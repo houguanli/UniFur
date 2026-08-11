@@ -674,6 +674,9 @@ def create_unified_fiber_field(
     max_points: int = 20_000,
     neighbor_k: int = 0,
     initial_residual_trust: float = 0.95,
+    initial_shell_length_scale: float | None = None,
+    initial_strand_length_scale: float | None = None,
+    initialize_direction_from_normal: bool = False,
 ) -> UnifiedFiberField:
     device = device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"
     cloud = load_gaussian_ply(str(gaussian_ply))
@@ -752,12 +755,29 @@ def create_unified_fiber_field(
     direction_local /= np.maximum(
         np.linalg.norm(direction_local, axis=-1, keepdims=True), 1e-8
     )
+    if initialize_direction_from_normal:
+        # The local z-axis is the outward rest-surface normal.  This is a
+        # generic scalp/surface prior rather than any strand supervision.
+        direction_local = np.zeros_like(direction_local)
+        direction_local[:, 2] = 1.0
 
     sorted_scaling = np.sort(scaling, axis=-1)
     radius = np.maximum(sorted_scaling[:, :2].mean(axis=-1), scene_scale * 2e-5)
     source_length = np.maximum(2.0 * sorted_scaling[:, 2], 2.0 * radius)
     shell_length = np.minimum(source_length, scene_scale * 0.02)
     strand_length = source_length
+    if initial_shell_length_scale is not None:
+        shell_length = np.full(
+            xyz.shape[0],
+            max(float(initial_shell_length_scale), 0.0) * scene_scale,
+            dtype=np.float32,
+        )
+    if initial_strand_length_scale is not None:
+        strand_length = np.full(
+            xyz.shape[0],
+            max(float(initial_strand_length_scale), 0.0) * scene_scale,
+            dtype=np.float32,
+        )
     height = np.maximum(np.abs(residual_offset_local[:, 2]), radius * 0.25)
 
     anisotropy = np.log(

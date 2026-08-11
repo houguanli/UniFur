@@ -204,6 +204,11 @@ def optimize_unified_fiber_stage2(
             int(cfg.fiber_route_neighbor_k) if representation == "unified" else 0
         ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
+        initial_shell_length_scale=cfg.fiber_initial_shell_length_scale,
+        initial_strand_length_scale=cfg.fiber_initial_strand_length_scale,
+        initialize_direction_from_normal=bool(
+            cfg.fiber_initialize_direction_from_normal
+        ),
     )
     bootstrap_metadata = None
     if residual_bootstrap_checkpoint is not None:

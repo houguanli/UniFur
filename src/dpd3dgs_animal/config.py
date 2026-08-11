@@ -94,6 +94,12 @@ class PipelineConfig:
     fiber_geometry_lr_scale: float = 0.5
     fiber_route_lr_scale: float = 1.0
     fiber_initial_residual_trust: float = 0.95
+    # Optional geometry-only initialization for sparse neutral scalp/head
+    # seeds.  Values are relative to the rest-surface scene scale, so they
+    # transfer across subjects without consuming strand annotations.
+    fiber_initial_shell_length_scale: float | None = None
+    fiber_initial_strand_length_scale: float | None = None
+    fiber_initialize_direction_from_normal: bool = False
     # Optional effective [shell, strand, residual] routing mass assigned when
     # a residual-only checkpoint bootstraps a unified field.  This explicitly
     # decouples a conservative residual photometric scaffold from the initial
@@ -231,6 +237,9 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_geometry_lr_scale",
         "fiber_route_lr_scale",
         "fiber_initial_residual_trust",
+        "fiber_initial_shell_length_scale",
+        "fiber_initial_strand_length_scale",
+        "fiber_initialize_direction_from_normal",
         "fiber_bootstrap_route_mass",
         "fiber_residual_trust_weight",
         "fiber_gradient_clip",
