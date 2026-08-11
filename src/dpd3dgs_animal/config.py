@@ -101,6 +101,7 @@ class PipelineConfig:
     fiber_ema_decay: float = 0.95
     fiber_route_continuation: bool = True
     fiber_route_hardening: bool = True
+    fiber_hard_route_policy: str = "argmax"
     fiber_route_neighbor_k: int = 0
     fiber_route_neighbor_weight: float = 0.0
     fiber_route_dropout_probability: float = 0.0
@@ -225,6 +226,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_ema_decay",
         "fiber_route_continuation",
         "fiber_route_hardening",
+        "fiber_hard_route_policy",
         "fiber_route_neighbor_k",
         "fiber_route_neighbor_weight",
         "fiber_route_dropout_probability",

@@ -13,6 +13,7 @@ from PIL import Image
 
 from .config import PipelineConfig
 from .fiber import (
+    HARD_ROUTE_POLICIES,
     ROUTE_NAMES,
     UnifiedFiberField,
     create_unified_fiber_field,
@@ -236,6 +237,7 @@ def optimize_unified_fiber_stage2(
                     geometry_blend=geometry_blend,
                     route_hardening=route_hardening,
                     dropped_route=dropped_route,
+                    hard_route_policy=cfg.fiber_hard_route_policy,
                 )
             prediction = _render(primitives, camera, cfg, renderer_name)
             render_loss, render_parts = differentiable_render_loss(
@@ -524,7 +526,11 @@ def optimize_unified_fiber_stage2(
             field, cfg.fiber_final_temperature, representation
         ),
         "final_hard_routes": _representation_route_summary(
-            field, cfg.fiber_final_temperature, representation, hard=True
+            field,
+            cfg.fiber_final_temperature,
+            representation,
+            hard=True,
+            hard_policy=cfg.fiber_hard_route_policy,
         ),
         "final_risk_target": (
             {
@@ -541,6 +547,7 @@ def optimize_unified_fiber_stage2(
         ),
         "route_dropout_counts": dropout_counts,
         "risk_update_count": risk_update_count,
+        "hard_route_policy": cfg.fiber_hard_route_policy,
         "config": {
             "representation": representation,
             "shell_samples": cfg.fiber_shell_samples,
@@ -635,11 +642,12 @@ def _representation_route_summary(
     representation: str,
     *,
     hard: bool = False,
+    hard_policy: str = "argmax",
 ) -> dict[str, float]:
     if representation == "residual_only":
         return {"shell": 0.0, "strand": 0.0, "residual": 1.0}
     return (
-        _hard_route_summary(field, temperature)
+        _hard_route_summary(field, temperature, hard_policy)
         if hard
         else field.route_summary(temperature)
     )
@@ -660,6 +668,11 @@ def _split_training_and_calibration_frames(
 
 
 def _validate_route_training_config(cfg: PipelineConfig) -> None:
+    if cfg.fiber_hard_route_policy not in HARD_ROUTE_POLICIES:
+        raise ValueError(
+            "fiber_hard_route_policy must be one of "
+            f"{HARD_ROUTE_POLICIES}, got {cfg.fiber_hard_route_policy!r}"
+        )
     dropout = float(cfg.fiber_route_dropout_probability)
     if not 0.0 <= dropout < 1.0:
         raise ValueError("fiber_route_dropout_probability must be in [0, 1)")
@@ -871,9 +884,13 @@ def _save_training_checkpoint(
 
 
 def _hard_route_summary(
-    field: UnifiedFiberField, temperature: float
+    field: UnifiedFiberField,
+    temperature: float,
+    hard_policy: str = "argmax",
 ) -> dict[str, float]:
-    probabilities = field.route_probabilities(temperature).detach()
+    probabilities = field.route_probabilities(
+        temperature, hard=True, hard_policy=hard_policy
+    ).detach()
     counts = torch.bincount(
         probabilities.argmax(dim=-1), minlength=len(ROUTE_NAMES)
     ).float()
@@ -1035,6 +1052,7 @@ def _save_previews(
                         hard_route=(
                             forced_route is None and cfg.fiber_route_hardening
                         ),
+                        hard_route_policy=cfg.fiber_hard_route_policy,
                     )
                 prediction = _render(primitives, camera, cfg, renderer_name)
                 image = (

@@ -13,6 +13,76 @@ from .render import PinholeCamera
 
 
 ROUTE_NAMES = ("shell", "strand", "residual")
+HARD_ROUTE_POLICIES = ("argmax", "mass_preserving")
+
+
+def mass_preserving_route_ids(probabilities: torch.Tensor) -> torch.Tensor:
+    """Assign one route per source while preserving aggregate soft route mass.
+
+    Ordinary argmax discretisation is locally optimal but can collapse almost
+    every source into residual.  This deterministic allocator turns summed soft
+    probabilities into integer capacities, then moves the least-confident
+    argmax assignments until those capacities are met.  It only changes the
+    hard forward path; straight-through gradients stay attached to the soft
+    probabilities.
+    """
+    if probabilities.ndim != 2 or probabilities.shape[1] != len(ROUTE_NAMES):
+        raise ValueError(
+            "probabilities must have shape (points, "
+            f"{len(ROUTE_NAMES)}), got {tuple(probabilities.shape)}"
+        )
+    point_count = int(probabilities.shape[0])
+    if point_count == 0:
+        return torch.empty((0,), dtype=torch.long, device=probabilities.device)
+
+    detached = probabilities.detach()
+    expected_counts = detached.sum(dim=0)
+    capacities = torch.floor(expected_counts).to(torch.long)
+    remaining = point_count - int(capacities.sum().item())
+    fractional = expected_counts - capacities.to(expected_counts.dtype)
+    if remaining > 0:
+        capacities[torch.argsort(fractional, descending=True)[:remaining]] += 1
+    elif remaining < 0:
+        # Numerical protection: remove an over-allocation without allowing a
+        # negative capacity.
+        for target in torch.argsort(fractional, descending=False).tolist():
+            removable = min(-remaining, int(capacities[target].item()))
+            capacities[target] -= removable
+            remaining += removable
+            if remaining == 0:
+                break
+
+    route_ids = detached.argmax(dim=-1)
+    counts = torch.bincount(route_ids, minlength=len(ROUTE_NAMES))
+    log_probabilities = detached.clamp_min(1e-8).log()
+    tie_scale = torch.finfo(log_probabilities.dtype).eps / float(max(point_count, 1))
+
+    # Greedily reroute sources with the smallest log-probability penalty.  A
+    # source route only loses points while it has surplus and a destination only
+    # receives points while it has capacity, so the final histogram is exact.
+    for source in range(len(ROUTE_NAMES)):
+        while int(counts[source].item()) > int(capacities[source].item()):
+            destinations = torch.nonzero(counts < capacities, as_tuple=False).flatten()
+            if destinations.numel() == 0:
+                break
+            destination = int(destinations[0].item())
+            move_count = min(
+                int(counts[source].item() - capacities[source].item()),
+                int(capacities[destination].item() - counts[destination].item()),
+            )
+            candidates = torch.nonzero(route_ids == source, as_tuple=False).flatten()
+            penalty = (
+                log_probabilities[candidates, source]
+                - log_probabilities[candidates, destination]
+            )
+            penalty = penalty + candidates.to(penalty.dtype) * tie_scale
+            selected = candidates[torch.topk(-penalty, k=move_count).indices]
+            route_ids[selected] = destination
+            counts[source] -= move_count
+            counts[destination] += move_count
+    if not torch.equal(counts, capacities):
+        raise RuntimeError("Mass-preserving route allocation failed to meet capacities")
+    return route_ids
 
 
 @dataclass
@@ -210,7 +280,12 @@ class UnifiedFiberField(nn.Module):
         route_blend: float = 1.0,
         hardening: float = 0.0,
         dropped_route: str | None = None,
+        hard_policy: str = "argmax",
     ) -> torch.Tensor:
+        if hard_policy not in HARD_ROUTE_POLICIES:
+            raise ValueError(
+                f"Unknown hard route policy {hard_policy!r}; expected one of {HARD_ROUTE_POLICIES}"
+            )
         if forced_route is not None:
             if forced_route not in ROUTE_NAMES:
                 raise ValueError(f"Unknown route {forced_route!r}; expected one of {ROUTE_NAMES}")
@@ -239,8 +314,13 @@ class UnifiedFiberField(nn.Module):
             ).clamp_min(1e-8)
         hardness = 1.0 if hard else min(max(float(hardening), 0.0), 1.0)
         if hardness > 0.0:
+            route_ids = (
+                probabilities.argmax(dim=-1)
+                if hard_policy == "argmax"
+                else mass_preserving_route_ids(probabilities)
+            )
             hard_probabilities = F.one_hot(
-                probabilities.argmax(dim=-1), num_classes=len(ROUTE_NAMES)
+                route_ids, num_classes=len(ROUTE_NAMES)
             ).to(probabilities.dtype)
             straight_through = (
                 hard_probabilities.detach() - probabilities.detach() + probabilities
@@ -278,6 +358,7 @@ class UnifiedFiberField(nn.Module):
         geometry_blend: float = 1.0,
         route_hardening: float = 0.0,
         dropped_route: str | None = None,
+        hard_route_policy: str = "argmax",
     ) -> FiberPrimitives:
         if shell_samples < 1 or strand_samples < 1:
             raise ValueError("shell_samples and strand_samples must be positive")
@@ -285,12 +366,13 @@ class UnifiedFiberField(nn.Module):
         direction = _local_to_world(self.direction_local, tangent, bitangent, normal)
         direction = F.normalize(direction, dim=-1, eps=1e-8)
         probabilities = self.route_probabilities(
-            temperature,
-            forced_route,
-            hard_route,
-            route_blend,
-            route_hardening,
-            dropped_route,
+            temperature=temperature,
+            forced_route=forced_route,
+            hard=hard_route,
+            route_blend=route_blend,
+            hardening=route_hardening,
+            dropped_route=dropped_route,
+            hard_policy=hard_route_policy,
         )
         source_id = torch.arange(self.point_count, device=root.device, dtype=torch.long)
 

@@ -206,6 +206,7 @@ def evaluate_unified_fiber_stage2(
                     temperature=cfg.fiber_final_temperature,
                     forced_route=route_mode if route_mode in ROUTE_NAMES else None,
                     hard_route=route_mode == "hard",
+                    hard_route_policy=cfg.fiber_hard_route_policy,
                 )
             prediction = _render(primitives, camera, cfg, renderer_name)
             ground_truth = _load_gt_frame_torch(
@@ -271,7 +272,9 @@ def evaluate_unified_fiber_stage2(
         field.route_probabilities(forced_route="residual").detach()
         if representation == "residual_only"
         else field.route_probabilities(
-            temperature=cfg.fiber_final_temperature
+            temperature=cfg.fiber_final_temperature,
+            hard=True,
+            hard_policy=cfg.fiber_hard_route_policy,
         ).detach()
     )
     hard_counts = torch.bincount(
@@ -310,6 +313,7 @@ def evaluate_unified_fiber_stage2(
             else field.route_summary(cfg.fiber_final_temperature)
         ),
         "hard_routes": hard_routes,
+        "hard_route_policy": cfg.fiber_hard_route_policy,
         "per_frame": per_frame,
     }
     with open(report_json, "w", encoding="utf-8") as file:

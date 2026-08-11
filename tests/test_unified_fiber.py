@@ -4,6 +4,7 @@ import torch
 from dpd3dgs_animal.fiber import (
     UnifiedFiberField,
     _quaternion_to_matrix_torch,
+    mass_preserving_route_ids,
     render_fiber_primitives,
 )
 from dpd3dgs_animal.render import PinholeCamera
@@ -120,6 +121,35 @@ def test_route_continuation_is_residual_at_start_and_hard_at_end() -> None:
     torch.testing.assert_close(hard, torch.nn.functional.one_hot(
         soft.argmax(dim=-1), num_classes=3
     ).to(hard.dtype))
+
+
+def test_mass_preserving_hard_routes_match_soft_expected_counts() -> None:
+    probabilities = torch.tensor(
+        [
+            [0.60, 0.30, 0.10],
+            [0.59, 0.31, 0.10],
+            [0.61, 0.29, 0.10],
+            [0.30, 0.40, 0.30],
+            [0.31, 0.39, 0.30],
+            [0.29, 0.41, 0.30],
+            [0.10, 0.20, 0.70],
+            [0.20, 0.10, 0.70],
+            [0.25, 0.05, 0.70],
+            [0.15, 0.15, 0.70],
+        ]
+    )
+    route_ids = mass_preserving_route_ids(probabilities)
+    expected = torch.floor(probabilities.sum(dim=0)).to(torch.long)
+    expected[torch.argmax(probabilities.sum(dim=0) - expected)] += 1
+    actual = torch.bincount(route_ids, minlength=3)
+    torch.testing.assert_close(actual, expected)
+    # The hard policy produces a one-hot primal path while preserving gradients.
+    field, _vertices, _faces = _toy_field()
+    hard = field.route_probabilities(hard=True, hard_policy="mass_preserving")
+    torch.testing.assert_close(hard.sum(dim=-1), torch.ones(2))
+    hard[:, 0].sum().backward()
+    assert field.route_logits.grad is not None
+    assert float(field.route_logits.grad.abs().sum()) > 0.0
 
 
 def test_learned_residual_trust_prevents_early_structured_takeover() -> None:
