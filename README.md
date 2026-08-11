@@ -9,13 +9,14 @@
 
 The frozen **DFA Panda walk monocular** protocol fits one view across 32 motion
 states and evaluates eight held-out views at 512 x 288 (256 images).  The
-reported `Unified-boundary-hard` soft deployment reaches foreground PSNR
-**12.180**, masked PSNR **19.836**, masked LPIPS **0.1336**, and mask IoU
-**0.8088** under `scripts/evaluate_external_renders.py`.  It improves the
-residual-only ablation in both appearance and silhouette metrics; GART-DFA
-retains a narrow 0.0085 IoU advantage.  See
-`docs/boundary_hard_route_ablation_20260811.md` for the full, strictly matched
-comparison and the hard-route limitation.
+latest `Unified-mass-preserving` run keeps shell/strand/residual proportions
+when deployed with one hard expert per source: soft/hard mask IoU is
+**0.80985 / 0.80068**, compared with **0.80875 / 0.79408** for the preceding
+boundary-hard run.  Its hard source allocation is 32.16% shell, 6.09% strand,
+and 61.75% residual, rather than collapsing to 95.5% residual under argmax.
+Every value is computed by `scripts/evaluate_external_renders.py`; see
+`docs/mass_preserving_route_ablation_20260811.md` for the frozen protocol,
+strict comparison, and remaining limitations.
 
 GART-DFA and 4D-Animal-DFA results are data-boundary adapters around their
 respective upstream models, not official paper numbers.  Datasets, upstream
