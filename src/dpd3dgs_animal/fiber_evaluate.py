@@ -9,7 +9,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from .config import PipelineConfig
-from .fiber import ROUTE_NAMES, create_unified_fiber_field
+from .fiber import HARD_ROUTE_POLICIES, ROUTE_NAMES, create_unified_fiber_field
 from .fiber_optimize import _render
 from .optimize import (
     DifferentiableSkeletonTetModel,
@@ -109,6 +109,15 @@ def evaluate_unified_fiber_stage2(
     if representation not in {"unified", "residual_only"}:
         raise ValueError(f"Unknown checkpoint representation {representation!r}")
     point_count = int(metadata.get("point_count", cfg.fiber_max_points))
+    shell_samples = int(metadata.get("shell_samples", cfg.fiber_shell_samples))
+    strand_samples = int(metadata.get("strand_samples", cfg.fiber_strand_samples))
+    hard_route_policy = str(
+        metadata.get("hard_route_policy", cfg.fiber_hard_route_policy)
+    )
+    if hard_route_policy not in HARD_ROUTE_POLICIES:
+        raise ValueError(
+            f"Unknown checkpoint hard-route policy {hard_route_policy!r}"
+        )
     motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     field = create_unified_fiber_field(
@@ -201,12 +210,12 @@ def evaluate_unified_fiber_stage2(
                 primitives = field.primitives(
                     surface_vertices,
                     motion.surface_faces,
-                    shell_samples=cfg.fiber_shell_samples,
-                    strand_samples=cfg.fiber_strand_samples,
+                    shell_samples=shell_samples,
+                    strand_samples=strand_samples,
                     temperature=cfg.fiber_final_temperature,
                     forced_route=route_mode if route_mode in ROUTE_NAMES else None,
                     hard_route=route_mode == "hard",
-                    hard_route_policy=cfg.fiber_hard_route_policy,
+                    hard_route_policy=hard_route_policy,
                 )
             prediction = _render(primitives, camera, cfg, renderer_name)
             ground_truth = _load_gt_frame_torch(
@@ -274,7 +283,7 @@ def evaluate_unified_fiber_stage2(
         else field.route_probabilities(
             temperature=cfg.fiber_final_temperature,
             hard=True,
-            hard_policy=cfg.fiber_hard_route_policy,
+            hard_policy=hard_route_policy,
         ).detach()
     )
     hard_counts = torch.bincount(
@@ -313,7 +322,7 @@ def evaluate_unified_fiber_stage2(
             else field.route_summary(cfg.fiber_final_temperature)
         ),
         "hard_routes": hard_routes,
-        "hard_route_policy": cfg.fiber_hard_route_policy,
+        "hard_route_policy": hard_route_policy,
         "per_frame": per_frame,
     }
     with open(report_json, "w", encoding="utf-8") as file:

@@ -184,6 +184,38 @@ def test_residual_bootstrap_transfers_only_residual_scaffold(tmp_path) -> None:
     assert loaded["source_representation"] == "residual_only"
 
 
+def test_residual_bootstrap_can_seed_structured_effective_route_mass(tmp_path) -> None:
+    source, _vertices, _faces = _toy_field()
+    checkpoint = tmp_path / "residual.pt"
+    torch.save(
+        {
+            "state_dict": source.state_dict(),
+            "metadata": {
+                "representation": "residual_only",
+                "point_count": source.point_count,
+            },
+        },
+        checkpoint,
+    )
+    target, _vertices, _faces = _toy_field()
+    with torch.no_grad():
+        target.residual_trust_logits.fill_(torch.logit(torch.tensor(0.2)))
+    loaded = _load_residual_bootstrap_checkpoint(
+        target,
+        checkpoint,
+        bootstrap_route_mass=[0.45, 0.20, 0.35],
+        bootstrap_route_temperature=0.35,
+    )
+    expected = torch.tensor([0.45, 0.20, 0.35])
+    torch.testing.assert_close(
+        target.route_probabilities(temperature=0.35).mean(dim=0), expected
+    )
+    torch.testing.assert_close(target.initial_route_probabilities.mean(dim=0), expected)
+    np.testing.assert_allclose(
+        loaded["routing_bootstrap_mass"], [0.45, 0.2, 0.35], atol=1e-6
+    )
+
+
 def test_learned_residual_trust_prevents_early_structured_takeover() -> None:
     field, _vertices, _faces = _toy_field()
     probabilities = field.route_probabilities(temperature=1.0)

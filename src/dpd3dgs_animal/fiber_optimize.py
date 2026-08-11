@@ -52,6 +52,8 @@ _RESIDUAL_BOOTSTRAP_KEYS = (
 def _load_residual_bootstrap_checkpoint(
     field: UnifiedFiberField,
     checkpoint_path: str | Path,
+    bootstrap_route_mass: list[float] | tuple[float, float, float] | None = None,
+    bootstrap_route_temperature: float = 1.0,
 ) -> dict[str, object]:
     """Transfer only the photometric residual-Gaussian scaffold.
 
@@ -95,12 +97,58 @@ def _load_residual_bootstrap_checkpoint(
             )
         target_state[key] = source.to(device=target.device, dtype=target.dtype)
     field.load_state_dict(target_state, strict=True)
+    routing_bootstrap_mass = None
+    routing_bootstrap_temperature = None
+    if bootstrap_route_mass is not None:
+        requested_mass = torch.as_tensor(
+            bootstrap_route_mass,
+            dtype=field.route_logits.dtype,
+            device=field.route_logits.device,
+        ).reshape(-1)
+        if requested_mass.numel() != len(ROUTE_NAMES):
+            raise ValueError(
+                "fiber_bootstrap_route_mass must contain effective "
+                f"[{', '.join(ROUTE_NAMES)}] mass"
+            )
+        if not torch.isfinite(requested_mass).all() or torch.any(requested_mass <= 0):
+            raise ValueError("fiber_bootstrap_route_mass must be finite and positive")
+        if float(bootstrap_route_temperature) <= 0.0:
+            raise ValueError("bootstrap_route_temperature must be positive")
+        requested_mass = requested_mass / requested_mass.sum()
+        residual_index = ROUTE_NAMES.index("residual")
+        trust = field.residual_trust.detach().reshape(-1, 1)
+        if torch.any(requested_mass[residual_index] <= trust[:, 0]):
+            raise ValueError(
+                "fiber_bootstrap_route_mass residual fraction must exceed the "
+                "initial residual trust"
+            )
+        base_mass = requested_mass[None, :].expand(field.point_count, -1).clone()
+        base_mass[:, :residual_index] /= (1.0 - trust).clamp_min(1e-6)
+        base_mass[:, residual_index] = (
+            requested_mass[residual_index] - trust[:, 0]
+        ) / (1.0 - trust[:, 0]).clamp_min(1e-6)
+        with torch.no_grad():
+            # route_probabilities uses softmax(logits / temperature).  Scale
+            # the logits here so the requested mass is exact at deployment,
+            # rather than becoming spuriously shell-dominant as temperature
+            # is annealed below one.
+            field.route_logits.copy_(
+                float(bootstrap_route_temperature)
+                * torch.log(base_mass.clamp_min(1e-6))
+            )
+            field.initial_route_probabilities.copy_(
+                requested_mass[None, :].expand_as(field.initial_route_probabilities)
+            )
+        routing_bootstrap_mass = [float(value) for value in requested_mass.cpu()]
+        routing_bootstrap_temperature = float(bootstrap_route_temperature)
     return {
         "checkpoint": str(path),
         "loaded_keys": list(_RESIDUAL_BOOTSTRAP_KEYS),
         "source_representation": metadata.get("representation")
         if isinstance(metadata, dict)
         else None,
+        "routing_bootstrap_mass": routing_bootstrap_mass,
+        "routing_bootstrap_temperature": routing_bootstrap_temperature,
     }
 
 
@@ -160,7 +208,10 @@ def optimize_unified_fiber_stage2(
     bootstrap_metadata = None
     if residual_bootstrap_checkpoint is not None:
         bootstrap_metadata = _load_residual_bootstrap_checkpoint(
-            field, residual_bootstrap_checkpoint
+            field,
+            residual_bootstrap_checkpoint,
+            bootstrap_route_mass=cfg.fiber_bootstrap_route_mass,
+            bootstrap_route_temperature=cfg.fiber_final_temperature,
         )
 
     frame_paths = _frame_paths(frame_dir)
@@ -526,6 +577,7 @@ def optimize_unified_fiber_stage2(
                 "calibration_frame_indices": calibration_frame_indices,
                 "render_size": [width, height],
                 "representation": representation,
+                "hard_route_policy": cfg.fiber_hard_route_policy,
                 "deployment_route_mode": (
                     "residual"
                     if representation == "residual_only"
@@ -949,6 +1001,7 @@ def _save_training_checkpoint(
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
                 "representation": cfg.fiber_representation,
+                "hard_route_policy": cfg.fiber_hard_route_policy,
             },
         },
         path,

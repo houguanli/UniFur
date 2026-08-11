@@ -94,6 +94,11 @@ class PipelineConfig:
     fiber_geometry_lr_scale: float = 0.5
     fiber_route_lr_scale: float = 1.0
     fiber_initial_residual_trust: float = 0.95
+    # Optional effective [shell, strand, residual] routing mass assigned when
+    # a residual-only checkpoint bootstraps a unified field.  This explicitly
+    # decouples a conservative residual photometric scaffold from the initial
+    # structural routing prior.
+    fiber_bootstrap_route_mass: list[float] | None = None
     fiber_residual_trust_weight: float = 0.0
     fiber_gradient_clip: float = 10.0
     fiber_log_every: int = 10
@@ -219,6 +224,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_geometry_lr_scale",
         "fiber_route_lr_scale",
         "fiber_initial_residual_trust",
+        "fiber_bootstrap_route_mass",
         "fiber_residual_trust_weight",
         "fiber_gradient_clip",
         "fiber_log_every",
