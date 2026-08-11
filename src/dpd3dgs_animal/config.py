@@ -114,6 +114,9 @@ class PipelineConfig:
     fiber_route_prior_final_fraction: float = 0.0
     fiber_calibration_frames: int = 0
     fiber_risk_calibration_every: int = 0
+    # Do not estimate leave-one-route-out risk while structured primitives are
+    # still blended out of the renderer; such estimates are not identifiable.
+    fiber_risk_calibration_start_geometry_blend: float = 0.0
     fiber_risk_calibration_weight: float = 0.0
     fiber_risk_calibration_ema: float = 0.8
     fiber_risk_target_prior_blend: float = 0.0
@@ -240,6 +243,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_route_prior_final_fraction",
         "fiber_calibration_frames",
         "fiber_risk_calibration_every",
+        "fiber_risk_calibration_start_geometry_blend",
         "fiber_risk_calibration_weight",
         "fiber_risk_calibration_ema",
         "fiber_risk_target_prior_blend",

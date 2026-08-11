@@ -49,6 +49,9 @@ fiber_route_dropout_residual_bias: 0.70
 fiber_random_seed: 20260812
 
 fiber_risk_calibration_every: 500
+# Risk is only meaningful after shell/strand are substantially active in the
+# renderer. Early leave-one-route-out loss would otherwise call them unused.
+fiber_risk_calibration_start_geometry_blend: 0.95
 fiber_risk_calibration_weight: 0.01
 fiber_risk_calibration_ema: 0.8
 fiber_risk_target_prior_blend: 0.25

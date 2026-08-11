@@ -380,6 +380,8 @@ def optimize_unified_fiber_stage2(
                 and bool(calibration_frame_indices)
                 and float(cfg.fiber_risk_calibration_weight) > 0.0
                 and calibration_every > 0
+                and geometry_blend
+                >= float(cfg.fiber_risk_calibration_start_geometry_blend)
                 and (
                     risk_target is None
                     or (step - warmup_steps) % calibration_every == 0
@@ -692,6 +694,9 @@ def optimize_unified_fiber_stage2(
                 cfg.fiber_route_prior_final_fraction
             ),
             "risk_calibration_every": int(cfg.fiber_risk_calibration_every),
+            "risk_calibration_start_geometry_blend": float(
+                cfg.fiber_risk_calibration_start_geometry_blend
+            ),
             "risk_calibration_weight": float(cfg.fiber_risk_calibration_weight),
             "risk_target_prior_blend": float(
                 cfg.fiber_risk_target_prior_blend
@@ -816,6 +821,13 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_route_neighbor_k must be non-negative")
     if int(cfg.fiber_risk_calibration_every) < 0:
         raise ValueError("fiber_risk_calibration_every must be non-negative")
+    calibration_start_blend = float(
+        cfg.fiber_risk_calibration_start_geometry_blend
+    )
+    if not 0.0 <= calibration_start_blend <= 1.0:
+        raise ValueError(
+            "fiber_risk_calibration_start_geometry_blend must be in [0, 1]"
+        )
     if float(cfg.fiber_risk_floor) <= 0.0:
         raise ValueError("fiber_risk_floor must be positive")
 
