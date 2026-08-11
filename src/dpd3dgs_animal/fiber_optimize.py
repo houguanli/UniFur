@@ -40,6 +40,70 @@ class FiberOptimizationArtifacts:
     loss_curve_png: Path
 
 
+_RESIDUAL_BOOTSTRAP_KEYS = (
+    "color_logits",
+    "opacity_logits",
+    "residual_offset_local",
+    "residual_log_scale_delta",
+    "residual_rotation_raw",
+)
+
+
+def _load_residual_bootstrap_checkpoint(
+    field: UnifiedFiberField,
+    checkpoint_path: str | Path,
+) -> dict[str, object]:
+    """Transfer only the photometric residual-Gaussian scaffold.
+
+    A residual-only multi-view fit supplies a valid 3DGS appearance bootstrap
+    for the unified model.  Route logits, structured geometry, and route
+    buffers deliberately remain freshly initialized, preventing a residual-only
+    checkpoint from reintroducing a collapsed routing prior.
+    """
+    path = Path(checkpoint_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Residual bootstrap checkpoint not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
+        raise ValueError("Residual bootstrap checkpoint must contain a state_dict")
+    metadata = payload.get("metadata", {})
+    if isinstance(metadata, dict):
+        representation = metadata.get("representation")
+        if representation is not None and representation != "residual_only":
+            raise ValueError(
+                "Residual bootstrap checkpoint must be trained with "
+                f"representation='residual_only', got {representation!r}"
+            )
+        point_count = metadata.get("point_count")
+        if point_count is not None and int(point_count) != field.point_count:
+            raise ValueError(
+                "Residual bootstrap point count does not match current field: "
+                f"{point_count} != {field.point_count}"
+            )
+
+    source_state = payload["state_dict"]
+    target_state = field.state_dict()
+    for key in _RESIDUAL_BOOTSTRAP_KEYS:
+        source = source_state.get(key)
+        target = target_state.get(key)
+        if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
+            raise ValueError(f"Residual bootstrap checkpoint lacks tensor {key!r}")
+        if tuple(source.shape) != tuple(target.shape):
+            raise ValueError(
+                f"Residual bootstrap tensor {key!r} shape mismatch: "
+                f"{tuple(source.shape)} != {tuple(target.shape)}"
+            )
+        target_state[key] = source.to(device=target.device, dtype=target.dtype)
+    field.load_state_dict(target_state, strict=True)
+    return {
+        "checkpoint": str(path),
+        "loaded_keys": list(_RESIDUAL_BOOTSTRAP_KEYS),
+        "source_representation": metadata.get("representation")
+        if isinstance(metadata, dict)
+        else None,
+    }
+
+
 def optimize_unified_fiber_stage2(
     stage1_npz: str | Path,
     gaussian_ply: str | Path,
@@ -58,6 +122,7 @@ def optimize_unified_fiber_stage2(
     log_every: int | None = None,
     checkpoint_every: int | None = None,
     camera_manifest: str | Path | None = None,
+    residual_bootstrap_checkpoint: str | Path | None = None,
 ) -> FiberOptimizationArtifacts:
     """Optimize a unified field on monocular or calibrated multi-view data.
 
@@ -92,6 +157,11 @@ def optimize_unified_fiber_stage2(
         ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
     )
+    bootstrap_metadata = None
+    if residual_bootstrap_checkpoint is not None:
+        bootstrap_metadata = _load_residual_bootstrap_checkpoint(
+            field, residual_bootstrap_checkpoint
+        )
 
     frame_paths = _frame_paths(frame_dir)
     width, height = _resolve_render_size(render_size, frame_paths, stage1_npz)
@@ -462,6 +532,7 @@ def optimize_unified_fiber_stage2(
                     else ("hard" if cfg.fiber_route_hardening else "soft")
                 ),
                 "baseline": "HairGS@16588656b1f6f048bc3bc83f3cb98c2da8596754",
+                "residual_bootstrap": bootstrap_metadata,
             },
         },
         checkpoint_pt,
@@ -554,6 +625,7 @@ def optimize_unified_fiber_stage2(
             "strand_samples": cfg.fiber_strand_samples,
             "max_points": int(max_points or cfg.fiber_max_points),
             "base_lr": base_lr,
+            "residual_bootstrap": bootstrap_metadata,
             "route_neighbor_k": int(cfg.fiber_route_neighbor_k),
             "route_neighbor_weight": float(cfg.fiber_route_neighbor_weight),
             "initial_residual_trust": float(cfg.fiber_initial_residual_trust),

@@ -116,6 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     fiber_stage2.add_argument("--log-every", type=int, default=None)
     fiber_stage2.add_argument("--checkpoint-every", type=int, default=None)
     fiber_stage2.add_argument(
+        "--residual-bootstrap-checkpoint",
+        default=None,
+        help=(
+            "Residual-only multi-view field checkpoint whose appearance and "
+            "residual-Gaussian geometry initialize the unified optimization."
+        ),
+    )
+    fiber_stage2.add_argument(
         "--renderer", choices=["torch", "hairgs"], default=None,
         help="Differentiable renderer. HairGS requires the hair-gs Conda environment.",
     )
@@ -298,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_every=args.checkpoint_every,
             render_size=_render_size_from_args(args),
             camera_manifest=args.camera_manifest,
+            residual_bootstrap_checkpoint=args.residual_bootstrap_checkpoint,
         )
         print(f"checkpoint={artifacts.checkpoint_pt}")
         print(f"state={artifacts.state_npz}")

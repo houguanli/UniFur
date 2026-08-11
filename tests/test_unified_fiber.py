@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from dpd3dgs_animal.fiber_optimize import _load_residual_bootstrap_checkpoint
+
 from dpd3dgs_animal.fiber import (
     UnifiedFiberField,
     _quaternion_to_matrix_torch,
@@ -150,6 +152,36 @@ def test_mass_preserving_hard_routes_match_soft_expected_counts() -> None:
     hard[:, 0].sum().backward()
     assert field.route_logits.grad is not None
     assert float(field.route_logits.grad.abs().sum()) > 0.0
+
+
+def test_residual_bootstrap_transfers_only_residual_scaffold(tmp_path) -> None:
+    source, _vertices, _faces = _toy_field()
+    with torch.no_grad():
+        source.color_logits.fill_(0.3)
+        source.opacity_logits.fill_(-0.7)
+        source.residual_offset_local.fill_(0.04)
+        source.residual_log_scale_delta.fill_(0.02)
+        source.residual_rotation_raw.fill_(0.01)
+        source.route_logits.fill_(4.0)
+    checkpoint = tmp_path / "residual.pt"
+    torch.save(
+        {
+            "state_dict": source.state_dict(),
+            "metadata": {
+                "representation": "residual_only",
+                "point_count": source.point_count,
+            },
+        },
+        checkpoint,
+    )
+    target, _vertices, _faces = _toy_field()
+    original_routes = target.route_logits.detach().clone()
+    loaded = _load_residual_bootstrap_checkpoint(target, checkpoint)
+    torch.testing.assert_close(target.color_logits, source.color_logits)
+    torch.testing.assert_close(target.opacity_logits, source.opacity_logits)
+    torch.testing.assert_close(target.residual_offset_local, source.residual_offset_local)
+    torch.testing.assert_close(target.route_logits, original_routes)
+    assert loaded["source_representation"] == "residual_only"
 
 
 def test_learned_residual_trust_prevents_early_structured_takeover() -> None:
