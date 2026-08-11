@@ -111,6 +111,10 @@ class PipelineConfig:
     fiber_route_neighbor_weight: float = 0.0
     fiber_route_dropout_probability: float = 0.0
     fiber_route_dropout_residual_bias: float = 1.0 / 3.0
+    # Optional aggregate [shell, strand, residual] route-mass floor for
+    # contribution-aware calibration.  Remaining mass is assigned from
+    # multi-view leave-one-route-out evidence.
+    fiber_route_minimum_mass: list[float] | None = None
     fiber_route_prior_final_fraction: float = 0.0
     fiber_calibration_frames: int = 0
     fiber_risk_calibration_every: int = 0
@@ -240,6 +244,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_route_neighbor_weight",
         "fiber_route_dropout_probability",
         "fiber_route_dropout_residual_bias",
+        "fiber_route_minimum_mass",
         "fiber_route_prior_final_fraction",
         "fiber_calibration_frames",
         "fiber_risk_calibration_every",

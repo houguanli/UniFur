@@ -1,7 +1,10 @@
 import numpy as np
 import torch
 
-from dpd3dgs_animal.fiber_optimize import _load_residual_bootstrap_checkpoint
+from dpd3dgs_animal.fiber_optimize import (
+    _apply_route_mass_floor,
+    _load_residual_bootstrap_checkpoint,
+)
 
 from dpd3dgs_animal.fiber import (
     UnifiedFiberField,
@@ -214,6 +217,12 @@ def test_residual_bootstrap_can_seed_structured_effective_route_mass(tmp_path) -
     np.testing.assert_allclose(
         loaded["routing_bootstrap_mass"], [0.45, 0.2, 0.35], atol=1e-6
     )
+
+
+def test_contribution_target_preserves_minimum_route_mass() -> None:
+    target = torch.tensor([0.0, 0.0, 1.0])
+    result = _apply_route_mass_floor(target, [0.25, 0.05, 0.20])
+    torch.testing.assert_close(result, torch.tensor([0.25, 0.05, 0.70]))
 
 
 def test_learned_residual_trust_prevents_early_structured_takeover() -> None:

@@ -411,6 +411,9 @@ def optimize_unified_fiber_stage2(
                         geometry_blend,
                     )
                 )
+                new_target = _apply_route_mass_floor(
+                    new_target, cfg.fiber_route_minimum_mass
+                )
                 prior_blend = float(cfg.fiber_risk_target_prior_blend)
                 initial_mass = field.initial_route_probabilities.mean(dim=0)
                 new_target = (
@@ -808,6 +811,18 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
     residual_bias = float(cfg.fiber_route_dropout_residual_bias)
     if not 0.0 <= residual_bias <= 1.0:
         raise ValueError("fiber_route_dropout_residual_bias must be in [0, 1]")
+    minimum_mass = cfg.fiber_route_minimum_mass
+    if minimum_mass is not None:
+        values = np.asarray(minimum_mass, dtype=np.float64).reshape(-1)
+        if values.shape != (len(ROUTE_NAMES),):
+            raise ValueError(
+                "fiber_route_minimum_mass must contain "
+                f"[{', '.join(ROUTE_NAMES)}] mass"
+            )
+        if not np.isfinite(values).all() or np.any(values < 0.0):
+            raise ValueError("fiber_route_minimum_mass must be finite and non-negative")
+        if float(values.sum()) >= 1.0:
+            raise ValueError("fiber_route_minimum_mass must sum to less than one")
     prior_floor = float(cfg.fiber_route_prior_final_fraction)
     if not 0.0 <= prior_floor <= 1.0:
         raise ValueError("fiber_route_prior_final_fraction must be in [0, 1]")
@@ -856,6 +871,21 @@ def _sample_dropped_route(
 def _normalize_positive_risk(risk: torch.Tensor, floor: float) -> torch.Tensor:
     positive = risk.clamp_min(0.0) + float(floor)
     return positive / positive.sum().clamp_min(1e-8)
+
+
+def _apply_route_mass_floor(
+    target: torch.Tensor,
+    minimum_mass: list[float] | None,
+) -> torch.Tensor:
+    """Reserve only a small expert floor; let observed contribution allocate the rest."""
+
+    target = target / target.sum().clamp_min(1e-8)
+    if minimum_mass is None:
+        return target
+    floor = torch.as_tensor(minimum_mass, dtype=target.dtype, device=target.device)
+    if floor.numel() != target.numel():
+        raise ValueError("fiber_route_minimum_mass has an invalid size")
+    return floor + (1.0 - floor.sum()) * target
 
 
 def _risk_calibration_kl(
