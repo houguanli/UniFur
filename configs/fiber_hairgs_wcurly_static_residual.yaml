@@ -1,0 +1,25 @@
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 6000
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+mask_boundary_weight: 0.20
+mask_boundary_radius: 1
+
+# Static calibrated multi-view hair protocol prepared by
+# scripts/prepare_hairgs_static_protocol.py.  This is the controlled 3DGS
+# scaffold for the later unified shell/strand/residual refinement.
+fiber_representation: residual_only
+fiber_renderer: hairgs
+fiber_max_points: 20000
+fiber_max_frames: 12
+fiber_shell_samples: 2
+fiber_strand_samples: 5
+fiber_sigma_scale: 1.0
+fiber_appearance_lr_scale: 0.5
+fiber_geometry_lr_scale: 0.5
+fiber_residual_drift_weight: 0.005
+fiber_gradient_clip: 10.0
+fiber_log_every: 100
+fiber_checkpoint_every: 1000
+fiber_ema_decay: 0.95
