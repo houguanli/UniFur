@@ -244,6 +244,8 @@ def optimize_unified_fiber_stage2(
                 ground_truth[local_frame_index]["mask"],
                 cfg.color_loss_weight,
                 cfg.mask_loss_weight,
+                cfg.mask_boundary_weight,
+                cfg.mask_boundary_radius,
             )
             regularizers = field.regularizers(
                 surface_vertices, motion.surface_faces, temperature=temperature
@@ -362,6 +364,7 @@ def optimize_unified_fiber_stage2(
                 "mask_loss": float(render_parts["mask_loss"].detach().cpu()),
                 "mask_soft": float(render_parts["mask_soft"].detach().cpu()),
                 "mask_01": float(render_parts["mask_01"].detach().cpu()),
+                "mask_boundary": float(render_parts["mask_boundary"].detach().cpu()),
                 "risk_calibration": float(risk_calibration.detach().cpu()),
             }
             for name, value in scalar_values.items():
@@ -759,6 +762,8 @@ def _estimate_route_ablation_risk(
                 target_frame["mask"],
                 cfg.color_loss_weight,
                 cfg.mask_loss_weight,
+                cfg.mask_boundary_weight,
+                cfg.mask_boundary_radius,
             )
             accumulated_full_loss += full_loss
             for route_index in range(len(ROUTE_NAMES)):

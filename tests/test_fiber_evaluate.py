@@ -52,6 +52,28 @@ def test_soft_mask_loss_penalizes_subthreshold_background_alpha() -> None:
     assert prediction["mask"].grad.abs().sum() > 0
 
 
+def test_boundary_loss_targets_alpha_at_the_silhouette() -> None:
+    prediction = {
+        "rgb": torch.zeros((5, 5, 3)),
+        "mask": torch.zeros((5, 5), requires_grad=True),
+    }
+    target_mask = torch.zeros((5, 5))
+    target_mask[1:4, 1:4] = 1.0
+    loss, parts = differentiable_render_loss(
+        prediction,
+        torch.zeros((5, 5, 3)),
+        target_mask,
+        0.0,
+        0.0,
+        mask_boundary_weight=1.0,
+        mask_boundary_radius=1,
+    )
+    assert float(parts["mask_boundary"]) > 0.0
+    loss.backward()
+    assert prediction["mask"].grad is not None
+    assert prediction["mask"].grad[1:4, 1:4].abs().sum() > 0
+
+
 def test_route_contribution_separates_appearance_and_silhouette() -> None:
     full = {
         "foreground_l1": 0.1,

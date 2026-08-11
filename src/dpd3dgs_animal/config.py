@@ -35,6 +35,8 @@ class PipelineConfig:
     mocap_ref_seq: str = "Dog#Dog-Galloping/y30"
     mocap_ref_idx: int = 0
     mask_loss_weight: float = 10.0
+    mask_boundary_weight: float = 0.0
+    mask_boundary_radius: int = 1
     color_loss_weight: float = 1.0
     max_render_points: int = 120000
     device: str = "cuda"
@@ -161,6 +163,8 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "mocap_ref_seq",
         "mocap_ref_idx",
         "mask_loss_weight",
+        "mask_boundary_weight",
+        "mask_boundary_radius",
         "color_loss_weight",
         "max_render_points",
         "device",

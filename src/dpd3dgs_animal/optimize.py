@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from .config import PipelineConfig
@@ -324,6 +325,8 @@ def differentiable_render_loss(
     gt_mask: torch.Tensor,
     color_weight: float,
     mask_weight: float,
+    mask_boundary_weight: float = 0.0,
+    mask_boundary_radius: int = 1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     valid = gt_mask[..., None].clamp(0.0, 1.0)
     color = (torch.abs(pred["rgb"] - gt_rgb) * valid).sum() / (valid.sum() * 3.0).clamp_min(1.0)
@@ -335,8 +338,29 @@ def differentiable_render_loss(
     # improve foreground color while evading silhouette supervision. Optimize
     # continuous alpha and retain mask_01 as a diagnostic only.
     mask_loss = mask_soft
-    total = color_weight * color + mask_weight * mask_loss
-    return total, {"color": color, "mask_loss": mask_loss, "mask_soft": mask_soft, "mask_01": mask_01}
+    mask_boundary = pred["mask"].new_zeros(())
+    if mask_boundary_weight > 0.0:
+        radius = max(int(mask_boundary_radius), 0)
+        kernel = 2 * radius + 1
+        target = gt_mask.clamp(0.0, 1.0)[None, None]
+        dilated = F.max_pool2d(target, kernel, stride=1, padding=radius)
+        eroded = 1.0 - F.max_pool2d(1.0 - target, kernel, stride=1, padding=radius)
+        boundary = (dilated - eroded).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+        mask_boundary = (
+            torch.abs(pred["mask"] - gt_mask) * boundary
+        ).sum() / boundary.sum().clamp_min(1.0)
+    total = (
+        color_weight * color
+        + mask_weight * mask_loss
+        + mask_boundary_weight * mask_boundary
+    )
+    return total, {
+        "color": color,
+        "mask_loss": mask_loss,
+        "mask_soft": mask_soft,
+        "mask_01": mask_01,
+        "mask_boundary": mask_boundary,
+    }
 
 
 def optimize_stage2(
@@ -407,6 +431,8 @@ def optimize_stage2(
                 gt[frame_index]["mask"],
                 cfg.color_loss_weight,
                 cfg.mask_loss_weight,
+                cfg.mask_boundary_weight,
+                cfg.mask_boundary_radius,
             )
             elastic_frame = model.elastic_losses_for_nodes(tet_nodes)
             frame_objective = (
