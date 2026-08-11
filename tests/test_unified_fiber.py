@@ -1,0 +1,222 @@
+import numpy as np
+import torch
+
+from dpd3dgs_animal.fiber import (
+    UnifiedFiberField,
+    _quaternion_to_matrix_torch,
+    render_fiber_primitives,
+)
+from dpd3dgs_animal.render import PinholeCamera
+
+
+def _toy_field() -> tuple[UnifiedFiberField, torch.Tensor, torch.Tensor]:
+    vertices = torch.tensor(
+        [[-0.5, -0.5, 2.0], [0.5, -0.5, 2.0], [-0.5, 0.5, 2.0]],
+        dtype=torch.float32,
+    )
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    field = UnifiedFiberField(
+        face_index=torch.tensor([0, 0]),
+        barycentric=torch.tensor([[0.3, 0.4, 0.3], [0.2, 0.2, 0.6]]),
+        color=torch.tensor([[0.7, 0.4, 0.2], [0.2, 0.3, 0.7]]),
+        opacity=torch.tensor([0.6, 0.7]),
+        original_scaling=torch.full((2, 3), 0.015),
+        original_rotation=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+        rest_surface_frame=torch.eye(3).repeat(2, 1, 1),
+        residual_offset_local=torch.tensor([[0.0, 0.0, 0.02], [0.02, 0.0, 0.01]]),
+        direction_local=torch.tensor([[0.0, 0.0, 1.0], [0.5, 0.0, 1.0]]),
+        height=torch.tensor([0.005, 0.01]),
+        shell_length=torch.tensor([0.02, 0.025]),
+        strand_length=torch.tensor([0.08, 0.1]),
+        radius=torch.tensor([0.005, 0.006]),
+        route_logits=torch.tensor([[1.0, 0.0, -1.0], [0.0, 1.0, -1.0]]),
+        scene_scale=1.0,
+        route_neighbor_index=torch.tensor([[1], [0]]),
+    )
+    return field, vertices, faces
+
+
+def test_unified_routes_form_a_differentiable_partition() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3, temperature=0.8
+    )
+    assert primitives.xyz.shape == (2 * (2 + 3 + 1), 3)
+    torch.testing.assert_close(
+        primitives.route_probabilities.sum(dim=-1), torch.ones(2)
+    )
+    assert torch.all(primitives.scaling > 0)
+    assert torch.isfinite(primitives.rotation).all()
+
+    route_weighted_loss = (
+        primitives.opacity * (1.0 + primitives.route_id.to(torch.float32))
+    ).mean() + 0.01 * primitives.xyz.square().mean()
+    route_weighted_loss.backward()
+    assert field.route_logits.grad is not None
+    assert float(field.route_logits.grad.abs().sum()) > 0.0
+    assert field.residual_trust_logits.grad is not None
+    assert torch.isfinite(field.residual_trust_logits.grad).all()
+    assert field.direction_local_raw.grad is not None
+    assert torch.isfinite(field.direction_local_raw.grad).all()
+
+
+def test_surface_anchor_moves_all_three_representations_with_the_animal() -> None:
+    field, vertices, faces = _toy_field()
+    translation = torch.tensor([0.25, -0.1, 0.4])
+    before = field.primitives(vertices, faces, shell_samples=2, strand_samples=3)
+    after = field.primitives(
+        vertices + translation, faces, shell_samples=2, strand_samples=3
+    )
+    torch.testing.assert_close(
+        after.xyz - before.xyz,
+        translation.expand_as(before.xyz),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_residual_covariance_follows_rigid_surface_rotation() -> None:
+    field, vertices, faces = _toy_field()
+    angle = torch.tensor(0.7)
+    cosine, sine = torch.cos(angle), torch.sin(angle)
+    rotation = torch.stack(
+        [
+            torch.stack([cosine, -sine, torch.tensor(0.0)]),
+            torch.stack([sine, cosine, torch.tensor(0.0)]),
+            torch.tensor([0.0, 0.0, 1.0]),
+        ]
+    )
+    before = field.residual_primitives(vertices, faces)
+    after = field.residual_primitives(vertices @ rotation.T, faces)
+    before_matrix = _quaternion_to_matrix_torch(before.rotation)
+    after_matrix = _quaternion_to_matrix_torch(after.rotation)
+    expected_matrix = rotation[None] @ before_matrix
+    torch.testing.assert_close(
+        after_matrix, expected_matrix, atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        after.xyz, before.xyz @ rotation.T, atol=1e-6, rtol=1e-6
+    )
+
+
+def test_identity_covariance_transport_has_finite_backward() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.residual_primitives(vertices, faces)
+    loss = primitives.rotation[:, 1:].square().sum()
+    loss.backward()
+    assert field.residual_rotation_raw.grad is not None
+    assert torch.isfinite(field.residual_rotation_raw.grad).all()
+
+
+def test_route_continuation_is_residual_at_start_and_hard_at_end() -> None:
+    field, _vertices, _faces = _toy_field()
+    start = field.route_probabilities(route_blend=0.0)
+    torch.testing.assert_close(start[:, 2], torch.ones(2))
+    torch.testing.assert_close(start[:, :2], torch.zeros(2, 2))
+
+    soft = field.route_probabilities(temperature=0.8)
+    hard = field.route_probabilities(temperature=0.8, hardening=1.0)
+    torch.testing.assert_close(hard.sum(dim=-1), torch.ones(2))
+    torch.testing.assert_close(hard, torch.nn.functional.one_hot(
+        soft.argmax(dim=-1), num_classes=3
+    ).to(hard.dtype))
+
+
+def test_learned_residual_trust_prevents_early_structured_takeover() -> None:
+    field, _vertices, _faces = _toy_field()
+    probabilities = field.route_probabilities(temperature=1.0)
+    assert torch.all(probabilities[:, 2] >= 0.95)
+    probabilities[:, 2].mean().backward()
+    assert field.residual_trust_logits.grad is not None
+    assert float(field.residual_trust_logits.grad.abs().sum()) > 0.0
+
+
+def test_structured_geometry_starts_as_render_preserving_residual_copies() -> None:
+    field, vertices, faces = _toy_field()
+    residual = field.residual_primitives(vertices, faces)
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        forced_route="shell",
+        geometry_blend=0.0,
+    )
+
+    shell_count = field.point_count * 2
+    expected_xyz = residual.xyz.repeat_interleave(2, dim=0)
+    expected_scaling = residual.scaling.repeat_interleave(2, dim=0)
+    expected_rotation = residual.rotation.repeat_interleave(2, dim=0)
+    torch.testing.assert_close(primitives.xyz[:shell_count], expected_xyz)
+    torch.testing.assert_close(primitives.scaling[:shell_count], expected_scaling)
+    torch.testing.assert_close(primitives.rotation[:shell_count], expected_rotation)
+
+
+def test_route_dropout_removes_one_expert_and_renormalizes_soft_mass() -> None:
+    field, _vertices, _faces = _toy_field()
+    probabilities = field.route_probabilities(
+        temperature=0.8, dropped_route="residual"
+    )
+    torch.testing.assert_close(probabilities[:, 2], torch.zeros(2))
+    torch.testing.assert_close(probabilities.sum(dim=-1), torch.ones(2))
+    assert torch.all(probabilities[:, :2] > 0.0)
+
+
+def test_residual_only_is_compact_anisotropic_3dgs() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.residual_primitives(vertices, faces)
+    assert primitives.xyz.shape == (field.point_count, 3)
+    assert primitives.scaling.shape == (field.point_count, 3)
+    assert primitives.rotation.shape == (field.point_count, 4)
+    torch.testing.assert_close(
+        primitives.route_probabilities[:, 2], torch.ones(field.point_count)
+    )
+    assert torch.all(primitives.route_id == 2)
+
+    objective = (
+        primitives.xyz.square().mean()
+        + primitives.scaling.square().mean()
+        + primitives.rotation.square().mean()
+    )
+    objective.backward()
+    assert field.residual_offset_local.grad is not None
+    assert field.residual_log_scale_delta.grad is not None
+    assert field.residual_rotation_raw.grad is not None
+
+
+def test_lightweight_fiber_renderer_backpropagates_to_geometry_and_routing() -> None:
+    field, vertices, faces = _toy_field()
+    camera = PinholeCamera(
+        width=48,
+        height=48,
+        fx=45.0,
+        fy=45.0,
+        cx=24.0,
+        cy=24.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    primitives = field.primitives(vertices, faces, shell_samples=2, strand_samples=3)
+    prediction = render_fiber_primitives(primitives, camera, radius_px=3)
+    objective = prediction["mask"].square().mean() + prediction["rgb"].mean()
+    objective.backward()
+    assert field.route_logits.grad is not None
+    assert field.radius_raw.grad is not None
+    assert torch.isfinite(field.route_logits.grad).all()
+    assert torch.isfinite(field.radius_raw.grad).all()
+
+    regularizers = field.regularizers(vertices, faces)
+    assert set(regularizers) == {
+        "route_entropy",
+        "route_prior",
+        "route_neighbor",
+        "shell_normal",
+        "shell_length",
+        "strand_thinness",
+        "height",
+        "bend",
+        "residual_drift",
+        "residual_trust",
+    }
+    assert all(torch.isfinite(value) for value in regularizers.values())
+    assert float(regularizers["route_neighbor"]) > 0.0

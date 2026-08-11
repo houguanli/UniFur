@@ -1,0 +1,30 @@
+diff --git a/lab4d/nnutils/deformable.py b/lab4d/nnutils/deformable.py
+index 0af154d..7648c5e 100755
+--- a/lab4d/nnutils/deformable.py
++++ b/lab4d/nnutils/deformable.py
+@@ -94,8 +94,8 @@ class Deformable(FeatureNeRF):
+             geom_path (str): Unused
+             init_scale (float): Unused
+         """
+-        geom_path = "/pfs/mt-1oY5F7/liuguangce/program-vidu/4dcode-8.3/objs for lab4d-neus/monster/tmpbrv8we0o.obj"
+-        init_scale = 0.1
++        # The released snapshot accidentally hard-coded an author-local mesh.
++        # Use the centered TSDF mesh supplied by the dataset metadata instead.
+         mesh = trimesh.load(geom_path)
+         rotation_matrix = tf.euler_matrix(-np.pi, 0, 0)
+         mesh.apply_transform(rotation_matrix)
+diff --git a/lab4d/nnutils/nerf.py b/lab4d/nnutils/nerf.py
+index a986985..4a10eb2 100755
+--- a/lab4d/nnutils/nerf.py
++++ b/lab4d/nnutils/nerf.py
+@@ -254,8 +254,8 @@ class NeRF(nn.Module):
+             geom_path (str): Initial shape mesh
+             init_scale (float): Geometry scale factor
+         """
+-        geom_path = "/pfs/mt-1oY5F7/liuguangce/program-vidu/4dcode-8.3/objs for lab4d-neus/pokemon/tmp4y7ghih_.obj"
+-        init_scale = 0.005
++        # The released snapshot accidentally hard-coded an author-local mesh.
++        # Use the centered TSDF mesh supplied by the dataset metadata instead.
+         mesh = trimesh.load(geom_path)
+         rotation_matrix = tf.euler_matrix(-np.pi, 0, 0)
+         mesh.apply_transform(rotation_matrix)

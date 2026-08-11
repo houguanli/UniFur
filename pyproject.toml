@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dpd3dgs-animal"
+version = "0.1.0"
+description = "Differentiable physical driven 3DGS integration for monocular animal motion reconstruction."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "torchmetrics",
+  "opencv-python",
+  "pillow",
+  "pyyaml",
+  "trimesh",
+  "plyfile",
+  "scipy",
+  "tqdm",
+]
+
+[project.scripts]
+dpd3dgs-animal = "dpd3dgs_animal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

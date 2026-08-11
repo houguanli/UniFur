@@ -1,0 +1,5 @@
+diffusers==0.32.2
+taichi==1.7.3
+tetgen==0.8.4
+diso==0.1.4
+elastic-fusion @ file:///home/aoki/ElasticSimulator

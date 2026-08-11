@@ -1,0 +1,52 @@
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 1200
+color_loss_weight: 1.0
+mask_loss_weight: 10.0
+
+fiber_renderer: hairgs
+fiber_max_points: 20000
+fiber_max_frames: 32
+fiber_shell_samples: 2
+fiber_strand_samples: 5
+fiber_warmup_steps: 200
+fiber_initial_temperature: 2.0
+fiber_final_temperature: 0.35
+fiber_sigma_scale: 1.0
+fiber_appearance_lr_scale: 0.25
+fiber_geometry_lr_scale: 0.5
+fiber_route_lr_scale: 1.0
+fiber_gradient_clip: 10.0
+fiber_log_every: 10
+fiber_checkpoint_every: 200
+fiber_ema_decay: 0.95
+fiber_route_continuation: true
+
+# Audit-driven v2: do not force the mixture into a hard expert assignment.
+fiber_route_hardening: false
+fiber_route_entropy_weight: 0.0
+
+# Surface-local routing and expert anti-duplication.
+fiber_route_neighbor_k: 8
+fiber_route_neighbor_weight: 0.01
+fiber_route_dropout_probability: 0.25
+fiber_route_dropout_residual_bias: 0.7
+fiber_random_seed: 20260809
+
+# Frames 28--31 calibrate global gate mass to held-out ablation risk. They are
+# excluded from photometric fitting. Final evaluation still uses frames 32--39.
+fiber_calibration_frames: 4
+fiber_risk_calibration_every: 80
+fiber_risk_calibration_weight: 0.005
+fiber_risk_calibration_ema: 0.8
+fiber_risk_target_prior_blend: 0.5
+fiber_risk_floor: 0.0001
+
+fiber_route_prior_weight: 0.015
+fiber_route_prior_final_fraction: 0.25
+fiber_shell_normal_weight: 0.02
+fiber_shell_length_weight: 0.001
+fiber_strand_thinness_weight: 0.01
+fiber_height_weight: 0.001
+fiber_bend_weight: 0.001
+fiber_residual_drift_weight: 0.01

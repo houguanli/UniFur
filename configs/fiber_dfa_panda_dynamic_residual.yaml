@@ -1,0 +1,28 @@
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 20000
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+
+# Shared D-mono/D-mv residual backbone.  The frame directory and observation
+# manifest choose the input regime; all representation/optimizer settings stay
+# fixed so view count is the only protocol variable.
+fiber_representation: residual_only
+fiber_renderer: hairgs
+fiber_max_points: 20000
+fiber_max_frames: 256
+fiber_calibration_frames: 0
+fiber_warmup_steps: 2000
+fiber_sigma_scale: 1.0
+
+fiber_appearance_lr_scale: 0.25
+fiber_geometry_lr_scale: 0.5
+fiber_route_lr_scale: 0.0
+fiber_gradient_clip: 10.0
+fiber_log_every: 100
+fiber_checkpoint_every: 2000
+fiber_ema_decay: 0.95
+fiber_random_seed: 20260810
+
+fiber_residual_drift_weight: 0.01
+

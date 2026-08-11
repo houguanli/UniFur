@@ -1,0 +1,22 @@
+device: cpu
+optimize_lr: 0.001
+optimize_steps: 2
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+
+fiber_representation: residual_only
+fiber_renderer: torch
+fiber_max_points: 200
+fiber_max_frames: 2
+fiber_calibration_frames: 0
+fiber_warmup_steps: 0
+fiber_sigma_scale: 1.0
+fiber_appearance_lr_scale: 0.25
+fiber_geometry_lr_scale: 0.5
+fiber_route_lr_scale: 0.0
+fiber_gradient_clip: 10.0
+fiber_log_every: 1
+fiber_checkpoint_every: 2
+fiber_ema_decay: 0.95
+fiber_random_seed: 20260810
+fiber_residual_drift_weight: 0.01

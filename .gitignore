@@ -1,0 +1,52 @@
+# Model checkpoints are stored locally and documented separately.
+checkpoints/*
+!checkpoints/README.md
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated samples, renders, meshes, logs, and optimization states.
+output/
+
+# Local datasets and vendored upstream implementations are intentionally not
+# redistributed. Setup scripts document their separate installation.
+samples/*
+!samples/README.md
+third_party/*
+!third_party/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Conda and local environments
+.conda/
+.venv/
+venv/
+
+# Native and simulator build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.so
+*.dll
+*.dylib
+*.o
+*.obj
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary TetGen files
+_skipped.*
+*.node
+*.face
+*.ele

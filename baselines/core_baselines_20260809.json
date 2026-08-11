@@ -1,0 +1,121 @@
+{
+  "case": "cat-local-controlled",
+  "date": "2026-08-09",
+  "input": {
+    "frames": 40,
+    "resolution": [1920, 1080],
+    "fit_frames": [0, 31],
+    "heldout_frames": [32, 39],
+    "stage1_intrinsics_fx_fy_cx_cy": [1570.3680419921875, 1570.3680419921875, 949.0, 543.0]
+  },
+  "repositories": {
+    "gart": {
+      "path": "/home/aoki/fur_hair_baselines/GART",
+      "commit": "16c11f8a5bb3ae249a9d04dc9d98c316e10f1126",
+      "environment": "/home/aoki/miniconda3/envs/gart-repro",
+      "status": "environment_and_official_dog_loader_verified; fit_blocked_by_licensed_d_smal_asset"
+    },
+    "vidu4d": {
+      "path": "/home/aoki/fur_hair_baselines/Vidu4D",
+      "commit": "ec9f024b60b14c2c61d13de306043f990d3b6584",
+      "environment": "/home/aoki/miniconda3/envs/vidu4d-repro",
+      "patch": "baselines/patches/vidu4d_remove_author_mesh_paths.patch",
+      "dinov2_commit": "85a24602099d397264d5b30461ad7f3bfd726ca1",
+      "status": "cat_preprocessing_and_three_round_stage2_smoke_complete; formal_21_round_stage2_running; stage3_gated_on_stage2_quality",
+      "formal_stage2_log": "/mnt/f/fur_hair_unified_data/baselines/vidu4d/formal_cat/stage2_stdout.log",
+      "formal_stage2_output": "/mnt/f/fur_hair_unified_data/baselines/vidu4d/logs/cat-local-controlled-base"
+    },
+    "hairgs": {
+      "path": "/home/aoki/fur_hair_baselines/hair-gs",
+      "commit": "16588656b1f6f048bc3bc83f3cb98c2da8596754",
+      "environment": "/home/aoki/miniconda3/envs/hair-gs",
+      "status": "official_wCurly_16_view_1000_strand_run_complete"
+    },
+    "banmo": {
+      "path": "/home/aoki/fur_hair_baselines/banmo",
+      "commit": "422098726f4c42914f7881f43ab57ea2cff2b90e",
+      "status": "cloned_as_historical_second_tier"
+    }
+  },
+  "controlled_results": {
+    "unified_soft": {
+      "source_points": 20000,
+      "steps": 1200,
+      "render_size": [512, 288],
+      "foreground_psnr": 16.3983031511307,
+      "mask_iou": 0.579581737518311,
+      "mask_f1": 0.7337373048067093
+    },
+    "unified_hard": {
+      "source_points": 20000,
+      "steps": 1200,
+      "render_size": [512, 288],
+      "foreground_psnr": 15.8382997512817,
+      "mask_iou": 0.559591248631477,
+      "mask_f1": 0.717360228300095
+    },
+    "residual_only": {
+      "source_points": 20000,
+      "steps": 1200,
+      "render_size": [512, 288],
+      "foreground_psnr": 16.190329909324646,
+      "mask_iou": 0.5700761079788208,
+      "mask_f1": 0.7257585301995277
+    }
+  },
+  "observed_40_frame_results": {
+    "protocol": "all 40 frames fitted and evaluated; 20000 source points; 1200 steps; 512x288",
+    "unified_soft": {
+      "foreground_psnr": 19.225508069992067,
+      "mask_iou": 0.6751433461904526,
+      "mask_f1": 0.8053940892219543,
+      "final_soft_routes": {
+        "shell": 0.3167814016342163,
+        "strand": 0.2400168925523758,
+        "residual": 0.4432016611099243
+      }
+    },
+    "unified_hard": {
+      "foreground_psnr": 19.214625310897826,
+      "mask_iou": 0.6958870261907577,
+      "mask_f1": 0.8201678961515426,
+      "final_hard_routes": {
+        "shell": 0.2061000019311905,
+        "strand": 0.21044999361038208,
+        "residual": 0.5834500193595886
+      }
+    },
+    "residual_only": {
+      "foreground_psnr": 20.691157960891722,
+      "mask_iou": 0.7288798391819,
+      "mask_f1": 0.8426481798291207
+    }
+  },
+  "external_runs": {
+    "vidu4d_cat_stage2_smoke": {
+      "rounds": 3,
+      "iterations_per_round": 200,
+      "scope": "training-view convergence diagnostic; not a held-out benchmark and not Stage-3 Gaussian surfels",
+      "loss_samples": {
+        "total_first": 0.0986783429980278,
+        "total_last": 0.01448308490216732,
+        "rgb_first": 0.007170245051383972,
+        "rgb_last": 0.0005687768571078777,
+        "mask_first": 0.029972245916724205,
+        "mask_last": 0.004114779178053141
+      },
+      "mask_grid_before_round_2": {
+        "fixed_0_5_iou": 0.691421476626339,
+        "fixed_0_5_f1": 0.8175626077604602,
+        "soft_l1": 0.11378530412912369
+      },
+      "report": "/mnt/f/fur_hair_unified_data/baselines/vidu4d/logs/cat-local-controlled-base-smoke-r3a/smoke_metrics.json"
+    },
+    "hairgs_wCurly_official16_1000": {
+      "scope": "fitted training views plus synthetic ground-truth geometry; different dataset from cat",
+      "train_view_psnr": 30.486944199854943,
+      "train_view_mask_iou": 0.9111791626687554,
+      "geometry_f1_0_004m_90deg": 0.6761998587997773
+    }
+  }
+}

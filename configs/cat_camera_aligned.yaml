@@ -1,0 +1,58 @@
+paths:
+  sam3d_root: third_party/sam3d_objects
+  elastic_root: third_party/elastic_simulator
+  mocap_root: third_party/mocap_anything
+  sam3d_checkpoints: checkpoints/sam3d
+  mocap_checkpoints: checkpoints/mocap_anything
+  mocap_zoo: samples/mocap_anything/zoo
+
+conda_env: dpd3dgs-animal
+canonical_frame: opencv_camera_x_right_y_down_z_forward
+mocap_axis_transform: mocap_to_opencv
+skeleton_scale_mode: fit_inside
+skeleton_center_mode: bbox
+skeleton_fit_padding: 0.95
+sam3d_tag: hf
+reference_frame: 0
+mocap_ref_seq: Cat#Cat-Walk/y30
+mocap_ref_idx: 0
+color_loss_weight: 1.0
+mask_loss_weight: 10.0
+max_render_points: 120000
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 100
+elastic_edge_weight: 0.01
+elastic_volume_weight: 0.01
+bone_length_weight: 0.1
+temporal_weight: 0.01
+mocap_prior_weight: 0.01
+render_sigma_px: 1.5
+render_radius_px: 4
+gravity: 0.0
+camera_align_to_frame0: false
+camera_alignment_points: 12000
+camera_alignment_padding: 0.92
+gaussian_binding_k: 8
+pull_gaussians_to_surface: true
+tet_mesh_max_faces: 6000
+skinning_weight_mode: tet_geodesic
+skinning_weight_k: 4
+skinning_deformation_mode: dqs
+elastic_fem_dt: 0.001
+elastic_fem_substeps: 1
+elastic_fem_youngs_modulus: 100000.0
+elastic_fem_poisson_ratio: 0.4
+elastic_fem_density: 1000.0
+elastic_fem_damping: 0.02
+elastic_fem_radius_scale: 0.25
+elastic_fem_min_radius_scale: 0.025
+elastic_fem_max_radius_scale: 0.12
+elastic_fem_min_bone_length_scale: 0.015
+elastic_fem_reset_each_frame: true
+fem_cg_iters: 16
+fem_elastic_stiffness: 1.0
+fem_handle_stiffness: 80.0
+fem_diagonal_reg: 0.0001
+fem_handle_support: 3.0
+fem_handle_weight_power: 1.0
