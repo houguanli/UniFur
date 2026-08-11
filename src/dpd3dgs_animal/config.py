@@ -100,6 +100,10 @@ class PipelineConfig:
     fiber_initial_shell_length_scale: float | None = None
     fiber_initial_strand_length_scale: float | None = None
     fiber_initialize_direction_from_normal: bool = False
+    # Optional image-derived, confidence-weighted 2D orientation supervision.
+    # This accepts the same Gabor fields used by HairGS, never 3D strand GT.
+    fiber_orientation_dir: str | None = None
+    fiber_orientation_weight: float = 0.0
     # Optional effective [shell, strand, residual] routing mass assigned when
     # a residual-only checkpoint bootstraps a unified field.  This explicitly
     # decouples a conservative residual photometric scaffold from the initial
@@ -240,6 +244,8 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_initial_shell_length_scale",
         "fiber_initial_strand_length_scale",
         "fiber_initialize_direction_from_normal",
+        "fiber_orientation_dir",
+        "fiber_orientation_weight",
         "fiber_bootstrap_route_mass",
         "fiber_residual_trust_weight",
         "fiber_gradient_clip",

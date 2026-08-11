@@ -187,6 +187,8 @@ def optimize_unified_fiber_stage2(
     renderer_name = str(renderer or cfg.fiber_renderer).lower()
     if renderer_name not in {"torch", "hairgs"}:
         raise ValueError("renderer must be 'torch' or 'hairgs'")
+    if float(cfg.fiber_orientation_weight) > 0.0 and renderer_name != "hairgs":
+        raise ValueError("fiber_orientation_weight requires the HairGS renderer")
     representation = str(cfg.fiber_representation).lower()
     if representation not in {"unified", "residual_only"}:
         raise ValueError(
@@ -273,6 +275,9 @@ def optimize_unified_fiber_stage2(
         _load_gt_frame_torch(frame_paths[index], width, height, device)
         for index in calibration_frame_indices
     ]
+    orientation_targets = _load_orientation_targets(
+        frame_paths, frame_indices, width, height, device, cfg.fiber_orientation_dir
+    )
 
     _validate_route_training_config(cfg)
     route_rng = np.random.default_rng(int(cfg.fiber_random_seed))
@@ -365,7 +370,18 @@ def optimize_unified_fiber_stage2(
                     dropped_route=dropped_route,
                     hard_route_policy=cfg.fiber_hard_route_policy,
                 )
-            prediction = _render(primitives, camera, cfg, renderer_name)
+            orientation_target = (
+                orientation_targets[local_frame_index]
+                if phase != "gaussian_scaffold"
+                else None
+            )
+            prediction = _render(
+                primitives,
+                camera,
+                cfg,
+                renderer_name,
+                render_orientation=orientation_target is not None,
+            )
             render_loss, render_parts = differentiable_render_loss(
                 prediction,
                 ground_truth[local_frame_index]["rgb"],
@@ -375,6 +391,15 @@ def optimize_unified_fiber_stage2(
                 cfg.mask_boundary_weight,
                 cfg.mask_boundary_radius,
             )
+            orientation_loss = render_loss.new_zeros(())
+            if orientation_target is not None:
+                orientation_loss = _orientation_consistency_loss(
+                    prediction["orientation"], orientation_target,
+                    ground_truth[local_frame_index]["mask"],
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_orientation_weight) * orientation_loss
+                )
             regularizers = field.regularizers(
                 surface_vertices, motion.surface_faces, temperature=temperature
             )
@@ -498,6 +523,7 @@ def optimize_unified_fiber_stage2(
                 "mask_soft": float(render_parts["mask_soft"].detach().cpu()),
                 "mask_01": float(render_parts["mask_01"].detach().cpu()),
                 "mask_boundary": float(render_parts["mask_boundary"].detach().cpu()),
+                "orientation": float(orientation_loss.detach().cpu()),
                 "risk_calibration": float(risk_calibration.detach().cpu()),
             }
             for name, value in scalar_values.items():
@@ -1259,8 +1285,17 @@ def _save_previews(
                     )
 
 
-def _render(primitives, camera, cfg: PipelineConfig, renderer_name: str):
+def _render(
+    primitives,
+    camera,
+    cfg: PipelineConfig,
+    renderer_name: str,
+    *,
+    render_orientation: bool = False,
+):
     if renderer_name == "torch":
+        if render_orientation:
+            raise ValueError("Orientation supervision requires the HairGS renderer")
         return render_fiber_primitives(
             primitives,
             camera,
@@ -1269,4 +1304,65 @@ def _render(primitives, camera, cfg: PipelineConfig, renderer_name: str):
         )
     from .hairgs_renderer import render_fiber_primitives_hairgs
 
-    return render_fiber_primitives_hairgs(primitives, camera)
+    return render_fiber_primitives_hairgs(
+        primitives, camera, render_orientation=render_orientation
+    )
+
+
+def _load_orientation_targets(
+    frame_paths: list[Path],
+    frame_indices: list[int],
+    width: int,
+    height: int,
+    device: str,
+    orientation_dir: str | None,
+) -> list[dict[str, torch.Tensor] | None]:
+    """Load HairGS-compatible Gabor angle maps for the selected train views."""
+
+    if orientation_dir is None:
+        return [None] * len(frame_indices)
+    directory = Path(orientation_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"fiber_orientation_dir does not exist: {directory}")
+    targets: list[dict[str, torch.Tensor] | None] = []
+    for index in frame_indices:
+        stem = frame_paths[index].stem
+        angle_path = directory / f"{stem}_orientation.png"
+        confidence_path = directory / f"{stem}_confidence.png"
+        if not angle_path.is_file() or not confidence_path.is_file():
+            raise FileNotFoundError(
+                f"Missing HairGS orientation/confidence maps for {frame_paths[index].name}"
+            )
+        angle = np.asarray(Image.open(angle_path).convert("L"), dtype=np.float32)
+        confidence = np.asarray(
+            Image.open(confidence_path).convert("L"), dtype=np.float32
+        ) / 255.0
+        theta = torch.as_tensor(angle * (math.pi / 255.0), dtype=torch.float32)
+        vectors = torch.stack([torch.cos(2.0 * theta), torch.sin(2.0 * theta)], dim=0)
+        confidence_tensor = torch.as_tensor(confidence, dtype=torch.float32)[None, None]
+        vectors = F.interpolate(
+            vectors[None], size=(height, width), mode="bilinear", align_corners=False
+        )[0].permute(1, 2, 0)
+        confidence_tensor = F.interpolate(
+            confidence_tensor, size=(height, width), mode="bilinear", align_corners=False
+        )[0, 0]
+        targets.append(
+            {
+                "vectors": F.normalize(vectors, dim=-1, eps=1e-8).to(device),
+                "confidence": confidence_tensor.to(device),
+            }
+        )
+    return targets
+
+
+def _orientation_consistency_loss(
+    predicted: torch.Tensor,
+    target: dict[str, torch.Tensor],
+    foreground_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Confidence-weighted sign-invariant image-space tangent discrepancy."""
+
+    predicted_vectors = F.normalize(predicted[..., :2], dim=-1, eps=1e-8)
+    agreement = (predicted_vectors * target["vectors"]).sum(dim=-1).clamp(-1.0, 1.0)
+    weights = target["confidence"] * foreground_mask.to(target["confidence"].dtype)
+    return (0.5 * (1.0 - agreement) * weights).sum() / weights.sum().clamp_min(1e-8)

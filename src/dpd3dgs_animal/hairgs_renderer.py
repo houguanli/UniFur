@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .fiber import FiberPrimitives
+from .fiber import FiberPrimitives, _quaternion_to_matrix_torch
 from .render import PinholeCamera
 
 
@@ -15,6 +15,7 @@ def render_fiber_primitives_hairgs(
     znear: float = 0.01,
     zfar: float = 100.0,
     debug: bool = False,
+    render_orientation: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Render unified primitives with the CUDA rasterizer shipped by HairGS.
 
@@ -91,13 +92,34 @@ def render_fiber_primitives_hairgs(
     rendered_alpha_rgb, _alpha_radii, _alpha_viewspace = rasterize(
         torch.ones_like(primitives.color)
     )
-    return {
+    output = {
         "rgb": rendered_rgb.permute(1, 2, 0).contiguous().clamp(0.0, 1.0),
         "mask": rendered_alpha_rgb.mean(dim=0).clamp(0.0, 1.0),
         "radii": radii,
         "visibility_filter": radii > 0,
         "viewspace_points": viewspace_points,
     }
+    if render_orientation:
+        # Match HairGS: use the projected, sign-invariant tangent direction.
+        # A double-angle encoding lets Gaussian alpha compositing average
+        # directions without the pi-periodic sign ambiguity of hair.
+        tangent_world = _quaternion_to_matrix_torch(primitives.rotation)[..., :, 0]
+        world_to_camera = torch.as_tensor(
+            camera.world_to_camera[:3, :3], dtype=dtype, device=device
+        )
+        tangent_camera = tangent_world @ world_to_camera.T
+        x, y = tangent_camera[:, 0], tangent_camera[:, 1]
+        denominator = (x.square() + y.square()).clamp_min(1e-8)
+        orientation_color = torch.stack(
+            [(y.square() - x.square()) / denominator, 2.0 * x * y / denominator,
+             torch.zeros_like(x)],
+            dim=-1,
+        )
+        rendered_orientation, _orientation_radii, _orientation_viewspace = rasterize(
+            orientation_color
+        )
+        output["orientation"] = rendered_orientation.permute(1, 2, 0).contiguous()
+    return output
 
 
 def _projection_matrix(

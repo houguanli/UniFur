@@ -1,0 +1,68 @@
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 6000
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+mask_boundary_weight: 0.20
+mask_boundary_radius: 1
+
+# Static calibrated multi-view hair protocol prepared by
+# scripts/prepare_hairgs_static_protocol.py.  This is the controlled 3DGS
+# scaffold for the later unified shell/strand/residual refinement.
+fiber_representation: unified
+fiber_renderer: hairgs
+fiber_max_points: 20000
+fiber_max_frames: 12
+fiber_calibration_frames: 3
+fiber_shell_samples: 2
+fiber_strand_samples: 5
+fiber_warmup_steps: 1000
+fiber_initial_temperature: 2.0
+fiber_final_temperature: 0.35
+fiber_sigma_scale: 1.0
+fiber_appearance_lr_scale: 0.5
+fiber_geometry_lr_scale: 0.5
+fiber_route_lr_scale: 1.0
+# Scalp-only structural initialization: local z is the outward head normal;
+# lengths are fractions of the calibrated static subject scale, not hair GT.
+fiber_initialize_direction_from_normal: true
+fiber_initial_shell_length_scale: 0.01
+fiber_initial_strand_length_scale: 0.12
+fiber_initial_residual_trust: 0.20
+fiber_bootstrap_route_mass: [0.15, 0.60, 0.25]
+fiber_residual_trust_weight: 0.01
+# The official HairGS Gabor orientation estimates for the twelve train views.
+# They are an input-image cue, not strand ground truth.
+fiber_orientation_dir: /mnt/f/fur_hair_unified_data/hair-gs_parsed_official16_1000/cem_yuksel/wCurly/orientations
+fiber_orientation_weight: 0.15
+fiber_residual_drift_weight: 0.005
+fiber_gradient_clip: 10.0
+fiber_log_every: 100
+fiber_checkpoint_every: 1000
+fiber_ema_decay: 0.95
+fiber_route_continuation: true
+fiber_route_hardening: true
+fiber_hard_route_policy: mass_preserving
+
+# Static calibrated multi-view: require the long-strand expert to carry a
+# nonzero mass but permit evidence-based adjustment after geometry is visible.
+fiber_route_entropy_weight: 0.0005
+fiber_route_neighbor_k: 8
+fiber_route_neighbor_weight: 0.01
+fiber_route_dropout_probability: 0.60
+fiber_route_dropout_residual_bias: 0.90
+fiber_route_prior_weight: 0.04
+fiber_route_prior_final_fraction: 0.25
+fiber_route_minimum_mass: [0.10, 0.35, 0.15]
+fiber_random_seed: 20260815
+fiber_risk_calibration_every: 500
+fiber_risk_calibration_start_geometry_blend: 0.95
+fiber_risk_calibration_weight: 0.01
+fiber_risk_calibration_ema: 0.8
+fiber_risk_target_prior_blend: 0.25
+fiber_risk_floor: 0.0001
+fiber_shell_normal_weight: 0.02
+fiber_shell_length_weight: 0.001
+fiber_strand_thinness_weight: 0.01
+fiber_height_weight: 0.001
+fiber_bend_weight: 0.001
