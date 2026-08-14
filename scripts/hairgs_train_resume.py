@@ -235,9 +235,8 @@ def training(
                 plotter.app.processEvents()
 
             # Eval
-            if (
-                scene.gt is not None
-                and iteration % gp.eval_frequency == 0
+            if scene.gt is not None and (
+                iteration % gp.eval_frequency == 0
                 or iteration == opt.iterations
             ):
                 training_info.pred = (
@@ -247,7 +246,7 @@ def training(
                 )
                 training_info.eval_metrics, training_info.eval_thresholds = (
                     compute_metrics(
-                        pred=pred,
+                        pred=training_info.pred,
                         gt=scene.gt,
                         bidirectional=op.bidirectional_eval,
                     )

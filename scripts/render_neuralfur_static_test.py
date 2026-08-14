@@ -27,13 +27,33 @@ def main() -> None:
     parser.add_argument("--data_root", required=True)
     parser.add_argument("--pointcloud_path_head", required=True)
     parser.add_argument("--checkpoint_hair", required=True)
+    parser.add_argument(
+        "--checkpoint_body",
+        required=True,
+        help="Trained Stage-I body 3DGS checkpoint used for RGB composition",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--iteration", type=int, default=20000)
     parser.add_argument("--scene_suffix", default="")
     parser.add_argument("--scale_factor", type=int, default=1)
     parser.add_argument("--resolution_val", type=int, nargs=2, default=[512, 288])
     parser.add_argument("--num_views", type=int, default=-1)
+    parser.add_argument(
+        "--inference_num_strands",
+        type=int,
+        default=-1,
+        help="Override active strand count at inference without changing training capacity",
+    )
     parser.add_argument("--body_scale", type=float, default=0.0)
+    parser.add_argument(
+        "--evaluation_mask",
+        choices=("full", "hair"),
+        default="full",
+        help=(
+            "Export NeuralFur's full body+fur foreground channel for whole-subject "
+            "benchmarks, or its hair-label channel for hair-only evaluation."
+        ),
+    )
     parser.add_argument("--use_test_split", action="store_true")
     parser.add_argument("--max_observations", type=int, default=-1)
     args = parser.parse_args()
@@ -63,6 +83,19 @@ def main() -> None:
     gaussians.training_setup(opt)
     gaussians_hair.create_from_pcd(dataset.source_path, dataset.strand_scale)
     gaussians_hair.training_setup(opt, hair_config)
+    body_parameters, body_checkpoint_iteration = torch.load(args.checkpoint_body)
+    # NeuralFur's released Stage-I checkpoint was captured after `_covariance`
+    # was added to the serialized tuple, while the corresponding restore()
+    # function still expects the older 14-field layout.  Covariance is derived
+    # from scale/rotation at render time, so discard only that unused field.
+    if len(body_parameters) == 15:
+        body_parameters = body_parameters[:6] + body_parameters[7:]
+    if len(body_parameters) != 14:
+        raise RuntimeError(
+            "Unsupported NeuralFur body checkpoint layout: "
+            f"expected 14 or 15 fields, got {len(body_parameters)}"
+        )
+    gaussians.restore(body_parameters)
     model_parameters, checkpoint_iteration = torch.load(args.checkpoint_hair)
     gaussians_hair.restore(model_parameters, opt, hair_config)
 
@@ -79,7 +112,9 @@ def main() -> None:
             .transpose(1, 2)
             .view(-1, 3, (gaussians.max_sh_degree + 1) ** 2)
         )
-        gaussians_hair.initialize_gaussians_hair(args.iteration)
+        gaussians_hair.initialize_gaussians_hair(
+            args.iteration, num_strands=args.inference_num_strands
+        )
 
     background_values = (
         [1, 1, 1, 0, 0, 0, 0, 0, 0, 100]
@@ -95,14 +130,51 @@ def main() -> None:
     cameras = scene.getTestCameras()
     if args.max_observations > 0:
         cameras = cameras[: args.max_observations]
+    diagnostics = {}
+    if cameras:
+        with torch.no_grad():
+            diagnostics = {
+                "first_camera": str(cameras[0].image_name),
+                "body_point_count": int(gaussians.xyz_precomp.shape[0]),
+                "hair_point_count": int(gaussians_hair.get_xyz.shape[0]),
+                "body_bounds": [
+                    gaussians.xyz_precomp.amin(dim=0).detach().cpu().tolist(),
+                    gaussians.xyz_precomp.amax(dim=0).detach().cpu().tolist(),
+                ],
+                "hair_bounds": [
+                    gaussians_hair.get_xyz.amin(dim=0).detach().cpu().tolist(),
+                    gaussians_hair.get_xyz.amax(dim=0).detach().cpu().tolist(),
+                ],
+                "camera_center": cameras[0].camera_center.detach().cpu().tolist(),
+                "camera_raster_size": [
+                    int(cameras[0].image_width),
+                    int(cameras[0].image_height),
+                ],
+            }
+        expected_raster_size = tuple(map(int, args.resolution_val))
+        actual_raster_size = (
+            int(cameras[0].image_width),
+            int(cameras[0].image_height),
+        )
+        if actual_raster_size != expected_raster_size:
+            raise RuntimeError(
+                "NeuralFur raster/intrinsics resolution mismatch: "
+                f"raster={actual_raster_size}, intrinsics={expected_raster_size}. "
+                "Set -r and --scale_factor consistently."
+            )
     report = {
         "schema": "neuralfur-heldout-render-v1",
         "method": "NeuralFur",
         "checkpoint": str(Path(args.checkpoint_hair).resolve()),
         "checkpoint_iteration": int(checkpoint_iteration),
+        "body_checkpoint": str(Path(args.checkpoint_body).resolve()),
+        "body_checkpoint_iteration": int(body_checkpoint_iteration),
         "render_size": list(map(int, args.resolution_val)),
+        "evaluation_mask": args.evaluation_mask,
+        "inference_num_strands": int(args.inference_num_strands),
         "status": "running",
         "completed": 0,
+        "diagnostics": diagnostics,
         "observations": [],
     }
     report_path = output / "render_manifest.json"
@@ -117,11 +189,33 @@ def main() -> None:
                 background,
                 body_scale=args.body_scale,
             )
+        if index == 0:
+            body_count = int(gaussians.xyz_precomp.shape[0])
+            visible = rendered["visibility_filter"]
+            report["diagnostics"]["body_visible_count"] = int(
+                visible[:body_count].sum().item()
+            )
+            report["diagnostics"]["hair_visible_count"] = int(
+                visible[body_count:].sum().item()
+            )
+            report["diagnostics"]["render_rgb_range"] = [
+                float(rendered["render"][:3].amin().item()),
+                float(rendered["render"][:3].amax().item()),
+            ]
+            report["diagnostics"]["render_mask_range"] = [
+                float(rendered["mask"].amin().item()),
+                float(rendered["mask"].amax().item()),
+            ]
         rgb_tensor = rendered["render"][:3].clamp(0.0, 1.0)[None]
-        # NeuralFur supervises its foreground/hair mask with channel zero
-        # (see train_latent_fur.py).  The second channel is an auxiliary
-        # training signal rather than a comparable foreground alpha.
-        mask_tensor = rendered["mask"][:1].clamp(0.0, 1.0)[None]
+        # render_hair concatenates [hair label, all-foreground] before
+        # rasterization.  Its training loss uses channel zero because that
+        # stage optimizes fur occupancy, while a whole-animal RGB benchmark
+        # must use channel one so the known body is not incorrectly treated
+        # as transparent.  Hair-only protocols can still request channel zero.
+        mask_channel = 1 if args.evaluation_mask == "full" else 0
+        mask_tensor = rendered["mask"][mask_channel : mask_channel + 1].clamp(
+            0.0, 1.0
+        )[None]
         target_height, target_width = args.resolution_val[1], args.resolution_val[0]
         if tuple(rgb_tensor.shape[-2:]) != (target_height, target_width):
             # NeuralFur's Scene camera loader may preserve the native image

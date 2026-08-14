@@ -74,6 +74,29 @@ def test_boundary_loss_targets_alpha_at_the_silhouette() -> None:
     assert prediction["mask"].grad[1:4, 1:4].abs().sum() > 0
 
 
+def test_balanced_mask_loss_does_not_dilute_sparse_foreground() -> None:
+    prediction = {
+        "rgb": torch.zeros((10, 10, 3)),
+        "mask": torch.zeros((10, 10), requires_grad=True),
+    }
+    target_mask = torch.zeros((10, 10))
+    target_mask[0, 0] = 1.0
+    loss, parts = differentiable_render_loss(
+        prediction,
+        torch.zeros((10, 10, 3)),
+        target_mask,
+        0.0,
+        0.0,
+        mask_balance_weight=1.0,
+    )
+    assert float(parts["mask_soft"]) == pytest.approx(0.01)
+    assert float(parts["mask_foreground"]) == pytest.approx(1.0)
+    assert float(parts["mask_balanced"]) == pytest.approx(0.5)
+    loss.backward()
+    assert prediction["mask"].grad is not None
+    assert prediction["mask"].grad[0, 0].abs() > 0.1
+
+
 def test_route_contribution_separates_appearance_and_silhouette() -> None:
     full = {
         "foreground_l1": 0.1,

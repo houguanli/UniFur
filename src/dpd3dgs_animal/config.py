@@ -35,6 +35,10 @@ class PipelineConfig:
     mocap_ref_seq: str = "Dog#Dog-Galloping/y30"
     mocap_ref_idx: int = 0
     mask_loss_weight: float = 10.0
+    # Class-balanced foreground/background alpha supervision.  This is
+    # especially important for sparse hair silhouettes where a global mask
+    # mean otherwise rewards an almost-transparent solution.
+    mask_balance_weight: float = 0.0
     mask_boundary_weight: float = 0.0
     mask_boundary_radius: int = 1
     color_loss_weight: float = 1.0
@@ -82,6 +86,7 @@ class PipelineConfig:
     # learned routing. ``unified`` enables the full mixture.
     fiber_representation: str = "unified"
     fiber_max_points: int = 20000
+    fiber_binding_cache: str | None = None
     fiber_max_frames: int = 8
     fiber_renderer: str = "torch"
     fiber_shell_samples: int = 2
@@ -91,7 +96,11 @@ class PipelineConfig:
     fiber_final_temperature: float = 0.35
     fiber_sigma_scale: float = 1.0
     fiber_appearance_lr_scale: float = 0.25
+    # Small, regularized route-specific appearance offsets let shell, strand,
+    # and residual experts specialize without tripling the base color state.
+    fiber_expert_appearance_weight: float = 0.0
     fiber_geometry_lr_scale: float = 0.5
+    fiber_structure_activation_lr_scale: float = 1.0
     fiber_route_lr_scale: float = 1.0
     fiber_initial_residual_trust: float = 0.95
     # Optional geometry-only initialization for sparse neutral scalp/head
@@ -100,6 +109,20 @@ class PipelineConfig:
     fiber_initial_shell_length_scale: float | None = None
     fiber_initial_strand_length_scale: float | None = None
     fiber_initialize_direction_from_normal: bool = False
+    # UnityFurURP-inspired silhouette fins inside the shell expert.  The
+    # geometry is a thin anisotropic Gaussian ribbon and its opacity becomes
+    # view-selective only as the zero-initialized structured delta unfolds.
+    # A strength of zero is exactly backward compatible.
+    fiber_fin_gate_strength: float = 0.0
+    fiber_fin_grazing_threshold: float = 0.25
+    fiber_fin_grazing_softness: float = 0.05
+    fiber_fin_aspect_ratio: float = 1.0
+    # Shell-only supervision in a narrow ground-truth silhouette band.  This
+    # teaches fins their actual job instead of asking them to repaint the full
+    # residual image whenever the teacher route is dropped.
+    fiber_fin_silhouette_weight: float = 0.0
+    fiber_fin_silhouette_radius: int = 3
+    fiber_strand_support_weight: float = 0.0
     # Optional image-derived, confidence-weighted 2D orientation supervision.
     # This accepts the same Gabor fields used by HairGS, never 3D strand GT.
     fiber_orientation_dir: str | None = None
@@ -120,6 +143,9 @@ class PipelineConfig:
     fiber_route_neighbor_k: int = 0
     fiber_route_neighbor_weight: float = 0.0
     fiber_route_dropout_probability: float = 0.0
+    # Keep expert-removal pressure early, then optionally anneal it away so
+    # the final hard deployment receives uninterrupted joint refinement.
+    fiber_route_dropout_final_fraction: float = 1.0
     fiber_route_dropout_residual_bias: float = 1.0 / 3.0
     # Optional aggregate [shell, strand, residual] route-mass floor for
     # contribution-aware calibration.  Remaining mass is assigned from
@@ -135,6 +161,29 @@ class PipelineConfig:
     fiber_risk_calibration_ema: float = 0.8
     fiber_risk_target_prior_blend: float = 0.0
     fiber_risk_floor: float = 1e-4
+    # Residual-only teacher and deployment-safety calibration.  When enabled,
+    # the bootstrapped residual appearance/covariance/position are frozen and
+    # only zero-initialized structured increments plus routing are optimized.
+    fiber_freeze_residual_teacher: bool = False
+    # Preserve the complete residual teacher and learn shell/strand as
+    # zero-opacity structured increments.  This is the safe mode for Fin:
+    # closing a view-conditioned fin never removes teacher opacity.
+    fiber_additive_teacher_mode: bool = False
+    fiber_teacher_nonregression_weight: float = 0.0
+    fiber_teacher_nonregression_margin: float = 0.0
+    fiber_teacher_nonregression_every: int = 1
+    # LOO evidence is signed: positive ablation damage earns route mass;
+    # negative contribution (ablation improves the held-out result) is
+    # directly charged against that route's current aggregate mass.
+    fiber_negative_contribution_weight: float = 0.0
+    # Multi-view hair-mask visual hull.  The hard gate removes unsupported
+    # strand samples; the soft loss supplies a geometric gradient before the
+    # next gate refresh.
+    fiber_visual_hull_weight: float = 0.0
+    fiber_visual_hull_update_every: int = 0
+    fiber_visual_hull_min_views: int = 2
+    fiber_visual_hull_min_fraction: float = 0.15
+    fiber_visual_hull_margin_px: int = 3
     fiber_random_seed: int = 20260809
     fiber_route_entropy_weight: float = 1e-3
     fiber_route_prior_weight: float = 2e-2
@@ -144,6 +193,17 @@ class PipelineConfig:
     fiber_height_weight: float = 1e-3
     fiber_bend_weight: float = 1e-3
     fiber_residual_drift_weight: float = 1e-2
+    # Rendering ownership is not deformation ownership.  These terms learn a
+    # separate surface/shell/strand carrier for every source Gaussian, so a
+    # photometric residual can still move with the simulated asset.
+    fiber_carrier_entropy_weight: float = 0.0
+    fiber_carrier_prior_weight: float = 0.0
+    fiber_carrier_neighbor_weight: float = 0.0
+    fiber_carrier_tip_neighbor_weight: float = 0.0
+    fiber_carrier_attachment_weight: float = 0.0
+    fiber_carrier_tip_prior_weight: float = 0.0
+    fiber_carrier_family_alignment_weight: float = 0.0
+    fiber_carrier_structure_floor_weight: float = 0.0
 
 
 def _coerce_path(value: Any) -> Path:
@@ -186,6 +246,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "mocap_ref_seq",
         "mocap_ref_idx",
         "mask_loss_weight",
+        "mask_balance_weight",
         "mask_boundary_weight",
         "mask_boundary_radius",
         "color_loss_weight",
@@ -229,6 +290,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fem_handle_weight_power",
         "fiber_representation",
         "fiber_max_points",
+        "fiber_binding_cache",
         "fiber_max_frames",
         "fiber_renderer",
         "fiber_shell_samples",
@@ -238,12 +300,21 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_final_temperature",
         "fiber_sigma_scale",
         "fiber_appearance_lr_scale",
+        "fiber_expert_appearance_weight",
         "fiber_geometry_lr_scale",
+        "fiber_structure_activation_lr_scale",
         "fiber_route_lr_scale",
         "fiber_initial_residual_trust",
         "fiber_initial_shell_length_scale",
         "fiber_initial_strand_length_scale",
         "fiber_initialize_direction_from_normal",
+        "fiber_fin_gate_strength",
+        "fiber_fin_grazing_threshold",
+        "fiber_fin_grazing_softness",
+        "fiber_fin_aspect_ratio",
+        "fiber_fin_silhouette_weight",
+        "fiber_fin_silhouette_radius",
+        "fiber_strand_support_weight",
         "fiber_orientation_dir",
         "fiber_orientation_weight",
         "fiber_bootstrap_route_mass",
@@ -258,6 +329,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_route_neighbor_k",
         "fiber_route_neighbor_weight",
         "fiber_route_dropout_probability",
+        "fiber_route_dropout_final_fraction",
         "fiber_route_dropout_residual_bias",
         "fiber_route_minimum_mass",
         "fiber_route_prior_final_fraction",
@@ -268,6 +340,17 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_risk_calibration_ema",
         "fiber_risk_target_prior_blend",
         "fiber_risk_floor",
+        "fiber_freeze_residual_teacher",
+        "fiber_additive_teacher_mode",
+        "fiber_teacher_nonregression_weight",
+        "fiber_teacher_nonregression_margin",
+        "fiber_teacher_nonregression_every",
+        "fiber_negative_contribution_weight",
+        "fiber_visual_hull_weight",
+        "fiber_visual_hull_update_every",
+        "fiber_visual_hull_min_views",
+        "fiber_visual_hull_min_fraction",
+        "fiber_visual_hull_margin_px",
         "fiber_random_seed",
         "fiber_route_entropy_weight",
         "fiber_route_prior_weight",
@@ -277,6 +360,14 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_height_weight",
         "fiber_bend_weight",
         "fiber_residual_drift_weight",
+        "fiber_carrier_entropy_weight",
+        "fiber_carrier_prior_weight",
+        "fiber_carrier_neighbor_weight",
+        "fiber_carrier_tip_neighbor_weight",
+        "fiber_carrier_attachment_weight",
+        "fiber_carrier_tip_prior_weight",
+        "fiber_carrier_family_alignment_weight",
+        "fiber_carrier_structure_floor_weight",
     ):
         if key in raw:
             setattr(cfg, key, raw[key])

@@ -8,7 +8,12 @@ import numpy as np
 import torch
 
 from .config import PipelineConfig
-from .fiber import ROUTE_NAMES, create_unified_fiber_field
+from .fiber import (
+    HARD_ROUTE_POLICIES,
+    ROUTE_NAMES,
+    create_unified_fiber_field,
+    mass_preserving_route_ids,
+)
 from .fiber_evaluate import _frame_metrics, _select_frame_indices
 from .fiber_optimize import _render
 from .optimize import (
@@ -58,9 +63,22 @@ def audit_unified_fiber_routes(
     payload = torch.load(checkpoint_pt, map_location=device)
     metadata = payload.get("metadata", {})
     point_count = int(metadata.get("point_count", cfg.fiber_max_points))
+    hard_route_policy = str(
+        metadata.get("hard_route_policy", cfg.fiber_hard_route_policy)
+    )
+    if hard_route_policy not in HARD_ROUTE_POLICIES:
+        raise ValueError(
+            f"Unknown checkpoint hard-route policy {hard_route_policy!r}"
+        )
 
     motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
+    with np.load(stage1_npz, allow_pickle=False) as stage1_payload:
+        scalp_face_indices = (
+            stage1_payload["scalp_face_indices"].astype(np.int64)
+            if "scalp_face_indices" in stage1_payload.files
+            else None
+        )
     field = create_unified_fiber_field(
         gaussian_ply,
         motion.rest_surface_vertices.detach().cpu().numpy(),
@@ -68,8 +86,36 @@ def audit_unified_fiber_routes(
         device=device,
         max_points=point_count,
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
+        scalp_face_indices=scalp_face_indices,
+        binding_cache=cfg.fiber_binding_cache,
     )
-    field.load_state_dict(payload["state_dict"], strict=True)
+    checkpoint_state = payload["state_dict"]
+    checkpoint_gate = checkpoint_state.get("strand_visibility_gate")
+    if isinstance(checkpoint_gate, torch.Tensor):
+        field.strand_visibility_gate = torch.empty_like(
+            checkpoint_gate, device=field.route_logits.device
+        )
+    incompatible = field.load_state_dict(checkpoint_state, strict=False)
+    unexpected_missing = set(incompatible.missing_keys) - {
+        "expert_color_delta",
+        "bend_cubic_local",
+        "structured_delta_raw",
+        "structured_opacity_raw",
+        "strand_visibility_gate",
+        "carrier_logits",
+        "carrier_root_tip_raw",
+        "initial_carrier_probabilities",
+        "initial_carrier_root_tip",
+    }
+    if unexpected_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint state mismatch: "
+            f"missing={sorted(unexpected_missing)}, "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
+    if "structured_delta_raw" in incompatible.missing_keys:
+        with torch.no_grad():
+            field.structured_delta_raw.fill_(1.0)
     field.eval()
 
     frame_paths = _frame_paths(frame_dir)
@@ -108,7 +154,11 @@ def audit_unified_fiber_routes(
     probabilities = field.route_probabilities(
         temperature=cfg.fiber_final_temperature
     ).detach()
-    hard_labels = probabilities.argmax(dim=-1)
+    hard_labels = (
+        probabilities.argmax(dim=-1)
+        if hard_route_policy == "argmax"
+        else mass_preserving_route_ids(probabilities)
+    )
     confidence = probabilities.max(dim=-1).values
     sorted_probabilities = probabilities.sort(dim=-1, descending=True).values
     margin = sorted_probabilities[:, 0] - sorted_probabilities[:, 1]
@@ -157,6 +207,8 @@ def audit_unified_fiber_routes(
                 strand_samples=cfg.fiber_strand_samples,
                 temperature=cfg.fiber_final_temperature,
                 hard_route=False,
+                fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                additive_teacher=cfg.fiber_additive_teacher_mode,
             )
             full_prediction = _render(
                 soft_primitives, camera, cfg, renderer_name
@@ -170,6 +222,9 @@ def audit_unified_fiber_routes(
                 strand_samples=cfg.fiber_strand_samples,
                 temperature=cfg.fiber_final_temperature,
                 hard_route=True,
+                hard_route_policy=hard_route_policy,
+                fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                additive_teacher=cfg.fiber_additive_teacher_mode,
             )
             hard_prediction = _render(
                 hard_primitives, camera, cfg, renderer_name
@@ -221,6 +276,7 @@ def audit_unified_fiber_routes(
         },
         "checkpoint": str(checkpoint_pt),
         "renderer": renderer_name,
+        "hard_route_policy": hard_route_policy,
         "camera_source": observation_set.source,
         "frame_indices": frame_indices,
         "motion_indices": [motion_indices[index] for index in frame_indices],

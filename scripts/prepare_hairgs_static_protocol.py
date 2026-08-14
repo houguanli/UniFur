@@ -36,13 +36,20 @@ def _nondegenerate_tet(vertices: np.ndarray) -> np.ndarray:
 
 
 def _world_to_camera(camera: dict) -> list[list[float]]:
-    rotation = np.asarray(camera["rotation"], dtype=np.float64)
+    # HairGS writes ``cameras.json`` with graphdeco's ``camera_to_JSON``.
+    # Its serialized rotation and position form a camera-to-world transform,
+    # despite the Camera class internally storing transposed world-to-camera
+    # rotation. Horizontal orbit cameras in wCurly happen to have symmetric
+    # rotations, which hid this distinction; the overhead camera does not and
+    # was previously placed entirely behind the renderer.
+    camera_to_world_rotation = np.asarray(camera["rotation"], dtype=np.float64)
     position = np.asarray(camera["position"], dtype=np.float64)
-    if rotation.shape != (3, 3) or position.shape != (3,):
+    if camera_to_world_rotation.shape != (3, 3) or position.shape != (3,):
         raise ValueError("HairGS camera must provide 3x3 rotation and 3-vector position")
+    world_to_camera_rotation = camera_to_world_rotation.T
     matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, :3] = rotation
-    matrix[:3, 3] = -rotation @ position
+    matrix[:3, :3] = world_to_camera_rotation
+    matrix[:3, 3] = -world_to_camera_rotation @ position
     return matrix.tolist()
 
 
@@ -161,11 +168,17 @@ def main() -> None:
     if not train_observations or not test_observations:
         raise ValueError("Static split must contain both fit and held-out observations")
     (out / "train" / "camera_manifest.json").write_text(
-        json.dumps(_manifest(train_observations, split="train", image_count=len(image_paths)), indent=2),
+        json.dumps(
+            _manifest(train_observations, split="train", image_count=len(train_observations)),
+            indent=2,
+        ),
         encoding="utf-8",
     )
     (out / "test" / "camera_manifest.json").write_text(
-        json.dumps(_manifest(test_observations, split="test", image_count=len(image_paths)), indent=2),
+        json.dumps(
+            _manifest(test_observations, split="test", image_count=len(test_observations)),
+            indent=2,
+        ),
         encoding="utf-8",
     )
     (out / "protocol.json").write_text(

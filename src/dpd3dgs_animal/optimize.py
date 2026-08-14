@@ -327,6 +327,7 @@ def differentiable_render_loss(
     mask_weight: float,
     mask_boundary_weight: float = 0.0,
     mask_boundary_radius: int = 1,
+    mask_balance_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     valid = gt_mask[..., None].clamp(0.0, 1.0)
     color = (torch.abs(pred["rgb"] - gt_rgb) * valid).sum() / (valid.sum() * 3.0).clamp_min(1.0)
@@ -338,6 +339,15 @@ def differentiable_render_loss(
     # improve foreground color while evading silhouette supervision. Optimize
     # continuous alpha and retain mask_01 as a diagnostic only.
     mask_loss = mask_soft
+    target_mask = gt_mask.clamp(0.0, 1.0)
+    foreground = (
+        torch.abs(pred["mask"] - target_mask) * target_mask
+    ).sum() / target_mask.sum().clamp_min(1.0)
+    background_mask = 1.0 - target_mask
+    background = (
+        torch.abs(pred["mask"] - target_mask) * background_mask
+    ).sum() / background_mask.sum().clamp_min(1.0)
+    mask_balanced = 0.5 * (foreground + background)
     mask_boundary = pred["mask"].new_zeros(())
     if mask_boundary_weight > 0.0:
         radius = max(int(mask_boundary_radius), 0)
@@ -352,6 +362,7 @@ def differentiable_render_loss(
     total = (
         color_weight * color
         + mask_weight * mask_loss
+        + mask_balance_weight * mask_balanced
         + mask_boundary_weight * mask_boundary
     )
     return total, {
@@ -359,6 +370,9 @@ def differentiable_render_loss(
         "mask_loss": mask_loss,
         "mask_soft": mask_soft,
         "mask_01": mask_01,
+        "mask_balanced": mask_balanced,
+        "mask_foreground": foreground,
+        "mask_background": background,
         "mask_boundary": mask_boundary,
     }
 

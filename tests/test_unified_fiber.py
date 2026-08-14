@@ -7,10 +7,16 @@ from dpd3dgs_animal.fiber_optimize import (
 )
 
 from dpd3dgs_animal.fiber import (
+    CARRIER_NAMES,
     UnifiedFiberField,
     _quaternion_to_matrix_torch,
+    apply_fin_view_gate,
+    deform_simulation_asset,
+    edit_structured_fibers,
+    fin_grazing_gate,
     mass_preserving_route_ids,
     render_fiber_primitives,
+    simulation_asset_summary,
 )
 from dpd3dgs_animal.render import PinholeCamera
 
@@ -64,6 +70,78 @@ def test_unified_routes_form_a_differentiable_partition() -> None:
     assert torch.isfinite(field.residual_trust_logits.grad).all()
     assert field.direction_local_raw.grad is not None
     assert torch.isfinite(field.direction_local_raw.grad).all()
+
+
+def test_expert_appearance_is_render_preserving_at_initialization() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3, temperature=0.8
+    )
+    expected = field.color[primitives.source_id]
+    torch.testing.assert_close(primitives.color, expected)
+
+
+def test_expert_appearance_receives_route_specific_gradients() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3, temperature=0.8
+    )
+    primitives.color[primitives.route_id == 1].sum().backward()
+    gradient = field.expert_color_delta.grad
+    assert gradient is not None
+    assert float(gradient[:, 1].abs().sum()) > 0.0
+    torch.testing.assert_close(gradient[:, 0], torch.zeros_like(gradient[:, 0]))
+    torch.testing.assert_close(gradient[:, 2], torch.zeros_like(gradient[:, 2]))
+
+
+def test_cubic_strand_bend_adds_inflection_and_receives_gradients() -> None:
+    field, vertices, faces = _toy_field()
+    baseline = field.primitives(
+        vertices,
+        faces,
+        shell_samples=1,
+        strand_samples=5,
+        forced_route="strand",
+    )
+    strand_slice = slice(field.point_count, field.point_count * 6)
+    with torch.no_grad():
+        field.structured_delta_raw[:, 1] = 1.0
+        field.bend_local[:, 0] = 0.25
+        field.bend_cubic_local[:, 0] = -0.35
+    curved = field.primitives(
+        vertices,
+        faces,
+        shell_samples=1,
+        strand_samples=5,
+        forced_route="strand",
+    )
+    assert not torch.allclose(
+        curved.xyz[strand_slice], baseline.xyz[strand_slice]
+    )
+    curved.xyz[strand_slice].square().mean().backward()
+    assert field.bend_cubic_local.grad is not None
+    assert float(field.bend_cubic_local.grad.abs().sum()) > 0.0
+    assert torch.isfinite(field.bend_cubic_local.grad).all()
+
+
+def test_structured_geometry_is_an_exact_zero_initialized_residual_increment() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3
+    )
+    shell = primitives.xyz[: field.point_count * 2].reshape(
+        field.point_count, 2, 3
+    )
+    strand = primitives.xyz[
+        field.point_count * 2 : field.point_count * 5
+    ].reshape(field.point_count, 3, 3)
+    residual = primitives.xyz[-field.point_count :]
+    torch.testing.assert_close(
+        shell, residual[:, None, :].expand_as(shell)
+    )
+    torch.testing.assert_close(
+        strand, residual[:, None, :].expand_as(strand)
+    )
 
 
 def test_surface_anchor_moves_all_three_representations_with_the_animal() -> None:
@@ -155,6 +233,16 @@ def test_mass_preserving_hard_routes_match_soft_expected_counts() -> None:
     hard[:, 0].sum().backward()
     assert field.route_logits.grad is not None
     assert float(field.route_logits.grad.abs().sum()) > 0.0
+
+
+def test_mass_preserving_routes_normalize_small_row_mass_drift() -> None:
+    probabilities = torch.tensor(
+        [[0.7, 0.2, 0.1], [0.1, 0.6, 0.3], [0.2, 0.2, 0.6]],
+        dtype=torch.float32,
+    )
+    route_ids = mass_preserving_route_ids(probabilities * 0.999)
+    assert route_ids.shape == (3,)
+    assert int(torch.bincount(route_ids, minlength=3).sum()) == 3
 
 
 def test_residual_bootstrap_transfers_only_residual_scaffold(tmp_path) -> None:
@@ -317,9 +405,244 @@ def test_lightweight_fiber_renderer_backpropagates_to_geometry_and_routing() -> 
         "shell_length",
         "strand_thinness",
         "height",
-        "bend",
-        "residual_drift",
-        "residual_trust",
-    }
+            "bend",
+            "structured_delta",
+            "structured_opacity",
+                "residual_drift",
+            "residual_trust",
+            "expert_appearance",
+            "carrier_entropy",
+            "carrier_prior",
+            "carrier_neighbor",
+            "carrier_tip_neighbor",
+            "carrier_attachment",
+            "carrier_tip_prior",
+            "carrier_confidence",
+            "carrier_structure_mass",
+            "carrier_family_alignment",
+            "carrier_structure_floor",
+        }
     assert all(torch.isfinite(value) for value in regularizers.values())
     assert float(regularizers["route_neighbor"]) > 0.0
+
+
+def test_fin_gate_prefers_grazing_views_and_preserves_zero_delta_teacher() -> None:
+    field, vertices, faces = _toy_field()
+    front_camera = PinholeCamera(
+        width=48,
+        height=48,
+        fx=45.0,
+        fy=45.0,
+        cx=24.0,
+        cy=24.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    grazing_world_to_camera = np.eye(4, dtype=np.float32)
+    grazing_world_to_camera[:3, 3] = [-5.0, 0.0, -2.0]
+    grazing_camera = PinholeCamera(
+        width=48,
+        height=48,
+        fx=45.0,
+        fy=45.0,
+        cx=24.0,
+        cy=24.0,
+        world_to_camera=grazing_world_to_camera,
+        image_y_down=True,
+    )
+    point = torch.tensor([[0.0, 0.0, 2.0]])
+    normal = torch.tensor([[0.0, 0.0, 1.0]])
+    front_gate = fin_grazing_gate(
+        point, normal, front_camera, threshold=0.25, softness=0.05
+    )
+    grazing_gate = fin_grazing_gate(
+        point, normal, grazing_camera, threshold=0.25, softness=0.05
+    )
+    assert float(grazing_gate) > 0.99
+    assert float(front_gate) < 1e-5
+
+    # Enabling Fin cannot change the zero-initialized residual teacher.
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3
+    )
+    gated = apply_fin_view_gate(
+        primitives,
+        front_camera,
+        strength=1.0,
+        threshold=0.25,
+        softness=0.05,
+    )
+    torch.testing.assert_close(gated.opacity, primitives.opacity)
+
+
+def test_fin_ribbon_is_anisotropic_and_only_gates_shell_opacity() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.structured_delta_raw[:, 0] = 1.0
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        geometry_blend=1.0,
+        fin_aspect_ratio=9.0,
+    )
+    shell = primitives.route_id == 0
+    residual_or_strand = ~shell
+    torch.testing.assert_close(
+        primitives.scaling[shell, 1] / primitives.scaling[shell, 2],
+        torch.full_like(primitives.scaling[shell, 1], 9.0),
+    )
+    assert primitives.root_tip is not None
+    assert primitives.surface_normal is not None
+    assert primitives.structure_weight is not None
+
+    camera = PinholeCamera(
+        width=48,
+        height=48,
+        fx=45.0,
+        fy=45.0,
+        cx=24.0,
+        cy=24.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    gated = apply_fin_view_gate(
+        primitives,
+        camera,
+        strength=1.0,
+        threshold=0.25,
+        softness=0.05,
+    )
+    assert torch.all(gated.opacity[shell] < primitives.opacity[shell])
+    torch.testing.assert_close(
+        gated.opacity[residual_or_strand], primitives.opacity[residual_or_strand]
+    )
+
+
+def test_additive_teacher_is_exact_at_zero_and_structured_gain_is_trainable() -> None:
+    field, vertices, faces = _toy_field()
+    residual = field.residual_primitives(vertices, faces)
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        additive_teacher=True,
+    )
+    shell_or_strand = primitives.route_id != 2
+    residual_slice = primitives.route_id == 2
+    torch.testing.assert_close(
+        primitives.opacity[shell_or_strand],
+        torch.zeros_like(primitives.opacity[shell_or_strand]),
+    )
+    torch.testing.assert_close(primitives.opacity[residual_slice], residual.opacity)
+
+    # Although its primal opacity is zero, the straight-through gain supplies
+    # a finite gradient that can grow a positively contributing Fin/strand.
+    primitives.opacity[shell_or_strand].sum().backward()
+    assert field.structured_opacity_raw.grad is not None
+    assert float(field.structured_opacity_raw.grad.abs().sum()) > 0.0
+    assert torch.isfinite(field.structured_opacity_raw.grad).all()
+
+
+def test_downstream_length_and_wind_edits_preserve_residual_and_roots() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.structured_delta_raw.fill_(1.0)
+        field.structured_opacity_raw.fill_(1.0)
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3
+    )
+    edited = edit_structured_fibers(
+        primitives,
+        length_scale=1.25,
+        wind_displacement=torch.tensor([0.05, 0.0, 0.0]),
+        wind_power=2.0,
+    )
+    residual = primitives.route_id == 2
+    structured = ~residual
+    torch.testing.assert_close(edited.xyz[residual], primitives.xyz[residual])
+    torch.testing.assert_close(
+        edited.scaling[residual], primitives.scaling[residual]
+    )
+    assert float((edited.xyz[structured] - primitives.xyz[structured]).abs().sum()) > 0
+
+    # Pure wind is exactly root-fixed and moves distal samples more.
+    wind_only = edit_structured_fibers(
+        primitives,
+        wind_displacement=torch.tensor([0.05, 0.0, 0.0]),
+        wind_power=2.0,
+    )
+    displacement = torch.linalg.vector_norm(
+        wind_only.xyz - primitives.xyz, dim=-1
+    )
+    root_tip = primitives.root_tip
+    assert root_tip is not None
+    route_tip = structured & (root_tip > 0.7)
+    route_root = structured & (root_tip < 0.3)
+    assert float(displacement[route_tip].mean()) > float(displacement[route_root].mean())
+
+
+def test_simulation_carrier_moves_residual_without_changing_render_route() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.carrier_logits.fill_(-10.0)
+        field.carrier_logits[:, CARRIER_NAMES.index("strand")] = 10.0
+        field.carrier_root_tip_raw.copy_(torch.tensor([0.0, 1.0]))
+    primitives = field.primitives(vertices, faces, shell_samples=1, strand_samples=2)
+    edited = deform_simulation_asset(
+        primitives,
+        wind_displacement=torch.tensor([0.1, 0.0, 0.0]),
+        wind_power=2.0,
+        hard_carriers=True,
+    )
+    residual = primitives.route_id == 2
+    residual_displacement = edited.xyz[residual] - primitives.xyz[residual]
+    torch.testing.assert_close(
+        residual_displacement[0], torch.zeros(3), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        residual_displacement[1], torch.tensor([0.1, 0.0, 0.0])
+    )
+    summary = simulation_asset_summary(primitives)
+    assert summary["residual_fiber_bound"] > 0.999
+
+    # Rendering ownership is unchanged: there is still exactly one residual
+    # primitive per source even though its deformation owner is a strand.
+    assert int(residual.sum()) == field.point_count
+
+
+def test_surface_carrier_keeps_residual_fixed_under_fiber_edit() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.carrier_logits.fill_(-10.0)
+        field.carrier_logits[:, CARRIER_NAMES.index("surface")] = 10.0
+        field.carrier_root_tip_raw.fill_(1.0)
+    primitives = field.primitives(vertices, faces, shell_samples=1, strand_samples=2)
+    edited = deform_simulation_asset(
+        primitives,
+        length_scale=1.5,
+        wind_displacement=torch.tensor([0.1, 0.0, 0.0]),
+        hard_carriers=True,
+    )
+    residual = primitives.route_id == 2
+    torch.testing.assert_close(edited.xyz[residual], primitives.xyz[residual])
+    torch.testing.assert_close(
+        edited.scaling[residual], primitives.scaling[residual]
+    )
+
+
+def test_carrier_regularizers_train_assignment_and_attachment() -> None:
+    field, vertices, faces = _toy_field()
+    regularizers = field.regularizers(vertices, faces, temperature=0.8)
+    loss = (
+        regularizers["carrier_entropy"]
+        + regularizers["carrier_attachment"]
+        + regularizers["carrier_tip_prior"]
+    )
+    loss.backward()
+    assert field.carrier_logits.grad is not None
+    assert torch.isfinite(field.carrier_logits.grad).all()
+    assert field.carrier_root_tip_raw.grad is not None
+    assert torch.isfinite(field.carrier_root_tip_raw.grad).all()

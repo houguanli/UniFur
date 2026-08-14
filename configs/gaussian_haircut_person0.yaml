@@ -1,0 +1,67 @@
+# GaussianHaircut's native strand configuration adapted only to the public
+# NeuralHaircut person_0 asset paths.  Architecture, priors, counts, and loss
+# weights match the upstream hair_strands_textured.yaml.
+sdf_chamfer:
+  mesh_outer_hair: /mnt/f/fur_hair_unified_data/benchmarks/gaussian_haircut_person0_protocol/hair_outer.ply
+  mesh_outer_hair_remeshed: /mnt/f/fur_hair_unified_data/benchmarks/gaussian_haircut_person0_protocol/hair_outer_remeshed.ply
+  num_points: 10000
+
+textured_strands:
+  path_to_mesh: /mnt/f/fur_hair_unified_data/benchmarks/gaussian_haircut_person0_protocol/head_prior.obj
+  decoder_checkpoint_path: ""
+  num_strands: 10000
+  max_num_strands: 50000
+  texture_size: 256
+  geometry_descriptor_size: 64
+  appearance_descriptor_size: 65
+  cut_scalp: true
+
+diffusion_prior:
+  use_diffusion: true
+  start_denoise: 1
+  diffuse_mask: /mnt/f/fur_hair_unified_data/benchmarks/gaussian_haircut_person0_protocol/dif_mask.png
+  diffuse_bs: 32
+  dif_path: ""
+  model:
+    type: image_v1
+    input_channels: 64
+    input_size: [32, 32]
+    patch_size: 1
+    mapping_out: 256
+    depths: [2, 4, 4]
+    channels: [128, 256, 512]
+    mapping_cond_dim: 0
+    unet_cond_dim: 0
+    cross_cond_dim: 0
+    cross_attn_depths: null
+    self_attn_depths: [false, false, false]
+    has_variance: true
+    dropout_rate: 0.05
+    skip_stages: 0
+    augment_wrapper: false
+    augment_prob: 0.12
+    sigma_data: 0.5
+    sigma_min: 0.02
+    sigma_max: 40
+    sigma_sample_density:
+      type: lognormal
+      mean: -1.2
+      std: 1.2
+
+general:
+  lr: 0.001
+  starting_rendering_iter: 1
+  gamma: 0.5
+  milestones: [40000, 60000, 80000]
+
+loss_factors:
+  volume: 1.0
+  orient: 0.01
+  chamfer: 1.0
+  raster_silh: 0.00001
+  raster_l1: 0.001
+  raster_alpha: 0.0
+  L_diff: 0.001
+
+extra_args:
+  num_guiding_strands: 1000

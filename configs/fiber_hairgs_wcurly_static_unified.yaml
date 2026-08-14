@@ -3,6 +3,8 @@ optimize_lr: 0.001
 optimize_steps: 6000
 color_loss_weight: 1.0
 mask_loss_weight: 2.0
+# Equalize sparse hair foreground and background contributions.
+mask_balance_weight: 2.0
 mask_boundary_weight: 0.20
 mask_boundary_radius: 1
 
@@ -21,6 +23,9 @@ fiber_initial_temperature: 2.0
 fiber_final_temperature: 0.35
 fiber_sigma_scale: 1.0
 fiber_appearance_lr_scale: 0.5
+# Allow shell/strand/residual to explain different appearance statistics while
+# keeping route-specific offsets close to the shared color scaffold.
+fiber_expert_appearance_weight: 0.001
 fiber_geometry_lr_scale: 0.5
 fiber_route_lr_scale: 1.0
 # Scalp-only structural initialization: local z is the outward head normal;
@@ -46,6 +51,7 @@ fiber_route_entropy_weight: 0.0005
 fiber_route_neighbor_k: 8
 fiber_route_neighbor_weight: 0.01
 fiber_route_dropout_probability: 0.60
+fiber_route_dropout_final_fraction: 1.0
 fiber_route_dropout_residual_bias: 0.90
 fiber_route_prior_weight: 0.04
 fiber_route_prior_final_fraction: 0.25

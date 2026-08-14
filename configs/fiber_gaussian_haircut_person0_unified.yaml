@@ -1,0 +1,83 @@
+device: cuda
+optimize_lr: 0.001
+optimize_steps: 16000
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+mask_balance_weight: 2.0
+mask_boundary_weight: 0.20
+mask_boundary_radius: 1
+
+# Same public person0 views, cameras, head frame and Gaussian scaffold as the
+# GaussianHaircut run.  Only the hair representation/refinement is changed.
+fiber_representation: unified
+fiber_renderer: hairgs
+fiber_max_points: 20000
+fiber_max_frames: 33
+fiber_calibration_frames: 5
+fiber_shell_samples: 2
+fiber_strand_samples: 5
+fiber_warmup_steps: 2500
+fiber_initial_temperature: 2.0
+fiber_final_temperature: 0.35
+fiber_sigma_scale: 1.0
+fiber_appearance_lr_scale: 0.5
+fiber_expert_appearance_weight: 0.001
+fiber_geometry_lr_scale: 0.5
+fiber_route_lr_scale: 1.0
+
+fiber_initialize_direction_from_normal: true
+fiber_initial_shell_length_scale: 0.01
+fiber_initial_strand_length_scale: 0.12
+fiber_initial_residual_trust: 0.95
+fiber_bootstrap_route_mass: [0.01, 0.01, 0.98]
+fiber_residual_trust_weight: 0.0
+fiber_orientation_dir: /mnt/f/fur_hair_unified_data/benchmarks/gaussian_haircut_person0_protocol/protocol/train/orientations
+fiber_orientation_weight: 0.15
+fiber_residual_drift_weight: 0.005
+fiber_gradient_clip: 10.0
+fiber_log_every: 100
+fiber_checkpoint_every: 2000
+fiber_ema_decay: 0.95
+fiber_route_continuation: true
+fiber_route_hardening: true
+fiber_hard_route_policy: mass_preserving
+
+fiber_route_entropy_weight: 0.0005
+fiber_route_neighbor_k: 8
+fiber_route_neighbor_weight: 0.01
+fiber_route_dropout_probability: 0.20
+fiber_route_dropout_final_fraction: 0.0
+fiber_route_dropout_residual_bias: 0.0
+fiber_route_prior_weight: 0.005
+fiber_route_prior_final_fraction: 0.0
+fiber_route_minimum_mass: null
+fiber_random_seed: 20260819
+fiber_risk_calibration_every: 500
+fiber_risk_calibration_start_geometry_blend: 0.95
+fiber_risk_calibration_weight: 0.02
+fiber_risk_calibration_ema: 0.8
+fiber_risk_target_prior_blend: 0.0
+fiber_risk_floor: 0.0001
+
+# Deployment safety: the residual-only checkpoint is immutable. Structured
+# routes begin as exact zero-delta copies and are allowed to unfold only when
+# the held-out calibration views do not regress.
+fiber_freeze_residual_teacher: true
+fiber_teacher_nonregression_weight: 5.0
+fiber_teacher_nonregression_margin: 0.0
+fiber_teacher_nonregression_every: 10
+fiber_negative_contribution_weight: 0.5
+
+# Hair-mask visual hull over all calibrated fit/calibration views. Five-pixel
+# dilation tolerates antialiasing and mask uncertainty; root-to-tip prefix
+# connectivity removes floating distal segments.
+fiber_visual_hull_weight: 0.10
+fiber_visual_hull_update_every: 1000
+fiber_visual_hull_min_views: 2
+fiber_visual_hull_min_fraction: 0.15
+fiber_visual_hull_margin_px: 5
+fiber_shell_normal_weight: 0.02
+fiber_shell_length_weight: 0.001
+fiber_strand_thinness_weight: 0.01
+fiber_height_weight: 0.001
+fiber_bend_weight: 0.001

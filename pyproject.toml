@@ -25,3 +25,10 @@ dpd3dgs-animal = "dpd3dgs_animal.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# External baseline runners may legitimately end in ``_test.py``.  They are
+# executable adapters, not unit-test modules, and often import dependencies
+# from the baseline's own environment.  Keep collection scoped to our tests.
+testpaths = ["tests"]
+python_files = ["test_*.py"]

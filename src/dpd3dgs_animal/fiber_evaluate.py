@@ -120,6 +120,12 @@ def evaluate_unified_fiber_stage2(
         )
     motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
+    with np.load(stage1_npz, allow_pickle=False) as stage1_payload:
+        scalp_face_indices = (
+            stage1_payload["scalp_face_indices"].astype(np.int64)
+            if "scalp_face_indices" in stage1_payload.files
+            else None
+        )
     field = create_unified_fiber_field(
         gaussian_ply,
         motion.rest_surface_vertices.detach().cpu().numpy(),
@@ -127,12 +133,29 @@ def evaluate_unified_fiber_stage2(
         device=device,
         max_points=point_count,
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
+        scalp_face_indices=scalp_face_indices,
+        binding_cache=cfg.fiber_binding_cache,
     )
-    incompatible = field.load_state_dict(payload["state_dict"], strict=False)
+    checkpoint_state = payload["state_dict"]
+    checkpoint_gate = checkpoint_state.get("strand_visibility_gate")
+    if isinstance(checkpoint_gate, torch.Tensor):
+        field.strand_visibility_gate = torch.empty_like(
+            checkpoint_gate, device=field.route_logits.device
+        )
+    incompatible = field.load_state_dict(checkpoint_state, strict=False)
     allowed_missing = {
         "residual_log_scale_delta",
         "residual_rotation_raw",
         "residual_trust_logits",
+        "expert_color_delta",
+        "bend_cubic_local",
+        "structured_delta_raw",
+        "structured_opacity_raw",
+        "strand_visibility_gate",
+        "carrier_logits",
+        "carrier_root_tip_raw",
+        "initial_carrier_probabilities",
+        "initial_carrier_root_tip",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:
@@ -141,6 +164,11 @@ def evaluate_unified_fiber_stage2(
             f"missing={sorted(unexpected_missing)}, "
             f"unexpected={sorted(incompatible.unexpected_keys)}"
         )
+    if "structured_delta_raw" in incompatible.missing_keys:
+        # Checkpoints produced before zero-initialized structured increments
+        # already stored fully deployed shell/strand geometry.
+        with torch.no_grad():
+            field.structured_delta_raw.fill_(1.0)
     field.eval()
 
     frame_paths = _frame_paths(frame_dir)
@@ -216,6 +244,8 @@ def evaluate_unified_fiber_stage2(
                     forced_route=route_mode if route_mode in ROUTE_NAMES else None,
                     hard_route=route_mode == "hard",
                     hard_route_policy=hard_route_policy,
+                    fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                    additive_teacher=cfg.fiber_additive_teacher_mode,
                 )
             prediction = _render(primitives, camera, cfg, renderer_name)
             ground_truth = _load_gt_frame_torch(
