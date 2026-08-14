@@ -4,12 +4,16 @@ import torch
 from dpd3dgs_animal.fiber_optimize import (
     _apply_route_mass_floor,
     _load_residual_bootstrap_checkpoint,
+    _resolve_fiber_point_budget,
 )
+from dpd3dgs_animal.config import PipelineConfig
 
 from dpd3dgs_animal.fiber import (
     CARRIER_NAMES,
     UnifiedFiberField,
+    _bind_exact_surface_vertices,
     _quaternion_to_matrix_torch,
+    _select_gaussian_indices,
     apply_fin_view_gate,
     deform_simulation_asset,
     edit_structured_fibers,
@@ -19,6 +23,59 @@ from dpd3dgs_animal.fiber import (
     simulation_asset_summary,
 )
 from dpd3dgs_animal.render import PinholeCamera
+
+
+def test_pixel_adaptive_capacity_uses_resolution_and_hard_cap() -> None:
+    cfg = PipelineConfig(
+        fiber_capacity_mode="pixel_adaptive",
+        fiber_min_points=20_000,
+        fiber_max_points=43_662,
+        fiber_target_pixels_per_point=6.0,
+    )
+    assert _resolve_fiber_point_budget(cfg, (512, 512)) == 43_662
+    assert _resolve_fiber_point_budget(cfg, (320, 180)) == 20_000
+    assert (
+        _resolve_fiber_point_budget(
+            cfg, (512, 512), explicit_max_points=12_345
+        )
+        == 12_345
+    )
+
+
+def test_spatial_morton_sampling_is_deterministic_and_covers_extent() -> None:
+    grid = np.stack(
+        np.meshgrid(
+            np.linspace(-1.0, 1.0, 10),
+            np.linspace(-2.0, 2.0, 8),
+            np.linspace(-3.0, 3.0, 6),
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    # Deliberately scramble topology/order; the selected subset must depend on
+    # geometry, not this arbitrary PLY ordering.
+    grid = grid[np.random.default_rng(7).permutation(grid.shape[0])]
+    first = _select_gaussian_indices(grid, 96, mode="spatial_morton")
+    second = _select_gaussian_indices(grid, 96, mode="spatial_morton")
+    np.testing.assert_array_equal(first, second)
+    assert np.unique(first).shape[0] == 96
+    selected = grid[first]
+    assert np.all(selected.min(axis=0) < np.array([-0.7, -1.4, -2.0]))
+    assert np.all(selected.max(axis=0) > np.array([0.7, 1.4, 2.0]))
+
+
+def test_exact_vertex_binding_reconstructs_selected_mesh_vertices() -> None:
+    vertices = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    selected = np.asarray([3, 1, 0], dtype=np.int64)
+    binding = _bind_exact_surface_vertices(selected, faces, None)
+    assert binding is not None
+    triangles = vertices[faces[binding.face_index]]
+    roots = (binding.barycentric[..., None] * triangles).sum(axis=1)
+    np.testing.assert_allclose(roots, vertices[selected])
 
 
 def _toy_field() -> tuple[UnifiedFiberField, torch.Tensor, torch.Tensor]:

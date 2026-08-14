@@ -85,7 +85,21 @@ class PipelineConfig:
     # anisotropic Gaussian per source point, with no shell/strand experts or
     # learned routing. ``unified`` enables the full mixture.
     fiber_representation: str = "unified"
+    # Capacity may remain fixed for already well-initialized 3DGS, or scale
+    # with the raster area for weak geometry-only seeds.  ``fiber_max_points``
+    # is always a hard ceiling, so the adaptive policy cannot silently exceed
+    # the memory budget recorded by an experiment config.
+    fiber_capacity_mode: str = "fixed"
+    fiber_min_points: int = 0
     fiber_max_points: int = 20000
+    fiber_target_pixels_per_point: float = 8.0
+    # PLY order is often topology/optimizer order rather than spatial order.
+    # Morton-systematic sampling preserves 3D coverage when a cloud must be
+    # truncated, while ``uniform_index`` reproduces previous checkpoints.
+    fiber_point_sampling_mode: str = "uniform_index"
+    fiber_exact_vertex_binding: bool = False
+    fiber_default_opacity: float = 0.5
+    fiber_default_opacity_reference_points: int = 0
     fiber_binding_cache: str | None = None
     fiber_max_frames: int = 8
     fiber_renderer: str = "torch"
@@ -289,7 +303,14 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fem_handle_support",
         "fem_handle_weight_power",
         "fiber_representation",
+        "fiber_capacity_mode",
+        "fiber_min_points",
         "fiber_max_points",
+        "fiber_target_pixels_per_point",
+        "fiber_point_sampling_mode",
+        "fiber_exact_vertex_binding",
+        "fiber_default_opacity",
+        "fiber_default_opacity_reference_points",
         "fiber_binding_cache",
         "fiber_max_frames",
         "fiber_renderer",

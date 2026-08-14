@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dpd3dgs_animal.fiber import _binding_cache_key
+from dpd3dgs_animal.fiber import _binding_cache_key, _select_gaussian_indices
 from dpd3dgs_animal.gaussian import load_gaussian_ply
 
 
@@ -18,11 +18,20 @@ def main() -> None:
     parser.add_argument("--stage1-npz", required=True)
     parser.add_argument("--field-state-npz", required=True)
     parser.add_argument("--max-points", type=int, default=20000)
+    parser.add_argument(
+        "--point-sampling-mode",
+        choices=("uniform_index", "spatial_morton"),
+        default="uniform_index",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     xyz = np.asarray(load_gaussian_ply(args.gaussian_ply).xyz, dtype=np.float32)
     if 0 < int(args.max_points) < xyz.shape[0]:
-        indices = np.linspace(0, xyz.shape[0] - 1, int(args.max_points)).astype(np.int64)
+        indices = _select_gaussian_indices(
+            xyz,
+            int(args.max_points),
+            mode=args.point_sampling_mode,
+        )
         xyz = xyz[indices]
     with np.load(args.stage1_npz, allow_pickle=False) as stage1:
         vertices = stage1["rest_surface_vertices"].astype(np.float32)

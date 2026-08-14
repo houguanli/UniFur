@@ -171,6 +171,41 @@ def _freeze_residual_teacher_scaffold(field: UnifiedFiberField) -> None:
     )
 
 
+def _resolve_fiber_point_budget(
+    cfg: PipelineConfig,
+    render_size: tuple[int, int],
+    *,
+    explicit_max_points: int | None = None,
+) -> int:
+    """Resolve a reproducible source-Gaussian budget for one experiment."""
+
+    if explicit_max_points is not None:
+        if int(explicit_max_points) < 0:
+            raise ValueError("max_points override must be non-negative")
+        return int(explicit_max_points)
+    hard_max = int(cfg.fiber_max_points)
+    if hard_max < 0:
+        raise ValueError("fiber_max_points must be non-negative")
+    mode = str(cfg.fiber_capacity_mode).lower()
+    if mode == "fixed":
+        return hard_max
+    if mode != "pixel_adaptive":
+        raise ValueError(
+            "fiber_capacity_mode must be 'fixed' or 'pixel_adaptive'"
+        )
+    pixels_per_point = float(cfg.fiber_target_pixels_per_point)
+    if not math.isfinite(pixels_per_point) or pixels_per_point <= 0.0:
+        raise ValueError("fiber_target_pixels_per_point must be positive")
+    minimum = int(cfg.fiber_min_points)
+    if minimum < 0:
+        raise ValueError("fiber_min_points must be non-negative")
+    width, height = (int(render_size[0]), int(render_size[1]))
+    if width <= 0 or height <= 0:
+        raise ValueError("render_size must be positive")
+    adaptive = max(minimum, int(math.ceil(width * height / pixels_per_point)))
+    return min(adaptive, hard_max) if hard_max > 0 else adaptive
+
+
 def optimize_unified_fiber_stage2(
     stage1_npz: str | Path,
     gaussian_ply: str | Path,
@@ -213,6 +248,13 @@ def optimize_unified_fiber_stage2(
         raise ValueError(
             "fiber_representation must be 'unified' or 'residual_only'"
         )
+    frame_paths = _frame_paths(frame_dir)
+    width, height = _resolve_render_size(render_size, frame_paths, stage1_npz)
+    point_budget = _resolve_fiber_point_budget(
+        cfg,
+        (width, height),
+        explicit_max_points=max_points,
+    )
     motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     with np.load(stage1_npz, allow_pickle=False) as stage1_payload:
@@ -226,7 +268,13 @@ def optimize_unified_fiber_stage2(
         motion.rest_surface_vertices.detach().cpu().numpy(),
         motion.surface_faces.detach().cpu().numpy(),
         device=device,
-        max_points=int(max_points or cfg.fiber_max_points),
+        max_points=point_budget,
+        point_sampling_mode=str(cfg.fiber_point_sampling_mode),
+        exact_vertex_binding=bool(cfg.fiber_exact_vertex_binding),
+        default_opacity=float(cfg.fiber_default_opacity),
+        default_opacity_reference_points=int(
+            cfg.fiber_default_opacity_reference_points
+        ),
         neighbor_k=(
             int(cfg.fiber_route_neighbor_k) if representation == "unified" else 0
         ),
@@ -264,8 +312,6 @@ def optimize_unified_fiber_stage2(
     if representation == "unified" and bool(cfg.fiber_freeze_residual_teacher):
         _freeze_residual_teacher_scaffold(field)
 
-    frame_paths = _frame_paths(frame_dir)
-    width, height = _resolve_render_size(render_size, frame_paths, stage1_npz)
     observation_set = resolve_observations(
         frame_paths,
         stage1_npz,
@@ -905,6 +951,10 @@ def optimize_unified_fiber_stage2(
             "metadata": {
                 "routes": ROUTE_NAMES,
                 "point_count": field.point_count,
+                "requested_point_budget": point_budget,
+                "capacity_mode": cfg.fiber_capacity_mode,
+                "point_sampling_mode": cfg.fiber_point_sampling_mode,
+                "exact_vertex_binding": bool(cfg.fiber_exact_vertex_binding),
                 "scene_scale": float(field.scene_scale.detach().cpu()),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
@@ -1785,6 +1835,8 @@ def _save_training_checkpoint(
             "metadata": {
                 "routes": ROUTE_NAMES,
                 "point_count": field.point_count,
+                "point_sampling_mode": cfg.fiber_point_sampling_mode,
+                "exact_vertex_binding": bool(cfg.fiber_exact_vertex_binding),
                 "frame_indices": list(frame_indices),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,

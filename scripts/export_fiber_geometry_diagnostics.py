@@ -60,6 +60,10 @@ def _load_field(args: argparse.Namespace, motion, device: str):
         motion.surface_faces.detach().cpu().numpy(),
         device=device,
         max_points=int(metadata.get("point_count", 20_000)),
+        point_sampling_mode=str(
+            metadata.get("point_sampling_mode", "uniform_index")
+        ),
+        exact_vertex_binding=bool(metadata.get("exact_vertex_binding", False)),
         scalp_face_indices=scalp_face_indices,
     )
     state = payload["state_dict"]

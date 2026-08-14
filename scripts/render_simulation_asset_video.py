@@ -57,6 +57,12 @@ def _load_field(args, cfg, device):
     payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
     metadata = payload.get("metadata", {})
     point_count = int(metadata.get("point_count", cfg.fiber_max_points))
+    point_sampling_mode = str(
+        metadata.get("point_sampling_mode", cfg.fiber_point_sampling_mode)
+    )
+    exact_vertex_binding = bool(
+        metadata.get("exact_vertex_binding", cfg.fiber_exact_vertex_binding)
+    )
     motion = DifferentiableSkeletonTetModel(args.stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     with np.load(args.stage1_npz, allow_pickle=False) as stage1:
@@ -71,6 +77,8 @@ def _load_field(args, cfg, device):
         motion.surface_faces.detach().cpu().numpy(),
         device=device,
         max_points=point_count,
+        point_sampling_mode=point_sampling_mode,
+        exact_vertex_binding=exact_vertex_binding,
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_faces,
         binding_cache=cfg.fiber_binding_cache,

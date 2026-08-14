@@ -1133,6 +1133,10 @@ def create_unified_fiber_field(
     *,
     device: str = "cuda",
     max_points: int = 20_000,
+    point_sampling_mode: str = "uniform_index",
+    exact_vertex_binding: bool = False,
+    default_opacity: float = 0.5,
+    default_opacity_reference_points: int = 0,
     neighbor_k: int = 0,
     initial_residual_trust: float = 0.95,
     initial_shell_length_scale: float | None = None,
@@ -1144,11 +1148,15 @@ def create_unified_fiber_field(
     device = device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"
     cloud = load_gaussian_ply(str(gaussian_ply))
     xyz = np.asarray(cloud.xyz, dtype=np.float32)
+    source_xyz = xyz
     color = np.asarray(cloud.color, dtype=np.float32)
+    uses_default_opacity = cloud.opacity is None
+    if not 0.0 < float(default_opacity) < 1.0:
+        raise ValueError("default_opacity must be in (0, 1)")
     opacity = (
         np.asarray(cloud.opacity, dtype=np.float32)
         if cloud.opacity is not None
-        else np.full((xyz.shape[0],), 0.5, dtype=np.float32)
+        else np.full((xyz.shape[0],), float(default_opacity), dtype=np.float32)
     )
     scaling = (
         np.asarray(cloud.scaling, dtype=np.float32)
@@ -1160,13 +1168,27 @@ def create_unified_fiber_field(
         if cloud.rotation is not None
         else None
     )
+    source_indices = np.arange(xyz.shape[0], dtype=np.int64)
     if max_points > 0 and xyz.shape[0] > max_points:
-        indices = np.linspace(0, xyz.shape[0] - 1, max_points).astype(np.int64)
+        indices = _select_gaussian_indices(
+            xyz,
+            max_points,
+            mode=point_sampling_mode,
+            opacity=opacity,
+            scaling=scaling,
+        )
+        source_indices = source_indices[indices]
         xyz, color, opacity = xyz[indices], color[indices], opacity[indices]
         if scaling is not None:
             scaling = scaling[indices]
         if rotation is not None:
             rotation = rotation[indices]
+    if uses_default_opacity and int(default_opacity_reference_points) > 0:
+        # Preserve approximate accumulated transmittance when adaptive
+        # capacity changes the number of initially overlapping neutral seeds.
+        exponent = float(default_opacity_reference_points) / max(xyz.shape[0], 1)
+        effective_opacity = 1.0 - (1.0 - float(default_opacity)) ** exponent
+        opacity.fill(effective_opacity)
 
     vertices = np.asarray(rest_vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int64)
@@ -1206,6 +1228,22 @@ def create_unified_fiber_field(
                         barycentric=cached_barycentric,
                         local_offset=np.zeros_like(xyz, dtype=np.float32),
                     )
+    # Hair datasets commonly provide the neutral head/hair mesh vertices as
+    # the initial PLY (same order, same coordinates).  Binding those points by
+    # an all-pairs point/triangle search is both wasteful and numerically less
+    # stable.  The exact-vertex path is O(V+F), and is especially important
+    # when adaptive capacity keeps the complete 40k+ vertex scaffold.
+    if (
+        binding is None
+        and bool(exact_vertex_binding)
+        and source_xyz.shape == vertices.shape
+        and np.array_equal(source_xyz, vertices)
+    ):
+        binding = _bind_exact_surface_vertices(
+            source_indices,
+            faces,
+            scalp_faces,
+        )
     if binding is None:
         binding = bind_gaussians_to_surface(
             xyz,
@@ -1342,6 +1380,110 @@ def create_unified_fiber_field(
         route_neighbor_index=torch.as_tensor(
             route_neighbor_index, dtype=torch.long, device=device
         ),
+    )
+
+
+def _select_gaussian_indices(
+    xyz: np.ndarray,
+    max_points: int,
+    *,
+    mode: str = "uniform_index",
+    opacity: np.ndarray | None = None,
+    scaling: np.ndarray | None = None,
+) -> np.ndarray:
+    """Select a deterministic, coverage-preserving subset of a source cloud."""
+
+    points = np.asarray(xyz, dtype=np.float32)
+    count = int(points.shape[0])
+    budget = int(max_points)
+    if budget <= 0 or budget >= count:
+        return np.arange(count, dtype=np.int64)
+    if budget < 1:
+        raise ValueError("max_points must be positive or zero for all points")
+    normalized_mode = str(mode).lower()
+    if normalized_mode == "uniform_index":
+        return np.linspace(0, count - 1, budget).astype(np.int64)
+    if normalized_mode != "spatial_morton":
+        raise ValueError(
+            "point_sampling_mode must be 'uniform_index' or 'spatial_morton'"
+        )
+
+    lower = points.min(axis=0)
+    extent = np.maximum(points.max(axis=0) - lower, 1e-12)
+    quantized = np.clip(
+        np.floor((points - lower) / extent * 1023.0), 0.0, 1023.0
+    ).astype(np.uint64)
+    morton = (
+        _morton_part_1by2(quantized[:, 0])
+        | (_morton_part_1by2(quantized[:, 1]) << np.uint64(1))
+        | (_morton_part_1by2(quantized[:, 2]) << np.uint64(2))
+    )
+    quality = np.ones((count,), dtype=np.float64)
+    if opacity is not None:
+        quality *= np.maximum(np.asarray(opacity).reshape(-1), 1e-6)
+    if scaling is not None:
+        scale = np.maximum(np.asarray(scaling, dtype=np.float64), 1e-12)
+        quality *= np.cbrt(np.prod(scale, axis=-1))
+    # Morton order supplies spatial locality; descending quality only breaks
+    # ties inside a quantized cell.  Systematic positions then retain density
+    # while covering the complete 3D extent instead of depending on PLY order.
+    order = np.lexsort((np.arange(count), -quality, morton))
+    positions = np.floor(
+        (np.arange(budget, dtype=np.float64) + 0.5) * count / budget
+    ).astype(np.int64)
+    return order[positions].astype(np.int64)
+
+
+def _morton_part_1by2(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=np.uint64) & np.uint64(0x3FF)
+    value = (value | (value << np.uint64(16))) & np.uint64(0x30000FF)
+    value = (value | (value << np.uint64(8))) & np.uint64(0x300F00F)
+    value = (value | (value << np.uint64(4))) & np.uint64(0x30C30C3)
+    value = (value | (value << np.uint64(2))) & np.uint64(0x9249249)
+    return value
+
+
+def _bind_exact_surface_vertices(
+    vertex_indices: np.ndarray,
+    faces: np.ndarray,
+    scalp_face_indices: np.ndarray | None,
+) -> GaussianSurfaceBinding | None:
+    """Bind exact mesh vertices to one incident face without a distance search."""
+
+    mesh_faces = np.asarray(faces, dtype=np.int64)
+    if scalp_face_indices is None:
+        candidate_global = np.arange(mesh_faces.shape[0], dtype=np.int64)
+    else:
+        candidate_global = np.asarray(scalp_face_indices, dtype=np.int64)
+    candidate_faces = mesh_faces[candidate_global]
+    vertex_count = int(mesh_faces.max()) + 1
+    incident_face = np.full((vertex_count,), -1, dtype=np.int64)
+    incident_corner = np.full((vertex_count,), -1, dtype=np.int64)
+    for corner in range(3):
+        vertices_at_corner = candidate_faces[:, corner]
+        unset = incident_face[vertices_at_corner] < 0
+        if not np.any(unset):
+            continue
+        selected_vertices = vertices_at_corner[unset]
+        selected_faces = candidate_global[unset]
+        # Repeated vertices in this corner are resolved deterministically by
+        # the first face.  np.unique returns those first positions.
+        unique_vertices, first = np.unique(selected_vertices, return_index=True)
+        incident_face[unique_vertices] = selected_faces[first]
+        incident_corner[unique_vertices] = corner
+    selected = np.asarray(vertex_indices, dtype=np.int64)
+    if selected.size and (
+        selected.min() < 0
+        or selected.max() >= vertex_count
+        or np.any(incident_face[selected] < 0)
+    ):
+        return None
+    barycentric = np.zeros((selected.shape[0], 3), dtype=np.float32)
+    barycentric[np.arange(selected.shape[0]), incident_corner[selected]] = 1.0
+    return GaussianSurfaceBinding(
+        face_index=incident_face[selected],
+        barycentric=barycentric,
+        local_offset=np.zeros((selected.shape[0], 3), dtype=np.float32),
     )
 
 

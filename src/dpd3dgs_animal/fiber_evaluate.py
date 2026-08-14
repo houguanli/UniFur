@@ -109,6 +109,12 @@ def evaluate_unified_fiber_stage2(
     if representation not in {"unified", "residual_only"}:
         raise ValueError(f"Unknown checkpoint representation {representation!r}")
     point_count = int(metadata.get("point_count", cfg.fiber_max_points))
+    point_sampling_mode = str(
+        metadata.get("point_sampling_mode", cfg.fiber_point_sampling_mode)
+    )
+    exact_vertex_binding = bool(
+        metadata.get("exact_vertex_binding", cfg.fiber_exact_vertex_binding)
+    )
     shell_samples = int(metadata.get("shell_samples", cfg.fiber_shell_samples))
     strand_samples = int(metadata.get("strand_samples", cfg.fiber_strand_samples))
     hard_route_policy = str(
@@ -132,6 +138,8 @@ def evaluate_unified_fiber_stage2(
         motion.surface_faces.detach().cpu().numpy(),
         device=device,
         max_points=point_count,
+        point_sampling_mode=point_sampling_mode,
+        exact_vertex_binding=exact_vertex_binding,
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_face_indices,
         binding_cache=cfg.fiber_binding_cache,
