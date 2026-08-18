@@ -11,8 +11,10 @@ from .config import PipelineConfig
 from .fiber import (
     HARD_ROUTE_POLICIES,
     ROUTE_NAMES,
+    attach_fixed_gaussian_base,
     create_unified_fiber_field,
     mass_preserving_route_ids,
+    partition_binding_cache,
 )
 from .fiber_evaluate import _frame_metrics, _select_frame_indices
 from .fiber_optimize import _render
@@ -47,6 +49,7 @@ def audit_unified_fiber_routes(
     frame_start: int = 0,
     frame_stride: int = 1,
     camera_manifest: str | Path | None = None,
+    fixed_base_gaussian_ply: str | Path | None = None,
 ) -> FiberRouteAuditArtifacts:
     """Audit whether routing confidence agrees with measurable rendering impact.
 
@@ -69,6 +72,21 @@ def audit_unified_fiber_routes(
     exact_vertex_binding = bool(
         metadata.get("exact_vertex_binding", cfg.fiber_exact_vertex_binding)
     )
+    split_fixed_base = bool(
+        metadata.get("split_fixed_base", cfg.fiber_split_fixed_base)
+    )
+    fixed_base_source = Path(
+        fixed_base_gaussian_ply
+        or metadata.get("fixed_base_gaussian_ply")
+        or gaussian_ply
+    )
+    fixed_base_max_scale_fraction = float(
+        cfg.fiber_fixed_base_max_scale_fraction
+    )
+    if fixed_base_max_scale_fraction <= 0.0:
+        fixed_base_max_scale_fraction = float(
+            metadata.get("fixed_base_max_scale_fraction", 0.0)
+        )
     hard_route_policy = str(
         metadata.get("hard_route_policy", cfg.fiber_hard_route_policy)
     )
@@ -93,11 +111,67 @@ def audit_unified_fiber_routes(
         max_points=point_count,
         point_sampling_mode=point_sampling_mode,
         exact_vertex_binding=exact_vertex_binding,
+        binding_mode=str(metadata.get("binding_mode", cfg.fiber_binding_mode)),
+        source_mask_mode=str(
+            metadata.get("source_mask_mode", cfg.fiber_source_mask_mode)
+        ),
+        source_mask_threshold=float(
+            metadata.get("source_mask_threshold", cfg.fiber_source_mask_threshold)
+        ),
+        source_min_opacity=float(
+            metadata.get("source_min_opacity", cfg.fiber_source_min_opacity)
+        ),
+        residual_max_scale_fraction=float(
+            metadata.get(
+                "residual_max_scale_fraction",
+                cfg.fiber_residual_max_scale_fraction,
+            )
+        ),
+        semantic_mask_from_source=bool(
+            metadata.get(
+                "semantic_mask_from_source", cfg.fiber_semantic_mask_from_source
+            )
+        ),
+        structured_foreground_only=bool(
+            metadata.get(
+                "structured_foreground_only",
+                cfg.fiber_structured_foreground_only,
+            )
+        ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_face_indices,
-        binding_cache=cfg.fiber_binding_cache,
+        binding_cache=(
+            partition_binding_cache(cfg.fiber_binding_cache, "foreground")
+            if split_fixed_base
+            else cfg.fiber_binding_cache
+        ),
     )
+    if split_fixed_base:
+        attach_fixed_gaussian_base(
+            field,
+            fixed_base_source,
+            motion.rest_surface_vertices.detach().cpu().numpy(),
+            motion.surface_faces.detach().cpu().numpy(),
+            device=device,
+            point_sampling_mode=point_sampling_mode,
+            exact_vertex_binding=exact_vertex_binding,
+            binding_mode=str(metadata.get("binding_mode", cfg.fiber_binding_mode)),
+            source_mask_threshold=float(
+                metadata.get("source_mask_threshold", cfg.fiber_source_mask_threshold)
+            ),
+            source_min_opacity=float(
+                metadata.get("source_min_opacity", cfg.fiber_source_min_opacity)
+            ),
+            residual_max_scale_fraction=fixed_base_max_scale_fraction,
+            scalp_face_indices=scalp_face_indices,
+            binding_cache=cfg.fiber_binding_cache,
+        )
     checkpoint_state = payload["state_dict"]
+    checkpoint_shell_gate = checkpoint_state.get("shell_visibility_gate")
+    if isinstance(checkpoint_shell_gate, torch.Tensor):
+        field.shell_visibility_gate = torch.empty_like(
+            checkpoint_shell_gate, device=field.route_logits.device
+        )
     checkpoint_gate = checkpoint_state.get("strand_visibility_gate")
     if isinstance(checkpoint_gate, torch.Tensor):
         field.strand_visibility_gate = torch.empty_like(
@@ -109,7 +183,9 @@ def audit_unified_fiber_routes(
         "bend_cubic_local",
         "structured_delta_raw",
         "structured_opacity_raw",
+        "shell_visibility_gate",
         "strand_visibility_gate",
+        "route_active_gate",
         "carrier_logits",
         "carrier_root_tip_raw",
         "initial_carrier_probabilities",
@@ -217,6 +293,7 @@ def audit_unified_fiber_routes(
                 hard_route=False,
                 fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                 additive_teacher=cfg.fiber_additive_teacher_mode,
+                teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
             )
             full_prediction = _render(
                 soft_primitives, camera, cfg, renderer_name
@@ -233,6 +310,7 @@ def audit_unified_fiber_routes(
                 hard_route_policy=hard_route_policy,
                 fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                 additive_teacher=cfg.fiber_additive_teacher_mode,
+                teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
             )
             hard_prediction = _render(
                 hard_primitives, camera, cfg, renderer_name

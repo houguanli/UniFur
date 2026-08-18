@@ -66,9 +66,13 @@ def test_hairgs_cuda_rasterizer_accepts_unified_primitives_and_backpropagates() 
         image_y_down=True,
     )
     primitives = field.primitives(vertices, faces, shell_samples=2, strand_samples=3)
-    rendered = render_fiber_primitives_hairgs(primitives, camera)
+    rendered = render_fiber_primitives_hairgs(
+        primitives, camera, render_orientation=True
+    )
     assert rendered["rgb"].shape == (64, 64, 3)
     assert rendered["mask"].shape == (64, 64)
+    assert rendered["orientation"].shape == (64, 64, 3)
+    assert rendered["orientation4"].shape == (64, 64, 3)
     assert bool(torch.isfinite(rendered["rgb"]).all())
     assert int(rendered["visibility_filter"].sum()) > 0
 

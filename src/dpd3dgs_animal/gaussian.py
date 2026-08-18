@@ -14,6 +14,10 @@ class GaussianCloud:
     opacity: np.ndarray | None = None
     scaling: np.ndarray | None = None
     rotation: np.ndarray | None = None
+    foreground_probability: np.ndarray | None = None
+    # Raw real spherical-harmonic coefficients in 3DGS order [N, K, RGB].
+    # Keeping them is essential for a lossless HairGS Stage-I base adapter.
+    sh_coefficients: np.ndarray | None = None
 
 
 @dataclass
@@ -33,11 +37,36 @@ def load_gaussian_ply(path: str) -> GaussianCloud:
     names = set(vertex.data.dtype.names or [])
     xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=-1).astype(np.float32)
 
+    sh_coefficients = None
     if {"red", "green", "blue"}.issubset(names):
         color = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=-1).astype(np.float32) / 255.0
     elif {"f_dc_0", "f_dc_1", "f_dc_2"}.issubset(names):
         dc = np.stack([vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"]], axis=-1).astype(np.float32)
         color = np.clip(dc * 0.28209479177387814 + 0.5, 0.0, 1.0)
+        rest_names = sorted(
+            (name for name in names if name.startswith("f_rest_")),
+            key=lambda value: int(value.rsplit("_", 1)[1]),
+        )
+        coefficient_count = 1
+        if rest_names:
+            if len(rest_names) % 3 != 0:
+                raise ValueError("3DGS f_rest properties must be divisible by RGB")
+            coefficient_count += len(rest_names) // 3
+        root = int(round(np.sqrt(coefficient_count)))
+        if root * root == coefficient_count:
+            sh_coefficients = np.zeros(
+                (xyz.shape[0], coefficient_count, 3), dtype=np.float32
+            )
+            sh_coefficients[:, 0, :] = dc
+            if rest_names:
+                rest = np.stack(
+                    [vertex[name] for name in rest_names], axis=-1
+                ).astype(np.float32)
+                # GaussianModel.load_ply reshapes the property-major sequence
+                # as [RGB, K-1] and then transposes to [K-1, RGB].
+                sh_coefficients[:, 1:, :] = rest.reshape(
+                    xyz.shape[0], 3, coefficient_count - 1
+                ).transpose(0, 2, 1)
     else:
         color = np.ones_like(xyz, dtype=np.float32)
 
@@ -64,7 +93,21 @@ def load_gaussian_ply(path: str) -> GaussianCloud:
         rotation /= np.maximum(
             np.linalg.norm(rotation, axis=-1, keepdims=True), 1e-8
         )
-    return GaussianCloud(xyz, color, opacity, scaling, rotation)
+    foreground_probability = None
+    if "mask" in names:
+        raw_mask = np.asarray(vertex["mask"], dtype=np.float32)
+        foreground_probability = 1.0 / (
+            1.0 + np.exp(-np.clip(raw_mask, -40.0, 40.0))
+        )
+    return GaussianCloud(
+        xyz,
+        color,
+        opacity,
+        scaling,
+        rotation,
+        foreground_probability,
+        sh_coefficients,
+    )
 
 
 def bind_gaussians_to_surface(

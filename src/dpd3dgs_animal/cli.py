@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fiber_stage2.add_argument("--stage1-npz", required=True, help="Stage 1 tet/skeleton/surface NPZ.")
     fiber_stage2.add_argument("--gaussian-ply", required=True, help="Initial ordinary 3DGS/SAM3D Gaussian PLY.")
+    fiber_stage2.add_argument(
+        "--fixed-base-gaussian-ply",
+        default=None,
+        help=(
+            "Optional separate immutable head/body Gaussian PLY. When omitted, "
+            "the background partition of --gaussian-ply remains the fixed base."
+        ),
+    )
     fiber_stage2.add_argument("--frame-dir", required=True, help="Ground-truth RGBA frame directory.")
     fiber_stage2.add_argument(
         "--camera-manifest",
@@ -129,6 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fiber_stage2.add_argument("--render-width", type=int, default=None)
     fiber_stage2.add_argument("--render-height", type=int, default=None)
+    fiber_stage2.add_argument(
+        "--fixed-base-max-scale-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional cap for immutable head/body Gaussian scale axes, "
+            "relative to the rest-surface scene diagonal. The value is saved "
+            "in checkpoints and reused by evaluation."
+        ),
+    )
 
     fiber_eval = sub.add_parser(
         "fiber-eval",
@@ -136,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fiber_eval.add_argument("--stage1-npz", required=True)
     fiber_eval.add_argument("--gaussian-ply", required=True)
+    fiber_eval.add_argument(
+        "--fixed-base-gaussian-ply",
+        default=None,
+        help="Optional separate immutable head/body Gaussian PLY.",
+    )
     fiber_eval.add_argument("--checkpoint", required=True)
     fiber_eval.add_argument("--frame-dir", required=True)
     fiber_eval.add_argument(
@@ -157,6 +180,24 @@ def build_parser() -> argparse.ArgumentParser:
     fiber_eval.add_argument("--render-width", type=int, default=None)
     fiber_eval.add_argument("--render-height", type=int, default=None)
     fiber_eval.add_argument(
+        "--residual-max-scale-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional evaluation-time cap for residual Gaussian scale axes, "
+            "relative to the rest-surface scene diagonal."
+        ),
+    )
+    fiber_eval.add_argument(
+        "--fixed-base-max-scale-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional evaluation-time cap for immutable head/body Gaussian "
+            "scale axes, relative to the rest-surface scene diagonal."
+        ),
+    )
+    fiber_eval.add_argument(
         "--export-external-renders",
         action="store_true",
         help="Save per-frame RGB/alpha arrays and an external-evaluator manifest.",
@@ -168,6 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fiber_audit.add_argument("--stage1-npz", required=True)
     fiber_audit.add_argument("--gaussian-ply", required=True)
+    fiber_audit.add_argument(
+        "--fixed-base-gaussian-ply",
+        default=None,
+        help="Optional separate immutable head/body Gaussian PLY.",
+    )
     fiber_audit.add_argument("--checkpoint", required=True)
     fiber_audit.add_argument("--frame-dir", required=True)
     fiber_audit.add_argument(
@@ -289,6 +335,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"losses={artifacts.losses_json}")
         return 0
     if args.command == "fiber-stage2":
+        if args.fixed_base_max_scale_fraction is not None:
+            cfg.fiber_fixed_base_max_scale_fraction = float(
+                args.fixed_base_max_scale_fraction
+            )
         artifacts = optimize_unified_fiber_stage2(
             stage1_npz=args.stage1_npz,
             gaussian_ply=args.gaussian_ply,
@@ -307,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             render_size=_render_size_from_args(args),
             camera_manifest=args.camera_manifest,
             residual_bootstrap_checkpoint=args.residual_bootstrap_checkpoint,
+            fixed_base_gaussian_ply=args.fixed_base_gaussian_ply,
         )
         print(f"checkpoint={artifacts.checkpoint_pt}")
         print(f"state={artifacts.state_npz}")
@@ -315,6 +366,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"loss_curve={artifacts.loss_curve_png}")
         return 0
     if args.command == "fiber-eval":
+        if args.residual_max_scale_fraction is not None:
+            cfg.fiber_residual_max_scale_fraction = float(
+                args.residual_max_scale_fraction
+            )
+        if args.fixed_base_max_scale_fraction is not None:
+            cfg.fiber_fixed_base_max_scale_fraction = float(
+                args.fixed_base_max_scale_fraction
+            )
         artifacts = evaluate_unified_fiber_stage2(
             stage1_npz=args.stage1_npz,
             gaussian_ply=args.gaussian_ply,
@@ -330,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             render_size=_render_size_from_args(args),
             camera_manifest=args.camera_manifest,
             export_external_renders=args.export_external_renders,
+            fixed_base_gaussian_ply=args.fixed_base_gaussian_ply,
         )
         print(f"evaluation={artifacts.report_json}")
         print(f"contact_sheet={artifacts.contact_sheet_png}")
@@ -348,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
             frame_stride=args.frame_stride,
             render_size=_render_size_from_args(args),
             camera_manifest=args.camera_manifest,
+            fixed_base_gaussian_ply=args.fixed_base_gaussian_ply,
         )
         print(f"route_audit={artifacts.report_json}")
         print(f"route_audit_plot={artifacts.plot_png}")

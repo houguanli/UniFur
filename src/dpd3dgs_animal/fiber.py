@@ -140,6 +140,221 @@ class FiberPrimitives:
     # being driven by a surface, shell or strand carrier downstream.
     carrier_probabilities: torch.Tensor | None = None
     carrier_root_tip: torch.Tensor | None = None
+    # Optional per-primitive semantic hair class.  This is deliberately
+    # independent of physical opacity: opaque head/body Gaussians must still
+    # occlude hair behind the face while contributing zero to the rendered
+    # hair mask, matching HairGS' Stage-I compositor.
+    semantic_foreground: torch.Tensor | None = None
+    # Shared source-level SH state avoids expanding 16 coefficients across
+    # every preallocated shell/strand sample. ``source_id`` indexes both.
+    source_sh_coefficients: torch.Tensor | None = None
+    source_base_color: torch.Tensor | None = None
+
+
+class FixedGaussianBase(nn.Module):
+    """Non-optimizable head/body GS used only for joint depth compositing.
+
+    The unified hair field must not spend route, carrier, KNN, or optimizer
+    capacity on a known head/body scaffold.  These persistent=False buffers
+    are reconstructed from the Stage-I PLY at load time, so checkpoints store
+    only the learnable hair field.
+    """
+
+    def __init__(self, source: "UnifiedFiberField") -> None:
+        super().__init__()
+
+        def fixed(name: str, value: torch.Tensor | None) -> None:
+            self.register_buffer(
+                name,
+                None if value is None else value.detach().clone(),
+                persistent=False,
+            )
+
+        fixed("face_index", source.face_index)
+        fixed("barycentric", source.barycentric)
+        fixed("scaling", source.residual_scaling)
+        fixed("rotation", source.residual_rotation)
+        fixed("rest_surface_frame", source.rest_surface_frame)
+        fixed("initial_residual_offset_local", source.initial_residual_offset_local)
+        fixed("original_xyz", source.original_xyz)
+        fixed("color", source.color)
+        fixed("opacity", source.opacity)
+        fixed("source_sh_coefficients", source.source_sh_coefficients)
+        fixed("scene_scale", source.scene_scale)
+        self.residual_max_scale_fraction = float(
+            source.residual_max_scale_fraction
+        )
+        self.has_exact_original_xyz = bool(source.has_exact_original_xyz)
+
+    @property
+    def point_count(self) -> int:
+        return int(self.color.shape[0])
+
+    def surface_frame(
+        self,
+        surface_vertices: torch.Tensor,
+        surface_faces: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        triangles = surface_vertices[surface_faces[self.face_index]]
+        root = (self.barycentric[..., None] * triangles).sum(dim=1)
+        edge0 = triangles[:, 1] - triangles[:, 0]
+        edge1 = triangles[:, 2] - triangles[:, 0]
+        tangent = F.normalize(edge0, dim=-1, eps=1e-8)
+        normal = F.normalize(
+            torch.linalg.cross(edge0, edge1, dim=-1), dim=-1, eps=1e-8
+        )
+        bitangent = F.normalize(
+            torch.linalg.cross(normal, tangent, dim=-1), dim=-1, eps=1e-8
+        )
+        return root, tangent, bitangent, normal
+
+    def primitives(
+        self,
+        surface_vertices: torch.Tensor,
+        surface_faces: torch.Tensor,
+    ) -> FiberPrimitives:
+        root, tangent, bitangent, normal = self.surface_frame(
+            surface_vertices, surface_faces
+        )
+        reconstructed = root + _local_to_world(
+            self.initial_residual_offset_local, tangent, bitangent, normal
+        )
+        current_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+        same_frame = (
+            torch.amax(
+                torch.abs(current_frame - self.rest_surface_frame), dim=(-2, -1)
+            )
+            < 1e-6
+        ) & bool(self.has_exact_original_xyz)
+        xyz = torch.where(same_frame[:, None], self.original_xyz, reconstructed)
+
+        frame_delta = current_frame @ self.rest_surface_frame.transpose(-1, -2)
+        transported_matrix = frame_delta @ _quaternion_to_matrix_torch(self.rotation)
+        transported_rotation = _matrix_to_quaternion_torch(transported_matrix)
+        rotation = torch.where(
+            same_frame[:, None], self.rotation, transported_rotation
+        )
+        source_id = torch.arange(
+            self.point_count, device=root.device, dtype=torch.long
+        )
+        probabilities = torch.zeros(
+            (self.point_count, len(ROUTE_NAMES)),
+            device=root.device,
+            dtype=root.dtype,
+        )
+        probabilities[:, ROUTE_NAMES.index("residual")] = 1.0
+        surface_carrier = F.one_hot(
+            torch.full(
+                (self.point_count,),
+                CARRIER_NAMES.index("surface"),
+                device=root.device,
+                dtype=torch.long,
+            ),
+            num_classes=len(CARRIER_NAMES),
+        ).to(root.dtype)
+        zeros = torch.zeros(self.point_count, device=root.device, dtype=root.dtype)
+        scaling = self.scaling
+        if self.residual_max_scale_fraction > 0.0:
+            maximum = self.scene_scale.to(
+                device=scaling.device, dtype=scaling.dtype
+            ) * self.residual_max_scale_fraction
+            scaling = scaling.clamp_max(maximum)
+        return FiberPrimitives(
+            xyz=xyz,
+            color=self.color,
+            opacity=self.opacity,
+            scaling=scaling,
+            rotation=rotation,
+            route_id=torch.full(
+                (self.point_count,),
+                ROUTE_NAMES.index("residual"),
+                device=root.device,
+                dtype=torch.long,
+            ),
+            source_id=source_id,
+            route_probabilities=probabilities,
+            surface_normal=normal,
+            root_tip=zeros,
+            structure_weight=zeros,
+            root_xyz=xyz,
+            carrier_probabilities=surface_carrier,
+            carrier_root_tip=zeros,
+            semantic_foreground=zeros,
+            source_sh_coefficients=self.source_sh_coefficients,
+            source_base_color=self.color,
+        )
+
+
+def append_fixed_base_primitives(
+    hair: FiberPrimitives, base: FiberPrimitives
+) -> FiberPrimitives:
+    """Append fixed base primitives without changing hair source indexing.
+
+    Hair primitives stay first because topology/visual-hull helpers slice the
+    structured sample blocks using ``field.point_count``.  Base source IDs are
+    offset only for the renderer's shared SH table.
+    """
+
+    hair_source_count = (
+        int(hair.source_base_color.shape[0])
+        if hair.source_base_color is not None
+        else int(hair.route_probabilities.shape[0])
+    )
+
+    def required(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        return torch.cat([left, right], dim=0)
+
+    def optional(
+        left: torch.Tensor | None, right: torch.Tensor | None, name: str
+    ) -> torch.Tensor | None:
+        if left is None and right is None:
+            return None
+        if left is None or right is None:
+            raise ValueError(f"Split compositor requires both {name} tensors")
+        return required(left, right)
+
+    shared_sh = optional(
+        hair.source_sh_coefficients,
+        base.source_sh_coefficients,
+        "source_sh_coefficients",
+    )
+    shared_color = optional(
+        hair.source_base_color, base.source_base_color, "source_base_color"
+    )
+    return FiberPrimitives(
+        xyz=required(hair.xyz, base.xyz),
+        color=required(hair.color, base.color),
+        opacity=required(hair.opacity, base.opacity),
+        scaling=required(hair.scaling, base.scaling),
+        rotation=required(hair.rotation, base.rotation),
+        route_id=required(hair.route_id, base.route_id),
+        source_id=required(hair.source_id, base.source_id + hair_source_count),
+        # Source-level routing belongs exclusively to the learnable hair field.
+        route_probabilities=hair.route_probabilities,
+        surface_normal=optional(
+            hair.surface_normal, base.surface_normal, "surface_normal"
+        ),
+        root_tip=optional(hair.root_tip, base.root_tip, "root_tip"),
+        structure_weight=optional(
+            hair.structure_weight, base.structure_weight, "structure_weight"
+        ),
+        root_xyz=optional(hair.root_xyz, base.root_xyz, "root_xyz"),
+        carrier_probabilities=optional(
+            hair.carrier_probabilities,
+            base.carrier_probabilities,
+            "carrier_probabilities",
+        ),
+        carrier_root_tip=optional(
+            hair.carrier_root_tip, base.carrier_root_tip, "carrier_root_tip"
+        ),
+        semantic_foreground=optional(
+            hair.semantic_foreground,
+            base.semantic_foreground,
+            "semantic_foreground",
+        ),
+        source_sh_coefficients=shared_sh,
+        source_base_color=shared_color,
+    )
 
 
 class UnifiedFiberField(nn.Module):
@@ -168,10 +383,17 @@ class UnifiedFiberField(nn.Module):
         radius: torch.Tensor,
         route_logits: torch.Tensor,
         scene_scale: float,
+        residual_max_scale_fraction: float = 0.0,
         carrier_logits: torch.Tensor | None = None,
         carrier_root_tip: torch.Tensor | None = None,
         initial_residual_trust: float = 0.95,
         route_neighbor_index: torch.Tensor | None = None,
+        source_foreground_probability: torch.Tensor | None = None,
+        semantic_mask_from_source: bool = False,
+        structured_foreground_only: bool = False,
+        source_mask_threshold: float = 0.25,
+        source_sh_coefficients: torch.Tensor | None = None,
+        original_xyz: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         eps = max(float(scene_scale) * 1e-7, 1e-8)
@@ -180,6 +402,12 @@ class UnifiedFiberField(nn.Module):
         self.register_buffer("barycentric", barycentric.float())
         self.register_buffer("original_scaling", original_scaling.float())
         self.register_buffer("original_rotation", _normalize_quaternion(original_rotation.float()))
+        self.has_exact_original_xyz = original_xyz is not None
+        if original_xyz is None:
+            original_xyz = torch.zeros(
+                (color.shape[0], 3), dtype=torch.float32, device=color.device
+            )
+        self.register_buffer("original_xyz", original_xyz.float(), persistent=False)
         # Columns are the rest-pose tangent, bitangent and normal.  This is
         # intentionally non-persistent: old checkpoints contain the learned
         # rest-world residual quaternion, while the frame is reconstructed
@@ -189,6 +417,13 @@ class UnifiedFiberField(nn.Module):
         )
         self.register_buffer("initial_residual_offset_local", residual_offset_local.float().clone())
         self.register_buffer("scene_scale", torch.tensor(float(scene_scale), dtype=torch.float32))
+        self.fixed_base: FixedGaussianBase | None = None
+        if float(residual_max_scale_fraction) < 0.0:
+            raise ValueError("residual_max_scale_fraction must be non-negative")
+        # This is deliberately runtime policy rather than checkpoint state.
+        # It lets an existing Stage-I checkpoint be audited under a stricter
+        # covariance envelope without rewriting its learned source PLY.
+        self.residual_max_scale_fraction = float(residual_max_scale_fraction)
         if route_neighbor_index is None:
             route_neighbor_index = torch.empty(
                 (color.shape[0], 0), dtype=torch.long, device=color.device
@@ -199,10 +434,74 @@ class UnifiedFiberField(nn.Module):
             persistent=False,
         )
         self.register_buffer(
+            "shell_visibility_gate",
+            torch.empty(
+                (color.shape[0], 0), dtype=torch.float32, device=color.device
+            ),
+        )
+        self.register_buffer(
             "strand_visibility_gate",
             torch.empty(
                 (color.shape[0], 0), dtype=torch.float32, device=color.device
             ),
+        )
+        # A persistent topology mask separates preallocated tensor capacity
+        # from active renderer primitives.  Columns follow ROUTE_NAMES.  Old
+        # checkpoints default to an all-active field; adaptive runs explicitly
+        # start with residual-only capacity and activate structured groups from
+        # multi-view evidence.
+        self.register_buffer(
+            "route_active_gate",
+            torch.ones(
+                (color.shape[0], len(ROUTE_NAMES)),
+                dtype=torch.float32,
+                device=color.device,
+            ),
+        )
+        if source_foreground_probability is None:
+            source_foreground_probability = torch.ones(
+                (color.shape[0],), dtype=torch.float32, device=color.device
+            )
+        source_foreground_probability = source_foreground_probability.float().reshape(-1)
+        if source_foreground_probability.shape[0] != color.shape[0]:
+            raise ValueError(
+                "source_foreground_probability must contain one value per source"
+            )
+        if not 0.0 <= float(source_mask_threshold) <= 1.0:
+            raise ValueError("source_mask_threshold must be in [0, 1]")
+        # These are reconstructed deterministically from the Stage-I PLY, so
+        # old checkpoints remain loadable without missing-buffer errors.
+        self.register_buffer(
+            "source_foreground_probability",
+            source_foreground_probability.clamp(0.0, 1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "source_foreground",
+            (
+                source_foreground_probability >= float(source_mask_threshold)
+            ).float(),
+            persistent=False,
+        )
+        self.semantic_mask_from_source = bool(semantic_mask_from_source)
+        self.structured_foreground_only = bool(structured_foreground_only)
+        if self.structured_foreground_only:
+            with torch.no_grad():
+                background = self.source_foreground < 0.5
+                self.route_active_gate[background, :2] = 0.0
+                self.route_active_gate[background, 2] = 1.0
+        if source_sh_coefficients is not None:
+            source_sh_coefficients = source_sh_coefficients.float()
+            if source_sh_coefficients.ndim != 3 or tuple(
+                source_sh_coefficients.shape[::2]
+            ) != (color.shape[0], 3):
+                raise ValueError(
+                    "source_sh_coefficients must have shape [sources, K, 3]"
+                )
+        self.register_buffer(
+            "source_sh_coefficients",
+            source_sh_coefficients,
+            persistent=False,
         )
 
         color = color.clamp(1e-4, 1.0 - 1e-4)
@@ -391,9 +690,15 @@ class UnifiedFiberField(nn.Module):
         scale_multiplier = torch.exp(
             self.residual_log_scale_delta.clamp(min=-4.0, max=4.0)
         )
-        return (self.original_scaling * scale_multiplier).clamp_min(
-            self.positive_eps
-        )
+        # HairGS uses transverse scales down to about 2e-9 for line splats.
+        # A scene-relative epsilon inflated them into visible black/color rods.
+        scaling = (self.original_scaling * scale_multiplier).clamp_min(1e-12)
+        if self.residual_max_scale_fraction > 0.0:
+            maximum = self.scene_scale.to(
+                device=scaling.device, dtype=scaling.dtype
+            ) * self.residual_max_scale_fraction
+            scaling = scaling.clamp_max(maximum)
+        return scaling
 
     @property
     def residual_rotation(self) -> torch.Tensor:
@@ -421,7 +726,48 @@ class UnifiedFiberField(nn.Module):
         )
         residual_matrix = _quaternion_to_matrix_torch(self.residual_rotation)
         transported_matrix = frame_delta @ residual_matrix
-        return _matrix_to_quaternion_torch(transported_matrix)
+        transported = _matrix_to_quaternion_torch(transported_matrix)
+        same_frame = (
+            torch.amax(
+                torch.abs(current_surface_frame - self.rest_surface_frame),
+                dim=(-2, -1),
+            )
+            < 1e-6
+        )
+        same_frame = same_frame & bool(self.has_exact_original_xyz)
+        # At the rest pose, bypass the frame->matrix->quaternion round trip.
+        # Degenerate head-mesh faces do not define an orthonormal frame and
+        # previously rotated a few opaque base Gaussians even with zero motion.
+        return torch.where(
+            same_frame[:, None], self.residual_rotation, transported
+        )
+
+    def transported_residual_xyz(
+        self,
+        root: torch.Tensor,
+        tangent: torch.Tensor,
+        bitangent: torch.Tensor,
+        normal: torch.Tensor,
+    ) -> torch.Tensor:
+        reconstructed = root + _local_to_world(
+            self.residual_offset_local, tangent, bitangent, normal
+        )
+        current_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+        same_frame = (
+            torch.amax(
+                torch.abs(current_frame - self.rest_surface_frame),
+                dim=(-2, -1),
+            )
+            < 1e-6
+        )
+        same_frame = same_frame & bool(self.has_exact_original_xyz)
+        rest_exact = self.original_xyz + _local_to_world(
+            self.residual_offset_local - self.initial_residual_offset_local,
+            tangent,
+            bitangent,
+            normal,
+        )
+        return torch.where(same_frame[:, None], rest_exact, reconstructed)
 
     def route_probabilities(
         self,
@@ -463,6 +809,21 @@ class UnifiedFiberField(nn.Module):
             probabilities = probabilities / probabilities.sum(
                 dim=-1, keepdim=True
             ).clamp_min(1e-8)
+        # Inactive routes must not consume soft or hard routing mass.  A fully
+        # pruned source keeps a numerical residual fallback here, while its
+        # opacity is still exactly zeroed below by route_active_gate.
+        active = self.route_active_gate.to(
+            device=probabilities.device, dtype=probabilities.dtype
+        )
+        probabilities = probabilities * active
+        active_mass = probabilities.sum(dim=-1, keepdim=True)
+        fallback = torch.zeros_like(probabilities)
+        fallback[:, ROUTE_NAMES.index("residual")] = 1.0
+        probabilities = torch.where(
+            active_mass > 1e-8,
+            probabilities / active_mass.clamp_min(1e-8),
+            fallback,
+        )
         hardness = 1.0 if hard else min(max(float(hardening), 0.0), 1.0)
         if hardness > 0.0:
             route_ids = (
@@ -495,6 +856,107 @@ class UnifiedFiberField(nn.Module):
         bitangent = F.normalize(torch.linalg.cross(normal, tangent, dim=-1), dim=-1, eps=1e-8)
         return root, tangent, bitangent, normal
 
+    def _strand_target_geometry(
+        self,
+        root: torch.Tensor,
+        tangent: torch.Tensor,
+        bitangent: torch.Tensor,
+        normal: torch.Tensor,
+        strand_samples: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the uncollapsed root-to-tip strand target and tangents.
+
+        Rendering may blend this target back to the residual teacher through
+        ``structured_delta_gain``.  Geometry supervision must nevertheless see
+        this target directly; otherwise a zero-gain curve is indistinguishable
+        from a valid short strand to visual-hull losses.
+        """
+
+        if strand_samples < 1:
+            raise ValueError("strand_samples must be positive")
+        direction = F.normalize(
+            _local_to_world(self.direction_local, tangent, bitangent, normal),
+            dim=-1,
+            eps=1e-8,
+        )
+        bend_world = (
+            self.bend_local[:, :1] * tangent
+            + self.bend_local[:, 1:] * bitangent
+        )
+        bend_cubic_world = (
+            self.bend_cubic_local[:, :1] * tangent
+            + self.bend_cubic_local[:, 1:] * bitangent
+        )
+        strand_t = (
+            torch.arange(
+                strand_samples, device=root.device, dtype=root.dtype
+            )
+            + 0.5
+        ) / float(strand_samples)
+        origin = root + self.height[:, None] * normal
+        xyz = origin[:, None, :] + self.strand_length[:, None, None] * (
+            strand_t[None, :, None] * direction[:, None, :]
+            + strand_t[None, :, None].square() * bend_world[:, None, :]
+            + strand_t[None, :, None].pow(3) * bend_cubic_world[:, None, :]
+        )
+        strand_direction = F.normalize(
+            direction[:, None, :]
+            + 2.0 * strand_t[None, :, None] * bend_world[:, None, :]
+            + 3.0
+            * strand_t[None, :, None].square()
+            * bend_cubic_world[:, None, :],
+            dim=-1,
+            eps=1e-8,
+        )
+        return xyz, strand_direction
+
+    def strand_target_geometry(
+        self,
+        surface_vertices: torch.Tensor,
+        surface_faces: torch.Tensor,
+        *,
+        strand_samples: int = 5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Public lightweight target geometry for multi-view supervision."""
+
+        root, tangent, bitangent, normal = self.surface_frame(
+            surface_vertices, surface_faces
+        )
+        return self._strand_target_geometry(
+            root, tangent, bitangent, normal, strand_samples
+        )
+
+    def shell_target_geometry(
+        self,
+        surface_vertices: torch.Tensor,
+        surface_faces: torch.Tensor,
+        *,
+        shell_samples: int = 2,
+    ) -> torch.Tensor:
+        """Return the fully deployed analytic shell centres for supervision."""
+
+        if shell_samples < 1:
+            raise ValueError("shell_samples must be positive")
+        root, tangent, bitangent, normal = self.surface_frame(
+            surface_vertices, surface_faces
+        )
+        direction = _local_to_world(
+            self.direction_local, tangent, bitangent, normal
+        )
+        direction = F.normalize(direction, dim=-1, eps=1e-8)
+        shell_t = (
+            torch.arange(
+                shell_samples, device=root.device, dtype=root.dtype
+            )
+            + 0.5
+        ) / float(shell_samples)
+        shell_origin = root + self.height[:, None] * normal
+        return shell_origin[:, None, :] + (
+            self.shell_length[:, None, None]
+            * shell_t[None, :, None]
+            * direction[:, None, :]
+        )
+
     def primitives(
         self,
         surface_vertices: torch.Tensor,
@@ -510,14 +972,18 @@ class UnifiedFiberField(nn.Module):
         route_hardening: float = 0.0,
         dropped_route: str | None = None,
         hard_route_policy: str = "argmax",
+        shell_visibility: torch.Tensor | None = None,
         strand_visibility: torch.Tensor | None = None,
         fin_aspect_ratio: float = 1.0,
         additive_teacher: bool = False,
+        teacher_opacity_transfer: float = 0.0,
     ) -> FiberPrimitives:
         if shell_samples < 1 or strand_samples < 1:
             raise ValueError("shell_samples and strand_samples must be positive")
         if float(fin_aspect_ratio) < 1.0:
             raise ValueError("fin_aspect_ratio must be at least one")
+        if not 0.0 <= float(teacher_opacity_transfer) <= 1.0:
+            raise ValueError("teacher_opacity_transfer must be in [0, 1]")
         root, tangent, bitangent, normal = self.surface_frame(surface_vertices, surface_faces)
         direction = _local_to_world(self.direction_local, tangent, bitangent, normal)
         direction = F.normalize(direction, dim=-1, eps=1e-8)
@@ -530,6 +996,19 @@ class UnifiedFiberField(nn.Module):
             dropped_route=dropped_route,
             hard_policy=hard_route_policy,
         )
+        if self.structured_foreground_only:
+            # Head/body sources form an immutable occluding base.  They remain
+            # residual even for forced-route and leave-one-route-out renders;
+            # otherwise a shell-only diagnostic would expose hair splats that
+            # correctly live behind the face in the full Stage-I composite.
+            foreground = self.source_foreground[:, None].to(
+                device=probabilities.device, dtype=probabilities.dtype
+            )
+            base_probabilities = torch.zeros_like(probabilities)
+            base_probabilities[:, ROUTE_NAMES.index("residual")] = 1.0
+            probabilities = foreground * probabilities + (
+                1.0 - foreground
+            ) * base_probabilities
         source_id = torch.arange(self.point_count, device=root.device, dtype=torch.long)
 
         shell_t = (
@@ -556,27 +1035,8 @@ class UnifiedFiberField(nn.Module):
         strand_t = (
             torch.arange(strand_samples, device=root.device, dtype=root.dtype) + 0.5
         ) / float(strand_samples)
-        bend_world = (
-            self.bend_local[:, :1] * tangent + self.bend_local[:, 1:] * bitangent
-        )
-        bend_cubic_world = (
-            self.bend_cubic_local[:, :1] * tangent
-            + self.bend_cubic_local[:, 1:] * bitangent
-        )
-        strand_xyz = shell_origin[:, None, :] + (
-            self.strand_length[:, None, None]
-            * (
-                strand_t[None, :, None] * direction[:, None, :]
-                + strand_t[None, :, None].square() * bend_world[:, None, :]
-                + strand_t[None, :, None].pow(3) * bend_cubic_world[:, None, :]
-            )
-        )
-        strand_direction = F.normalize(
-            direction[:, None, :]
-            + 2.0 * strand_t[None, :, None] * bend_world[:, None, :]
-            + 3.0 * strand_t[None, :, None].square() * bend_cubic_world[:, None, :],
-            dim=-1,
-            eps=1e-8,
+        strand_xyz, strand_direction = self._strand_target_geometry(
+            root, tangent, bitangent, normal, strand_samples
         )
         strand_axis_scale = self.strand_length[:, None] / (2.0 * strand_samples)
         strand_scaling = torch.stack(
@@ -588,8 +1048,8 @@ class UnifiedFiberField(nn.Module):
             dim=-1,
         )
 
-        residual_xyz = root + _local_to_world(
-            self.residual_offset_local, tangent, bitangent, normal
+        residual_xyz = self.transported_residual_xyz(
+            root, tangent, bitangent, normal
         )
         residual_rotation = self.transported_residual_rotation(
             tangent, bitangent, normal
@@ -672,21 +1132,76 @@ class UnifiedFiberField(nn.Module):
             strand_rotation,
             strand_mix[:, None].expand(-1, strand_samples).reshape(-1, 1),
         )
-        shell_source_opacity = self.opacity * probabilities[:, 0]
-        strand_source_opacity = self.opacity * probabilities[:, 1]
         if additive_teacher:
+            shell_source_opacity = self.opacity * probabilities[:, 0]
+            strand_source_opacity = self.opacity * probabilities[:, 1]
             # Geometry gain doubles as a zero-initialized structured opacity
             # gate.  The residual teacher remains complete; shell/strand can
             # only add evidence after their geometry begins to unfold.
             opacity_gain = self.structured_opacity_gain
             shell_source_opacity = shell_source_opacity * opacity_gain[:, 0]
             strand_source_opacity = strand_source_opacity * opacity_gain[:, 1]
-        shell_opacity = _split_opacity(
-            shell_source_opacity, shell_samples
-        )[:, None].expand(-1, shell_samples)
-        strand_opacity = _split_opacity(
-            strand_source_opacity, strand_samples
-        )[:, None].expand(-1, strand_samples)
+        # A zero-displacement structured expert must be one exact teacher
+        # splat, not several co-located transparent splats whose CUDA sorting
+        # can change color compositing.  As geometry unfolds, distribute the
+        # source transmittance across samples.  The weights sum to one for
+        # every gain, so prod(1 - sample_alpha) == 1 - source_alpha.
+        shell_sample_weight = (
+            shell_mix[:, None] / float(shell_samples)
+        ).expand(-1, shell_samples).clone()
+        shell_sample_weight[:, 0] += 1.0 - shell_mix
+        strand_sample_weight = (
+            strand_mix[:, None] / float(strand_samples)
+        ).expand(-1, strand_samples).clone()
+        strand_sample_weight[:, 0] += 1.0 - strand_mix
+        if additive_teacher:
+            shell_opacity = _weighted_split_opacity(
+                shell_source_opacity, shell_sample_weight
+            )
+            strand_opacity = _weighted_split_opacity(
+                strand_source_opacity, strand_sample_weight
+            )
+        else:
+            # The router owns *optical thickness*, not alpha itself.  Splitting
+            # alpha linearly as ``alpha * p(route)`` makes two co-located soft
+            # routes more transparent than their source teacher.  Using route
+            # probabilities as transmittance exponents instead preserves
+            # ``prod(1 - alpha_route_sample) == 1 - alpha_teacher`` exactly
+            # whenever the structured copies are co-located and share color.
+            shell_opacity = _weighted_split_opacity(
+                self.opacity,
+                probabilities[:, 0, None] * shell_sample_weight,
+            )
+            strand_opacity = _weighted_split_opacity(
+                self.opacity,
+                probabilities[:, 1, None] * strand_sample_weight,
+            )
+        if shell_visibility is None and tuple(self.shell_visibility_gate.shape) == (
+            self.point_count,
+            shell_samples,
+        ):
+            shell_visibility = self.shell_visibility_gate
+        if shell_visibility is not None:
+            if tuple(shell_visibility.shape) != (self.point_count, shell_samples):
+                raise ValueError(
+                    "shell_visibility must have shape "
+                    f"({self.point_count}, {shell_samples}), got "
+                    f"{tuple(shell_visibility.shape)}"
+                )
+            shell_visibility = shell_visibility.to(
+                device=shell_opacity.device, dtype=shell_opacity.dtype
+            )
+            # At zero structured displacement these samples are exact split
+            # copies of the residual teacher.  A visual-hull decision made on
+            # the *target* Fin must therefore not punch holes in that safe
+            # initialization.  Fade the hard gate in with the same geometric
+            # deployment gain; it becomes exact at full deployment.
+            shell_visibility_mix = shell_mix[:, None]
+            effective_shell_visibility = (
+                1.0 - shell_visibility_mix
+                + shell_visibility_mix * shell_visibility
+            )
+            shell_opacity = shell_opacity * effective_shell_visibility
         if strand_visibility is None and tuple(self.strand_visibility_gate.shape) == (
             self.point_count,
             strand_samples,
@@ -699,18 +1214,54 @@ class UnifiedFiberField(nn.Module):
                     f"({self.point_count}, {strand_samples}), got "
                     f"{tuple(strand_visibility.shape)}"
                 )
-            strand_opacity = strand_opacity * strand_visibility.to(
+            strand_visibility = strand_visibility.to(
                 device=strand_opacity.device, dtype=strand_opacity.dtype
             )
+            strand_visibility_mix = strand_mix[:, None]
+            effective_strand_visibility = (
+                1.0 - strand_visibility_mix
+                + strand_visibility_mix * strand_visibility
+            )
+            strand_opacity = strand_opacity * effective_strand_visibility
         if additive_teacher:
             residual_visible = (
                 forced_route in (None, "residual") and dropped_route != "residual"
             )
-            residual_opacity = (
-                self.opacity if residual_visible else torch.zeros_like(self.opacity)
+            structured_fraction = (
+                probabilities[:, 0] * self.structured_opacity_gain[:, 0]
+                + probabilities[:, 1] * self.structured_opacity_gain[:, 1]
+            ).clamp(0.0, 1.0)
+            residual_budget = 1.0 - (
+                float(teacher_opacity_transfer) * structured_fraction
             )
+            residual_opacity = (
+                self.opacity * residual_budget
+                if residual_visible
+                else torch.zeros_like(self.opacity)
+            )
+            if self.structured_foreground_only:
+                background = 1.0 - self.source_foreground.to(
+                    device=self.opacity.device, dtype=self.opacity.dtype
+                )
+                residual_opacity = torch.maximum(
+                    residual_opacity, self.opacity * background
+                )
         else:
-            residual_opacity = self.opacity * probabilities[:, 2]
+            residual_opacity = _weighted_split_opacity(
+                self.opacity, probabilities[:, 2, None]
+            )[:, 0]
+        active = self.route_active_gate.to(
+            device=self.opacity.device, dtype=self.opacity.dtype
+        )
+        shell_opacity = shell_opacity * active[:, 0, None]
+        strand_opacity = strand_opacity * active[:, 1, None]
+        residual_opacity = residual_opacity * active[:, 2]
+        if self.structured_foreground_only:
+            foreground = self.source_foreground.to(
+                device=self.opacity.device, dtype=self.opacity.dtype
+            )
+            shell_opacity = shell_opacity * foreground[:, None]
+            strand_opacity = strand_opacity * foreground[:, None]
 
         xyz = torch.cat(
             [
@@ -846,7 +1397,24 @@ class UnifiedFiberField(nn.Module):
             ],
             dim=0,
         )
-        return FiberPrimitives(
+        semantic_foreground = None
+        if self.semantic_mask_from_source:
+            semantic_source = self.source_foreground.to(
+                device=root.device, dtype=root.dtype
+            )
+            semantic_foreground = torch.cat(
+                [
+                    semantic_source[:, None]
+                    .expand(-1, shell_samples)
+                    .reshape(-1),
+                    semantic_source[:, None]
+                    .expand(-1, strand_samples)
+                    .reshape(-1),
+                    semantic_source,
+                ],
+                dim=0,
+            )
+        primitives = FiberPrimitives(
             xyz=xyz,
             color=color,
             opacity=opacity,
@@ -861,7 +1429,16 @@ class UnifiedFiberField(nn.Module):
             root_xyz=primitive_root_xyz,
             carrier_probabilities=expanded_carrier_probabilities,
             carrier_root_tip=carrier_root_tip,
+            semantic_foreground=semantic_foreground,
+            source_sh_coefficients=self.source_sh_coefficients,
+            source_base_color=self.color,
         )
+        if self.fixed_base is not None:
+            primitives = append_fixed_base_primitives(
+                primitives,
+                self.fixed_base.primitives(surface_vertices, surface_faces),
+            )
+        return primitives
 
     def residual_primitives(
         self,
@@ -878,9 +1455,7 @@ class UnifiedFiberField(nn.Module):
         root, tangent, bitangent, normal = self.surface_frame(
             surface_vertices, surface_faces
         )
-        xyz = root + _local_to_world(
-            self.residual_offset_local, tangent, bitangent, normal
-        )
+        xyz = self.transported_residual_xyz(root, tangent, bitangent, normal)
         rotation = self.transported_residual_rotation(
             tangent, bitangent, normal
         )
@@ -888,10 +1463,15 @@ class UnifiedFiberField(nn.Module):
         source_id = torch.arange(
             self.point_count, device=root.device, dtype=torch.long
         )
-        return FiberPrimitives(
+        primitives = FiberPrimitives(
             xyz=xyz,
             color=self.color,
-            opacity=self.opacity,
+            opacity=(
+                self.opacity
+                * self.route_active_gate[:, ROUTE_NAMES.index("residual")].to(
+                    device=self.opacity.device, dtype=self.opacity.dtype
+                )
+            ),
             scaling=self.residual_scaling,
             rotation=rotation,
             route_id=torch.full(
@@ -916,7 +1496,20 @@ class UnifiedFiberField(nn.Module):
                 num_classes=len(CARRIER_NAMES),
             ).to(root.dtype),
             carrier_root_tip=torch.zeros_like(self.opacity),
+            semantic_foreground=(
+                self.source_foreground.to(device=root.device, dtype=root.dtype)
+                if self.semantic_mask_from_source
+                else None
+            ),
+            source_sh_coefficients=self.source_sh_coefficients,
+            source_base_color=self.color,
         )
+        if self.fixed_base is not None:
+            primitives = append_fixed_base_primitives(
+                primitives,
+                self.fixed_base.primitives(surface_vertices, surface_faces),
+            )
+        return primitives
 
     def residual_drift_regularizer(self) -> torch.Tensor:
         scale = self.scene_scale.clamp_min(1e-8)
@@ -933,6 +1526,10 @@ class UnifiedFiberField(nn.Module):
         surface_faces: torch.Tensor,
         *,
         temperature: float = 1.0,
+        structure_min_deployment_gain: float = 0.0,
+        strand_min_deployment_gain: float = 0.0,
+        strand_min_deployed_length_scale: float = 0.0,
+        strand_coverage_target: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         probabilities = self.route_probabilities(temperature)
         _root, tangent, bitangent, normal = self.surface_frame(surface_vertices, surface_faces)
@@ -982,6 +1579,13 @@ class UnifiedFiberField(nn.Module):
                 / scale.square()
             )
         ).mean()
+        structure_mass = probabilities[:, :2]
+        structure_gain_deficit = F.relu(
+            float(structure_min_deployment_gain) - self.structured_delta_gain
+        ).square()
+        structure_deployment = (
+            structure_mass * structure_gain_deficit
+        ).sum() / structure_mass.sum().clamp_min(1e-8)
         if self.route_neighbor_index.numel() > 0:
             neighbor_probabilities = probabilities[self.route_neighbor_index]
             route_neighbor = (
@@ -989,6 +1593,99 @@ class UnifiedFiberField(nn.Module):
             ).square().sum(dim=-1).mean()
         else:
             route_neighbor = probabilities.new_zeros(())
+
+        # Shared orientation-field regularization.  Root-to-tip signs are
+        # meaningful because every curve is scalp anchored, so opposite
+        # neighboring tangents are penalized instead of being treated as an
+        # equivalent unoriented image line.
+        bend_world = (
+            self.bend_local[:, :1] * tangent
+            + self.bend_local[:, 1:] * bitangent
+        )
+        bend_cubic_world = (
+            self.bend_cubic_local[:, :1] * tangent
+            + self.bend_cubic_local[:, 1:] * bitangent
+        )
+        tip_direction = F.normalize(
+            direction + 2.0 * bend_world + 3.0 * bend_cubic_world,
+            dim=-1,
+            eps=1e-8,
+        )
+        strand_probability = probabilities[:, ROUTE_NAMES.index("strand")]
+        if self.route_neighbor_index.numel() > 0:
+            neighbor = self.route_neighbor_index
+            pair_weight = (
+                strand_probability[:, None] * strand_probability[neighbor]
+            )
+            root_dot = torch.sum(
+                direction[:, None, :] * direction[neighbor], dim=-1
+            ).clamp(-1.0, 1.0)
+            tip_dot = torch.sum(
+                tip_direction[:, None, :] * tip_direction[neighbor], dim=-1
+            ).clamp(-1.0, 1.0)
+            strand_field = (
+                pair_weight * (1.0 - 0.5 * (root_dot + tip_dot))
+            ).sum() / pair_weight.sum().clamp_min(1e-8)
+        else:
+            strand_field = probabilities.new_zeros(())
+
+        # The deployed curve is a linear interpolation from one residual point
+        # to the analytic strand.  Its entire arc length is therefore scaled
+        # by the learned deployment gain.  Five-point quadrature handles curls
+        # without confusing a small endpoint displacement with a collapsed
+        # curve.
+        arc_t = torch.linspace(
+            0.0, 1.0, 5, device=direction.device, dtype=direction.dtype
+        )
+        derivative = (
+            direction[:, None, :]
+            + 2.0 * arc_t[None, :, None] * bend_world[:, None, :]
+            + 3.0
+            * arc_t[None, :, None].square()
+            * bend_cubic_world[:, None, :]
+        )
+        target_arc_length = self.strand_length * torch.linalg.vector_norm(
+            derivative, dim=-1
+        ).mean(dim=1)
+        deployment_gain = self.structured_delta_gain[:, 1]
+        deployed_length_scale = (
+            deployment_gain * target_arc_length / scale
+        )
+        if (
+            self.strand_visibility_gate.ndim == 2
+            and self.strand_visibility_gate.shape[0] == self.point_count
+            and self.strand_visibility_gate.shape[1] > 0
+        ):
+            support_fraction = self.strand_visibility_gate.mean(dim=1).to(
+                device=probabilities.device, dtype=probabilities.dtype
+            )
+        else:
+            support_fraction = torch.ones_like(strand_probability)
+        supported_mass = strand_probability * support_fraction.detach()
+        gain_deficit = F.relu(
+            float(strand_min_deployment_gain) - deployment_gain
+        ).square()
+        length_deficit = F.relu(
+            float(strand_min_deployed_length_scale) - deployed_length_scale
+        ).square()
+        strand_deployability = (
+            supported_mass * (gain_deficit + length_deficit)
+        ).sum() / supported_mass.sum().clamp_min(1e-8)
+        # Unsupported analytic targets must not retain strand route mass.  The
+        # target-geometry visual-hull loss can later move them into support and
+        # make that route available again.
+        strand_deployability = strand_deployability + (
+            strand_probability * (1.0 - support_fraction.detach())
+        ).mean()
+        strand_effective_coverage = (
+            supported_mass * deployed_length_scale.clamp_max(2.0)
+        ).mean()
+        # A squared hinge made small coverage deficits effectively invisible
+        # (for example 0.001**2 even with a weight of 20).  The linear hinge
+        # keeps a usable gradient until the declared deployment floor is met.
+        strand_coverage_deficit = F.relu(
+            float(strand_coverage_target) - strand_effective_coverage
+        )
         carrier_probabilities = self.carrier_probabilities(temperature)
         carrier_entropy = -torch.sum(
             carrier_probabilities
@@ -1032,14 +1729,6 @@ class UnifiedFiberField(nn.Module):
         shell_carrier_xyz = shell_origin + (
             self.shell_length[:, None] * carrier_t * direction
         )
-        bend_world = (
-            self.bend_local[:, :1] * tangent
-            + self.bend_local[:, 1:] * bitangent
-        )
-        bend_cubic_world = (
-            self.bend_cubic_local[:, :1] * tangent
-            + self.bend_cubic_local[:, 1:] * bitangent
-        )
         strand_carrier_xyz = shell_origin + self.strand_length[:, None] * (
             carrier_t * direction
             + carrier_t.square() * bend_world
@@ -1082,6 +1771,11 @@ class UnifiedFiberField(nn.Module):
             "route_entropy": entropy,
             "route_prior": route_prior,
             "route_neighbor": route_neighbor,
+            "structure_deployment": structure_deployment,
+            "strand_field": strand_field,
+            "strand_deployability": strand_deployability,
+            "strand_effective_coverage": strand_effective_coverage,
+            "strand_coverage_deficit": strand_coverage_deficit,
             "shell_normal": shell_normal,
             "shell_length": shell_length,
             "strand_thinness": strand_thinness,
@@ -1107,6 +1801,27 @@ class UnifiedFiberField(nn.Module):
     def route_summary(self, temperature: float = 1.0) -> dict[str, float]:
         probabilities = self.route_probabilities(temperature).detach().mean(dim=0).cpu()
         return {name: float(probabilities[index]) for index, name in enumerate(ROUTE_NAMES)}
+
+    def active_topology_summary(
+        self, *, shell_samples: int, strand_samples: int
+    ) -> dict[str, int]:
+        """Return source and effective Gaussian counts after topology gating."""
+
+        active = self.route_active_gate.detach() > 0.5
+        shell_sources = int(active[:, ROUTE_NAMES.index("shell")].sum().cpu())
+        strand_sources = int(active[:, ROUTE_NAMES.index("strand")].sum().cpu())
+        residual_sources = int(active[:, ROUTE_NAMES.index("residual")].sum().cpu())
+        return {
+            "shell_sources": shell_sources,
+            "strand_sources": strand_sources,
+            "residual_sources": residual_sources,
+            "dead_sources": int((~active.any(dim=1)).sum().cpu()),
+            "active_gaussians": (
+                shell_sources * int(shell_samples)
+                + strand_sources * int(strand_samples)
+                + residual_sources
+            ),
+        }
 
     def carrier_summary(self, temperature: float = 1.0) -> dict[str, float]:
         probabilities = (
@@ -1135,6 +1850,13 @@ def create_unified_fiber_field(
     max_points: int = 20_000,
     point_sampling_mode: str = "uniform_index",
     exact_vertex_binding: bool = False,
+    binding_mode: str = "closest_surface",
+    source_mask_mode: str = "all",
+    source_mask_threshold: float = 0.25,
+    source_min_opacity: float = 0.0,
+    residual_max_scale_fraction: float = 0.0,
+    semantic_mask_from_source: bool = False,
+    structured_foreground_only: bool = False,
     default_opacity: float = 0.5,
     default_opacity_reference_points: int = 0,
     neighbor_k: int = 0,
@@ -1147,8 +1869,15 @@ def create_unified_fiber_field(
 ) -> UnifiedFiberField:
     device = device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"
     cloud = load_gaussian_ply(str(gaussian_ply))
+    if (
+        bool(semantic_mask_from_source) or bool(structured_foreground_only)
+    ) and cloud.foreground_probability is None:
+        raise ValueError(
+            "semantic/source-restricted hair routing requires a Stage-I PLY "
+            "with a learned 'mask' property"
+        )
     xyz = np.asarray(cloud.xyz, dtype=np.float32)
-    source_xyz = xyz
+    unfiltered_xyz = xyz
     color = np.asarray(cloud.color, dtype=np.float32)
     uses_default_opacity = cloud.opacity is None
     if not 0.0 < float(default_opacity) < 1.0:
@@ -1169,6 +1898,56 @@ def create_unified_fiber_field(
         else None
     )
     source_indices = np.arange(xyz.shape[0], dtype=np.int64)
+    foreground_probability = (
+        np.asarray(cloud.foreground_probability, dtype=np.float32).reshape(-1)
+        if cloud.foreground_probability is not None
+        else np.ones((xyz.shape[0],), dtype=np.float32)
+    )
+    sh_coefficients = (
+        np.asarray(cloud.sh_coefficients, dtype=np.float32)
+        if cloud.sh_coefficients is not None
+        else None
+    )
+    normalized_mask_mode = str(source_mask_mode).lower()
+    if normalized_mask_mode not in {"all", "foreground", "background"}:
+        raise ValueError(
+            "source_mask_mode must be 'all', 'foreground', or 'background'"
+        )
+    source_filter = np.ones((xyz.shape[0],), dtype=bool)
+    if normalized_mask_mode != "all":
+        if cloud.foreground_probability is None:
+            raise ValueError(
+                f"source_mask_mode={normalized_mask_mode!r} requires a PLY "
+                "'mask' property"
+            )
+        if not 0.0 <= float(source_mask_threshold) <= 1.0:
+            raise ValueError("source_mask_threshold must be in [0, 1]")
+        is_foreground = foreground_probability >= float(source_mask_threshold)
+        source_filter &= (
+            is_foreground
+            if normalized_mask_mode == "foreground"
+            else ~is_foreground
+        )
+    if float(source_min_opacity) > 0.0:
+        if not 0.0 <= float(source_min_opacity) < 1.0:
+            raise ValueError("source_min_opacity must be in [0, 1)")
+        source_filter &= opacity >= float(source_min_opacity)
+    if not bool(source_filter.all()):
+        if not bool(source_filter.any()):
+            raise ValueError("Gaussian source filter removed every point")
+        source_indices = source_indices[source_filter]
+        xyz, color, opacity = (
+            xyz[source_filter],
+            color[source_filter],
+            opacity[source_filter],
+        )
+        foreground_probability = foreground_probability[source_filter]
+        if sh_coefficients is not None:
+            sh_coefficients = sh_coefficients[source_filter]
+        if scaling is not None:
+            scaling = scaling[source_filter]
+        if rotation is not None:
+            rotation = rotation[source_filter]
     if max_points > 0 and xyz.shape[0] > max_points:
         indices = _select_gaussian_indices(
             xyz,
@@ -1179,6 +1958,9 @@ def create_unified_fiber_field(
         )
         source_indices = source_indices[indices]
         xyz, color, opacity = xyz[indices], color[indices], opacity[indices]
+        foreground_probability = foreground_probability[indices]
+        if sh_coefficients is not None:
+            sh_coefficients = sh_coefficients[indices]
         if scaling is not None:
             scaling = scaling[indices]
         if rotation is not None:
@@ -1196,7 +1978,9 @@ def create_unified_fiber_field(
     default_radius = scene_scale * 0.0025
     if scaling is None:
         scaling = np.full((xyz.shape[0], 3), default_radius, dtype=np.float32)
-    scaling = np.maximum(scaling, scene_scale * 1e-7)
+    # Preserve trained HairGS anisotropy; only reject literal non-positive
+    # values instead of applying the shell parameter epsilon to residual GS.
+    scaling = np.maximum(scaling, 1e-12)
     if rotation is None:
         rotation = np.zeros((xyz.shape[0], 4), dtype=np.float32)
         rotation[:, 0] = 1.0
@@ -1236,25 +2020,39 @@ def create_unified_fiber_field(
     if (
         binding is None
         and bool(exact_vertex_binding)
-        and source_xyz.shape == vertices.shape
-        and np.array_equal(source_xyz, vertices)
+        and unfiltered_xyz.shape == vertices.shape
+        and np.array_equal(unfiltered_xyz, vertices)
     ):
         binding = _bind_exact_surface_vertices(
             source_indices,
             faces,
             scalp_faces,
+            vertices,
         )
     if binding is None:
-        binding = bind_gaussians_to_surface(
-            xyz,
-            vertices,
-            binding_faces,
-            device=device,
-            vertex_k=0,
-            pull_to_surface=True,
-        )
-        if scalp_faces is not None:
-            binding.face_index = scalp_faces[binding.face_index]
+        normalized_binding_mode = str(binding_mode).lower()
+        if normalized_binding_mode == "nearest_vertex":
+            binding = _bind_nearest_surface_vertices(
+                xyz,
+                vertices,
+                faces,
+                scalp_faces,
+            )
+        elif normalized_binding_mode == "closest_surface":
+            binding = bind_gaussians_to_surface(
+                xyz,
+                vertices,
+                binding_faces,
+                device=device,
+                vertex_k=0,
+                pull_to_surface=True,
+            )
+            if scalp_faces is not None:
+                binding.face_index = scalp_faces[binding.face_index]
+        else:
+            raise ValueError(
+                "binding_mode must be 'closest_surface' or 'nearest_vertex'"
+            )
         if cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
@@ -1365,6 +2163,7 @@ def create_unified_fiber_field(
         opacity=tensor(opacity),
         original_scaling=tensor(scaling),
         original_rotation=tensor(rotation),
+        original_xyz=tensor(xyz),
         rest_surface_frame=tensor(rest_surface_frame),
         residual_offset_local=tensor(residual_offset_local),
         direction_local=tensor(direction_local),
@@ -1376,11 +2175,144 @@ def create_unified_fiber_field(
         carrier_logits=tensor(carrier_logits),
         carrier_root_tip=tensor(carrier_root_tip),
         scene_scale=scene_scale,
+        residual_max_scale_fraction=residual_max_scale_fraction,
         initial_residual_trust=initial_residual_trust,
         route_neighbor_index=torch.as_tensor(
             route_neighbor_index, dtype=torch.long, device=device
         ),
+        source_foreground_probability=tensor(foreground_probability),
+        semantic_mask_from_source=semantic_mask_from_source,
+        structured_foreground_only=structured_foreground_only,
+        source_mask_threshold=source_mask_threshold,
+        source_sh_coefficients=(
+            tensor(sh_coefficients) if sh_coefficients is not None else None
+        ),
     )
+
+
+def partition_binding_cache(
+    binding_cache: str | Path | None, partition: str
+) -> Path | None:
+    if binding_cache is None:
+        return None
+    path = Path(binding_cache)
+    return path.with_name(f"{path.stem}.{partition}{path.suffix}")
+
+
+def create_fixed_gaussian_base(
+    gaussian_ply: str | Path,
+    rest_vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    device: str = "cuda",
+    point_sampling_mode: str = "uniform_index",
+    exact_vertex_binding: bool = False,
+    binding_mode: str = "closest_surface",
+    source_mask_threshold: float = 0.25,
+    source_min_opacity: float = 0.0,
+    residual_max_scale_fraction: float = 0.0,
+    scalp_face_indices: np.ndarray | None = None,
+    binding_cache: str | Path | None = None,
+) -> FixedGaussianBase:
+    """Load only Stage-I head/body GS as an immutable compositor module."""
+
+    temporary = create_unified_fiber_field(
+        gaussian_ply,
+        rest_vertices,
+        faces,
+        device=device,
+        max_points=0,
+        point_sampling_mode=point_sampling_mode,
+        exact_vertex_binding=exact_vertex_binding,
+        binding_mode=binding_mode,
+        source_mask_mode="background",
+        source_mask_threshold=source_mask_threshold,
+        source_min_opacity=source_min_opacity,
+        residual_max_scale_fraction=residual_max_scale_fraction,
+        semantic_mask_from_source=True,
+        structured_foreground_only=False,
+        neighbor_k=0,
+        scalp_face_indices=scalp_face_indices,
+        binding_cache=partition_binding_cache(binding_cache, "background"),
+    )
+    base = FixedGaussianBase(temporary).eval()
+    for parameter in base.parameters():
+        parameter.requires_grad_(False)
+    return base
+
+
+def attach_fixed_gaussian_base(
+    field: UnifiedFiberField,
+    gaussian_ply: str | Path,
+    rest_vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    device: str,
+    point_sampling_mode: str,
+    exact_vertex_binding: bool,
+    binding_mode: str,
+    source_mask_threshold: float,
+    source_min_opacity: float,
+    residual_max_scale_fraction: float,
+    scalp_face_indices: np.ndarray | None,
+    binding_cache: str | Path | None,
+) -> FixedGaussianBase:
+    base = create_fixed_gaussian_base(
+        gaussian_ply,
+        rest_vertices,
+        faces,
+        device=device,
+        point_sampling_mode=point_sampling_mode,
+        exact_vertex_binding=exact_vertex_binding,
+        binding_mode=binding_mode,
+        source_mask_threshold=source_mask_threshold,
+        source_min_opacity=source_min_opacity,
+        residual_max_scale_fraction=residual_max_scale_fraction,
+        scalp_face_indices=scalp_face_indices,
+        binding_cache=binding_cache,
+    )
+    field.fixed_base = base
+    return base
+
+
+def _bind_nearest_surface_vertices(
+    points: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    scalp_face_indices: np.ndarray | None = None,
+) -> GaussianSurfaceBinding:
+    """Bind a dense trained GS to its nearest carrier vertex in O(N log V).
+
+    HairGS Stage-I produces many off-surface Gaussians.  The legacy exact
+    point/triangle search is quadratic for this case and is unnecessary: the
+    residual local offset reconstructs the original point exactly, while the
+    nearest carrier vertex supplies a stable scalp/head frame for deformation.
+    """
+
+    from scipy.spatial import cKDTree
+
+    mesh_vertices = np.asarray(vertices, dtype=np.float32)
+    mesh_faces = np.asarray(faces, dtype=np.int64)
+    query_points = np.asarray(points, dtype=np.float32)
+    if scalp_face_indices is None:
+        candidate_vertices = np.arange(mesh_vertices.shape[0], dtype=np.int64)
+    else:
+        scalp_faces = np.asarray(scalp_face_indices, dtype=np.int64).reshape(-1)
+        candidate_vertices = np.unique(mesh_faces[scalp_faces].reshape(-1))
+    if candidate_vertices.size == 0:
+        raise ValueError("No carrier vertices are available for nearest binding")
+    tree = cKDTree(mesh_vertices[candidate_vertices])
+    _distance, local_indices = tree.query(query_points, k=1, workers=-1)
+    nearest_vertices = candidate_vertices[np.asarray(local_indices, dtype=np.int64)]
+    binding = _bind_exact_surface_vertices(
+        nearest_vertices,
+        mesh_faces,
+        scalp_face_indices,
+        mesh_vertices,
+    )
+    if binding is None:
+        raise RuntimeError("Could not bind nearest carrier vertices to incident faces")
+    return binding
 
 
 def _select_gaussian_indices(
@@ -1447,6 +2379,7 @@ def _bind_exact_surface_vertices(
     vertex_indices: np.ndarray,
     faces: np.ndarray,
     scalp_face_indices: np.ndarray | None,
+    vertices: np.ndarray | None = None,
 ) -> GaussianSurfaceBinding | None:
     """Bind exact mesh vertices to one incident face without a distance search."""
 
@@ -1459,18 +2392,31 @@ def _bind_exact_surface_vertices(
     vertex_count = int(mesh_faces.max()) + 1
     incident_face = np.full((vertex_count,), -1, dtype=np.int64)
     incident_corner = np.full((vertex_count,), -1, dtype=np.int64)
-    for corner in range(3):
-        vertices_at_corner = candidate_faces[:, corner]
-        unset = incident_face[vertices_at_corner] < 0
-        if not np.any(unset):
-            continue
-        selected_vertices = vertices_at_corner[unset]
-        selected_faces = candidate_global[unset]
-        # Repeated vertices in this corner are resolved deterministically by
-        # the first face.  np.unique returns those first positions.
-        unique_vertices, first = np.unique(selected_vertices, return_index=True)
-        incident_face[unique_vertices] = selected_faces[first]
-        incident_corner[unique_vertices] = corner
+    best_area = np.full((vertex_count,), -1.0, dtype=np.float64)
+    if vertices is None:
+        face_quality = np.ones(candidate_faces.shape[0], dtype=np.float64)
+    else:
+        mesh_vertices = np.asarray(vertices, dtype=np.float64)
+        triangles = mesh_vertices[candidate_faces]
+        face_quality = np.linalg.norm(
+            np.cross(
+                triangles[:, 1] - triangles[:, 0],
+                triangles[:, 2] - triangles[:, 0],
+            ),
+            axis=-1,
+        )
+    for local_face, face in enumerate(candidate_faces):
+        score = float(face_quality[local_face])
+        global_face = int(candidate_global[local_face])
+        for corner, vertex in enumerate(face):
+            vertex = int(vertex)
+            if score > best_area[vertex] or (
+                score == best_area[vertex]
+                and (incident_face[vertex] < 0 or global_face < incident_face[vertex])
+            ):
+                best_area[vertex] = score
+                incident_face[vertex] = global_face
+                incident_corner[vertex] = corner
     selected = np.asarray(vertex_indices, dtype=np.int64)
     if selected.size and (
         selected.min() < 0
@@ -1494,6 +2440,7 @@ def _binding_cache_key(
     scalp_faces: np.ndarray | None,
 ) -> str:
     digest = hashlib.sha256()
+    digest.update(b"stable-nearest-vertex-binding-v2")
     for value in (xyz, vertices, faces):
         array = np.ascontiguousarray(value)
         digest.update(str(array.shape).encode("ascii"))
@@ -1576,7 +2523,7 @@ def render_fiber_primitives(
     if x.numel() == 0:
         rgb = torch.zeros((camera.height, camera.width, 3), dtype=dtype, device=device)
         mask = torch.zeros((camera.height, camera.width), dtype=dtype, device=device)
-        return {"rgb": rgb, "mask": mask}
+        return {"rgb": rgb, "mask": mask, "physical_mask": mask}
 
     offsets = torch.arange(-radius_px, radius_px + 1, device=device)
     oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
@@ -1609,10 +2556,26 @@ def render_fiber_primitives(
     )
     weight_sum.index_add_(0, flat_index, flat_weights[:, None])
     rgb = rgb_sum / weight_sum.clamp_min(1e-6)
-    mask = 1.0 - torch.exp(-weight_sum[:, 0])
+    physical_mask = 1.0 - torch.exp(-weight_sum[:, 0])
+    mask = physical_mask
+    if primitives.semantic_foreground is not None:
+        semantic = primitives.semantic_foreground[valid].to(dtype=dtype)
+        semantic_sum = torch.zeros(
+            (camera.height * camera.width, 1), dtype=dtype, device=device
+        )
+        semantic_sum.index_add_(
+            0,
+            flat_index,
+            (weights * semantic[:, None]).reshape(-1, 1),
+        )
+        semantic_fraction = semantic_sum[:, 0] / weight_sum[:, 0].clamp_min(1e-6)
+        mask = physical_mask * semantic_fraction
     return {
         "rgb": rgb.reshape(camera.height, camera.width, 3).clamp(0.0, 1.0),
         "mask": mask.reshape(camera.height, camera.width).clamp(0.0, 1.0),
+        "physical_mask": physical_mask.reshape(
+            camera.height, camera.width
+        ).clamp(0.0, 1.0),
     }
 
 
@@ -1867,6 +2830,17 @@ def _local_to_world(
 
 def _split_opacity(opacity: torch.Tensor, samples: int) -> torch.Tensor:
     return 1.0 - torch.pow((1.0 - opacity).clamp_min(1e-6), 1.0 / float(samples))
+
+
+def _weighted_split_opacity(
+    opacity: torch.Tensor, sample_weight: torch.Tensor
+) -> torch.Tensor:
+    if sample_weight.ndim != 2 or sample_weight.shape[0] != opacity.shape[0]:
+        raise ValueError("sample_weight must have shape [sources, samples]")
+    return 1.0 - torch.pow(
+        (1.0 - opacity).clamp_min(1e-6)[:, None],
+        sample_weight.clamp_min(0.0),
+    )
 
 
 def _inverse_softplus(value: torch.Tensor, eps: float) -> torch.Tensor:

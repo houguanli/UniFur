@@ -64,6 +64,19 @@ def _load_field(args: argparse.Namespace, motion, device: str):
             metadata.get("point_sampling_mode", "uniform_index")
         ),
         exact_vertex_binding=bool(metadata.get("exact_vertex_binding", False)),
+        binding_mode=str(metadata.get("binding_mode", "closest_surface")),
+        source_mask_mode=str(metadata.get("source_mask_mode", "all")),
+        source_mask_threshold=float(metadata.get("source_mask_threshold", 0.25)),
+        source_min_opacity=float(metadata.get("source_min_opacity", 0.0)),
+        residual_max_scale_fraction=float(
+            metadata.get("residual_max_scale_fraction", 0.0)
+        ),
+        semantic_mask_from_source=bool(
+            metadata.get("semantic_mask_from_source", False)
+        ),
+        structured_foreground_only=bool(
+            metadata.get("structured_foreground_only", False)
+        ),
         scalp_face_indices=scalp_face_indices,
     )
     state = payload["state_dict"]
@@ -81,6 +94,7 @@ def _load_field(args: argparse.Namespace, motion, device: str):
         "residual_trust_logits",
         "structured_delta_raw",
         "strand_visibility_gate",
+        "route_active_gate",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed
     if unexpected_missing or incompatible.unexpected_keys:

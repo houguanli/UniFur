@@ -19,7 +19,9 @@ from .fiber import (
     ROUTE_NAMES,
     UnifiedFiberField,
     apply_fin_view_gate,
+    attach_fixed_gaussian_base,
     create_unified_fiber_field,
+    partition_binding_cache,
     render_fiber_primitives,
 )
 from .optimize import (
@@ -46,6 +48,12 @@ class FiberOptimizationArtifacts:
 _RESIDUAL_BOOTSTRAP_KEYS = (
     "color_logits",
     "opacity_logits",
+    "residual_offset_local",
+    "residual_log_scale_delta",
+    "residual_rotation_raw",
+)
+_RESIDUAL_APPEARANCE_KEYS = ("color_logits", "opacity_logits")
+_RESIDUAL_GEOMETRY_KEYS = (
     "residual_offset_local",
     "residual_log_scale_delta",
     "residual_rotation_raw",
@@ -155,10 +163,15 @@ def _load_residual_bootstrap_checkpoint(
     }
 
 
-def _freeze_residual_teacher_scaffold(field: UnifiedFiberField) -> None:
-    """Freeze the exact residual checkpoint while structured deltas learn."""
+def _freeze_residual_teacher_scaffold(
+    field: UnifiedFiberField, *, optimize_structured_base_appearance: bool = False
+) -> None:
+    """Freeze teacher geometry; optionally let the structured student refit appearance."""
 
-    for name in _RESIDUAL_BOOTSTRAP_KEYS:
+    frozen_keys = list(_RESIDUAL_GEOMETRY_KEYS)
+    if not bool(optimize_structured_base_appearance):
+        frozen_keys.extend(_RESIDUAL_APPEARANCE_KEYS)
+    for name in frozen_keys:
         parameter = getattr(field, name)
         parameter.requires_grad_(False)
     # Keep the residual expert's appearance delta exactly zero while allowing
@@ -169,6 +182,332 @@ def _freeze_residual_teacher_scaffold(field: UnifiedFiberField) -> None:
             [gradient[:, :2], torch.zeros_like(gradient[:, 2:3])], dim=1
         )
     )
+
+
+def _rank_unit_interval(value: torch.Tensor) -> torch.Tensor:
+    """Return deterministic, scale-free ranks in [0, 1]."""
+
+    flat = value.detach().reshape(-1)
+    if flat.numel() <= 1:
+        return torch.zeros_like(flat)
+    # Source id is the final tie breaker.  The perturbation is far below the
+    # precision of the physical scores but makes repeated migrations exact.
+    source_id = torch.arange(flat.numel(), device=flat.device, dtype=flat.dtype)
+    tie = source_id * (torch.finfo(flat.dtype).eps / float(flat.numel()))
+    order = torch.argsort(flat + tie)
+    ranks = torch.empty_like(flat)
+    ranks[order] = torch.linspace(
+        0.0, 1.0, flat.numel(), device=flat.device, dtype=flat.dtype
+    )
+    return ranks
+
+
+def _route_capacity_counts(total: int, mass: torch.Tensor) -> list[int]:
+    """Round a normalized route mass without changing the total capacity."""
+
+    raw = mass.detach().cpu().double().numpy() * int(total)
+    counts = np.floor(raw).astype(np.int64)
+    remainder = int(total) - int(counts.sum())
+    fractional = raw - counts
+    # Stable route-index tie breaking keeps reports/checkpoints reproducible.
+    order = np.argsort(-fractional, kind="stable")
+    for index in order[:remainder]:
+        counts[int(index)] += 1
+    return [int(value) for value in counts]
+
+
+def _initialize_render_preserving_semantic_migration(
+    field: UnifiedFiberField,
+    route_mass: list[float] | tuple[float, float, float],
+    *,
+    temperature: float,
+) -> dict[str, object]:
+    """Hard-allocate teacher sources while keeping shell/strand co-located.
+
+    Low-confidence, broad, or weakly attached sources retain residual
+    capacity.  The remainder is split by anisotropy into shell and strand.
+    Every source has exactly one active renderer family, so the configured
+    residual share is a real capacity ceiling rather than a soft preference.
+    Zero structured displacement plus opacity splitting makes the allocation
+    an (up to rasterizer precision) render-preserving reparameterization.
+    """
+
+    requested = torch.as_tensor(
+        route_mass, device=field.route_logits.device, dtype=field.route_logits.dtype
+    ).reshape(-1)
+    if requested.numel() != len(ROUTE_NAMES):
+        raise ValueError(
+            "fiber_teacher_semantic_migration_mass must contain effective "
+            f"[{', '.join(ROUTE_NAMES)}] source fractions"
+        )
+    if (
+        not torch.isfinite(requested).all()
+        or torch.any(requested < 0.0)
+        or float(requested.sum()) <= 0.0
+    ):
+        raise ValueError(
+            "fiber_teacher_semantic_migration_mass must be finite, "
+            "non-negative, and sum to a positive value"
+        )
+    if float(temperature) <= 0.0:
+        raise ValueError("semantic migration temperature must be positive")
+    requested = requested / requested.sum()
+    counts = _route_capacity_counts(field.point_count, requested)
+    shell_index = ROUTE_NAMES.index("shell")
+    strand_index = ROUTE_NAMES.index("strand")
+    residual_index = ROUTE_NAMES.index("residual")
+
+    with torch.no_grad():
+        scaling = field.original_scaling.detach().clamp_min(1e-12)
+        sorted_scaling = torch.sort(scaling, dim=-1).values
+        anisotropy = torch.log(
+            (sorted_scaling[:, -1] / sorted_scaling[:, 0]).clamp_min(1.0)
+        )
+        source_size = torch.log(
+            torch.prod(scaling, dim=-1).clamp_min(1e-30).pow(1.0 / 3.0)
+            / field.scene_scale.clamp_min(1e-8)
+        )
+        binding_distance = torch.linalg.vector_norm(
+            field.initial_residual_offset_local.detach(), dim=-1
+        ) / field.scene_scale.clamp_min(1e-8)
+        opacity = field.opacity.detach()
+        normal_alignment = field.direction_local.detach()[:, 2].abs()
+
+        anisotropy_rank = _rank_unit_interval(anisotropy)
+        opacity_rank = _rank_unit_interval(opacity)
+        size_rank = _rank_unit_interval(source_size)
+        distance_rank = _rank_unit_interval(binding_distance)
+        # High structure confidence means a compact, anisotropic, opaque
+        # source with a reliable scalp attachment.
+        structure_confidence = (
+            0.45 * anisotropy_rank
+            + 0.25 * opacity_rank
+            - 0.20 * distance_rank
+            - 0.10 * size_rank
+        )
+        # Curves favor highly anisotropic, tangent-aligned sources; the
+        # remaining reliable sources form the denser shell/Fin family.
+        strand_preference = (
+            0.70 * anisotropy_rank
+            + 0.20 * distance_rank
+            + 0.10 * (1.0 - normal_alignment)
+        )
+
+        assignment = torch.full(
+            (field.point_count,), shell_index, device=field.route_logits.device,
+            dtype=torch.long,
+        )
+        all_indices = torch.arange(field.point_count, device=assignment.device)
+        residual_order = torch.argsort(structure_confidence)
+        residual_indices = residual_order[: counts[residual_index]]
+        assignment[residual_indices] = residual_index
+        structured_eligible = assignment != residual_index
+        structured_indices = all_indices[structured_eligible]
+        strand_order = torch.argsort(
+            strand_preference[structured_indices], descending=True
+        )
+        strand_indices = structured_indices[
+            strand_order[: counts[strand_index]]
+        ]
+        assignment[strand_indices] = strand_index
+        if int((assignment == shell_index).sum()) != counts[shell_index]:
+            raise RuntimeError("semantic migration shell capacity allocation failed")
+
+        one_hot = F.one_hot(assignment, num_classes=len(ROUTE_NAMES)).to(
+            field.route_logits.dtype
+        )
+        field.route_active_gate.zero_()
+        field.route_active_gate.copy_(one_hot)
+        epsilon = 1e-6
+        smooth = one_hot * (1.0 - epsilon * (len(ROUTE_NAMES) - 1)) + (
+            1.0 - one_hot
+        ) * epsilon
+        field.route_logits.copy_(float(temperature) * torch.log(smooth))
+        field.initial_route_probabilities.copy_(smooth)
+        low_trust = torch.logit(
+            torch.tensor(1e-4, device=assignment.device, dtype=field.route_logits.dtype)
+        )
+        high_trust = torch.logit(
+            torch.tensor(
+                1.0 - 1e-4,
+                device=assignment.device,
+                dtype=field.route_logits.dtype,
+            )
+        )
+        field.residual_trust_logits.fill_(low_trust)
+        field.residual_trust_logits[assignment == residual_index, 0] = high_trust
+
+        carrier_assignment = assignment.clone()
+        # Route and carrier enums are [shell, strand, residual] versus
+        # [surface, shell, strand].
+        carrier_assignment[assignment == shell_index] = CARRIER_NAMES.index("shell")
+        carrier_assignment[assignment == strand_index] = CARRIER_NAMES.index("strand")
+        carrier_assignment[assignment == residual_index] = CARRIER_NAMES.index("surface")
+        carrier_one_hot = F.one_hot(
+            carrier_assignment, num_classes=len(CARRIER_NAMES)
+        ).to(field.carrier_logits.dtype)
+        carrier_smooth = carrier_one_hot * (
+            1.0 - epsilon * (len(CARRIER_NAMES) - 1)
+        ) + (1.0 - carrier_one_hot) * epsilon
+        field.carrier_logits.copy_(float(temperature) * torch.log(carrier_smooth))
+        field.initial_carrier_probabilities.copy_(carrier_smooth)
+
+        # This line is the render-preserving contract.  Training unfolds the
+        # selected semantic families from an exact residual copy.
+        field.structured_delta_raw.zero_()
+        field.structured_opacity_raw.zero_()
+
+    route_statistics: dict[str, object] = {}
+    for route_index, route_name in enumerate(ROUTE_NAMES):
+        selected = assignment == route_index
+        route_statistics[route_name] = {
+            "count": int(selected.sum().detach().cpu()),
+            "fraction": float(selected.float().mean().detach().cpu()),
+            "mean_anisotropy": float(anisotropy[selected].mean().detach().cpu())
+            if bool(selected.any())
+            else None,
+            "mean_binding_distance_relative": float(
+                binding_distance[selected].mean().detach().cpu()
+            )
+            if bool(selected.any())
+            else None,
+            "mean_opacity": float(opacity[selected].mean().detach().cpu())
+            if bool(selected.any())
+            else None,
+        }
+    return {
+        "requested_mass": [float(value) for value in requested.detach().cpu()],
+        "capacity_counts": {
+            name: counts[index] for index, name in enumerate(ROUTE_NAMES)
+        },
+        "residual_source_capacity_ceiling": float(
+            counts[residual_index] / max(field.point_count, 1)
+        ),
+        "selection": "ranked covariance/opacity/scalp-attachment semantic migration",
+        "zero_initialized_structured_delta": True,
+        "single_active_route_per_source": True,
+        "route_statistics": route_statistics,
+    }
+
+
+def _initialize_render_preserving_adaptive_migration(
+    field: UnifiedFiberField,
+    domain: str,
+    *,
+    domain_bias: float,
+    temperature: float,
+) -> dict[str, object]:
+    """Remove residual capacity and initialize an adaptive shell/strand router.
+
+    Hair/fur supplies a weak family-level log-odds prior.  Per-source
+    anisotropy, scalp distance, opacity, and local direction decide the rest;
+    no aggregate route fraction is prescribed.  Both structural routes start
+    as co-located teacher copies, and transmittance-conserving opacity splitting
+    keeps their soft mixture render-equivalent.
+    """
+
+    normalized_domain = str(domain).lower()
+    if normalized_domain not in {"hair", "fur", "auto"}:
+        raise ValueError(
+            "fiber_teacher_adaptive_migration_domain must be 'hair', 'fur', "
+            "or 'auto'"
+        )
+    if not math.isfinite(float(domain_bias)) or float(domain_bias) < 0.0:
+        raise ValueError("fiber_teacher_adaptive_migration_bias must be non-negative")
+    if float(temperature) <= 0.0:
+        raise ValueError("adaptive migration temperature must be positive")
+    shell_index = ROUTE_NAMES.index("shell")
+    strand_index = ROUTE_NAMES.index("strand")
+    residual_index = ROUTE_NAMES.index("residual")
+
+    with torch.no_grad():
+        scaling = field.original_scaling.detach().clamp_min(1e-12)
+        sorted_scaling = torch.sort(scaling, dim=-1).values
+        anisotropy = torch.log(
+            (sorted_scaling[:, -1] / sorted_scaling[:, 0]).clamp_min(1.0)
+        )
+        binding_distance = torch.linalg.vector_norm(
+            field.initial_residual_offset_local.detach(), dim=-1
+        ) / field.scene_scale.clamp_min(1e-8)
+        opacity = field.opacity.detach()
+        normal_alignment = field.direction_local.detach()[:, 2].abs()
+
+        # Positive preference selects strand.  Every term is rank-normalized,
+        # so the router transfers across reconstruction scale and GS density.
+        preference = (
+            1.50 * (_rank_unit_interval(anisotropy) - 0.5)
+            + 0.45 * (_rank_unit_interval(binding_distance) - 0.5)
+            + 0.30 * (_rank_unit_interval(opacity) - 0.5)
+            + 0.25 * (1.0 - normal_alignment)
+        )
+        if normalized_domain == "hair":
+            preference = preference + float(domain_bias)
+        elif normalized_domain == "fur":
+            preference = preference - float(domain_bias)
+
+        field.route_active_gate.zero_()
+        field.route_active_gate[:, shell_index] = 1.0
+        field.route_active_gate[:, strand_index] = 1.0
+        route_logits = torch.full_like(field.route_logits, -20.0)
+        route_logits[:, shell_index] = -0.5 * float(temperature) * preference
+        route_logits[:, strand_index] = 0.5 * float(temperature) * preference
+        field.route_logits.copy_(route_logits)
+        field.residual_trust_logits.fill_(
+            torch.logit(
+                torch.tensor(
+                    1e-4,
+                    device=field.route_logits.device,
+                    dtype=field.route_logits.dtype,
+                )
+            )
+        )
+        initial_probabilities = field.route_probabilities(
+            temperature=float(temperature), route_blend=1.0
+        )
+        field.initial_route_probabilities.copy_(
+            initial_probabilities.clamp_min(1e-6)
+        )
+
+        carrier_logits = torch.full_like(field.carrier_logits, -20.0)
+        carrier_logits[:, CARRIER_NAMES.index("shell")] = route_logits[
+            :, shell_index
+        ]
+        carrier_logits[:, CARRIER_NAMES.index("strand")] = route_logits[
+            :, strand_index
+        ]
+        field.carrier_logits.copy_(carrier_logits)
+        field.initial_carrier_probabilities.copy_(
+            field.carrier_probabilities(float(temperature)).clamp_min(1e-6)
+        )
+        field.structured_delta_raw.zero_()
+        field.structured_opacity_raw.zero_()
+
+    initial_mass = initial_probabilities.mean(dim=0)
+    hard_ids = initial_probabilities.argmax(dim=-1)
+    return {
+        "domain": normalized_domain,
+        "domain_log_odds_bias": float(domain_bias),
+        "fixed_global_quota": False,
+        "residual_source_capacity_ceiling": 0.0,
+        "active_routes_per_source": ["shell", "strand"],
+        "initial_soft_mass": {
+            name: float(initial_mass[index].detach().cpu())
+            for index, name in enumerate(ROUTE_NAMES)
+        },
+        "initial_hard_fraction": {
+            name: float((hard_ids == index).float().mean().detach().cpu())
+            for index, name in enumerate(ROUTE_NAMES)
+        },
+        "preference_statistics": {
+            "mean": float(preference.mean().detach().cpu()),
+            "std": float(preference.std().detach().cpu()),
+            "min": float(preference.min().detach().cpu()),
+            "max": float(preference.max().detach().cpu()),
+        },
+        "zero_initialized_structured_delta": True,
+        "transmittance_conserving_soft_routes": True,
+        "straight_through_hard_forward_required": True,
+    }
 
 
 def _resolve_fiber_point_budget(
@@ -225,6 +564,7 @@ def optimize_unified_fiber_stage2(
     checkpoint_every: int | None = None,
     camera_manifest: str | Path | None = None,
     residual_bootstrap_checkpoint: str | Path | None = None,
+    fixed_base_gaussian_ply: str | Path | None = None,
 ) -> FiberOptimizationArtifacts:
     """Optimize a unified field on monocular or calibrated multi-view data.
 
@@ -248,6 +588,11 @@ def optimize_unified_fiber_stage2(
         raise ValueError(
             "fiber_representation must be 'unified' or 'residual_only'"
         )
+    adaptive_hard_router = (
+        representation == "unified"
+        and cfg.fiber_teacher_adaptive_migration_domain is not None
+        and bool(cfg.fiber_adaptive_migration_hard_router)
+    )
     frame_paths = _frame_paths(frame_dir)
     width, height = _resolve_render_size(render_size, frame_paths, stage1_npz)
     point_budget = _resolve_fiber_point_budget(
@@ -263,6 +608,10 @@ def optimize_unified_fiber_stage2(
             if "scalp_face_indices" in stage1_payload.files
             else None
         )
+    split_fixed_base = bool(cfg.fiber_split_fixed_base)
+    learnable_source_mask_mode = (
+        "foreground" if split_fixed_base else str(cfg.fiber_source_mask_mode)
+    )
     field = create_unified_fiber_field(
         gaussian_ply,
         motion.rest_surface_vertices.detach().cpu().numpy(),
@@ -271,6 +620,15 @@ def optimize_unified_fiber_stage2(
         max_points=point_budget,
         point_sampling_mode=str(cfg.fiber_point_sampling_mode),
         exact_vertex_binding=bool(cfg.fiber_exact_vertex_binding),
+        binding_mode=str(cfg.fiber_binding_mode),
+        source_mask_mode=learnable_source_mask_mode,
+        source_mask_threshold=float(cfg.fiber_source_mask_threshold),
+        source_min_opacity=float(cfg.fiber_source_min_opacity),
+        residual_max_scale_fraction=float(
+            cfg.fiber_residual_max_scale_fraction
+        ),
+        semantic_mask_from_source=bool(cfg.fiber_semantic_mask_from_source),
+        structured_foreground_only=bool(cfg.fiber_structured_foreground_only),
         default_opacity=float(cfg.fiber_default_opacity),
         default_opacity_reference_points=int(
             cfg.fiber_default_opacity_reference_points
@@ -285,8 +643,37 @@ def optimize_unified_fiber_stage2(
             cfg.fiber_initialize_direction_from_normal
         ),
         scalp_face_indices=scalp_face_indices,
-        binding_cache=cfg.fiber_binding_cache,
+        binding_cache=(
+            partition_binding_cache(cfg.fiber_binding_cache, "foreground")
+            if split_fixed_base
+            else cfg.fiber_binding_cache
+        ),
     )
+    fixed_base_count = 0
+    fixed_base_source = (
+        Path(fixed_base_gaussian_ply)
+        if fixed_base_gaussian_ply is not None
+        else Path(gaussian_ply)
+    )
+    if split_fixed_base:
+        fixed_base = attach_fixed_gaussian_base(
+            field,
+            fixed_base_source,
+            motion.rest_surface_vertices.detach().cpu().numpy(),
+            motion.surface_faces.detach().cpu().numpy(),
+            device=device,
+            point_sampling_mode=str(cfg.fiber_point_sampling_mode),
+            exact_vertex_binding=bool(cfg.fiber_exact_vertex_binding),
+            binding_mode=str(cfg.fiber_binding_mode),
+            source_mask_threshold=float(cfg.fiber_source_mask_threshold),
+            source_min_opacity=float(cfg.fiber_source_min_opacity),
+            residual_max_scale_fraction=float(
+                cfg.fiber_fixed_base_max_scale_fraction
+            ),
+            scalp_face_indices=scalp_face_indices,
+            binding_cache=cfg.fiber_binding_cache,
+        )
+        fixed_base_count = fixed_base.point_count
     bootstrap_metadata = None
     if residual_bootstrap_checkpoint is not None:
         bootstrap_metadata = _load_residual_bootstrap_checkpoint(
@@ -295,9 +682,13 @@ def optimize_unified_fiber_stage2(
             bootstrap_route_mass=cfg.fiber_bootstrap_route_mass,
             bootstrap_route_temperature=cfg.fiber_final_temperature,
         )
-    teacher_requested = representation == "unified" and (
-        bool(cfg.fiber_freeze_residual_teacher)
+    teacher_requested = (
+        (representation == "unified" and bool(cfg.fiber_freeze_residual_teacher))
         or float(cfg.fiber_teacher_nonregression_weight) > 0.0
+        or float(cfg.fiber_structured_spill_weight) > 0.0
+        or int(cfg.fiber_coverage_seed_count) > 0
+        or cfg.fiber_teacher_semantic_migration_mass is not None
+        or cfg.fiber_teacher_adaptive_migration_domain is not None
     )
     if teacher_requested and bootstrap_metadata is None:
         raise ValueError(
@@ -310,7 +701,74 @@ def optimize_unified_fiber_stage2(
         for parameter in teacher_field.parameters():
             parameter.requires_grad_(False)
     if representation == "unified" and bool(cfg.fiber_freeze_residual_teacher):
-        _freeze_residual_teacher_scaffold(field)
+        _freeze_residual_teacher_scaffold(
+            field,
+            optimize_structured_base_appearance=bool(
+                cfg.fiber_optimize_structured_base_appearance
+            ),
+        )
+    if (
+        representation == "unified"
+        and bool(cfg.fiber_topology_initial_structured_off)
+    ):
+        # Start exactly from the editable residual student.  Shell/strand
+        # capacity exists but is not allowed to consume routing mass until a
+        # multi-view seed/grow event explicitly activates it.
+        with torch.no_grad():
+            field.route_active_gate[:, :2] = 0.0
+            field.route_active_gate[:, ROUTE_NAMES.index("residual")] = 1.0
+    semantic_migration_report: dict[str, object] | None = None
+    if (
+        cfg.fiber_teacher_semantic_migration_mass is not None
+        and cfg.fiber_teacher_adaptive_migration_domain is not None
+    ):
+        raise ValueError(
+            "Fixed semantic migration and adaptive residual-free migration "
+            "are mutually exclusive"
+        )
+    if (
+        representation == "unified"
+        and cfg.fiber_teacher_semantic_migration_mass is not None
+    ):
+        if bootstrap_metadata is None or teacher_field is None:
+            raise ValueError(
+                "fiber_teacher_semantic_migration_mass requires a frozen "
+                "residual bootstrap teacher"
+            )
+        if bool(cfg.fiber_topology_initial_structured_off):
+            raise ValueError(
+                "semantic teacher migration is incompatible with "
+                "fiber_topology_initial_structured_off"
+            )
+        semantic_migration_report = (
+            _initialize_render_preserving_semantic_migration(
+                field,
+                cfg.fiber_teacher_semantic_migration_mass,
+                temperature=float(cfg.fiber_final_temperature),
+            )
+        )
+    elif (
+        representation == "unified"
+        and cfg.fiber_teacher_adaptive_migration_domain is not None
+    ):
+        if bootstrap_metadata is None or teacher_field is None:
+            raise ValueError(
+                "fiber_teacher_adaptive_migration_domain requires a frozen "
+                "residual bootstrap teacher"
+            )
+        if bool(cfg.fiber_topology_initial_structured_off):
+            raise ValueError(
+                "adaptive teacher migration is incompatible with "
+                "fiber_topology_initial_structured_off"
+            )
+        semantic_migration_report = (
+            _initialize_render_preserving_adaptive_migration(
+                field,
+                cfg.fiber_teacher_adaptive_migration_domain,
+                domain_bias=float(cfg.fiber_teacher_adaptive_migration_bias),
+                temperature=float(cfg.fiber_final_temperature),
+            )
+        )
 
     observation_set = resolve_observations(
         frame_paths,
@@ -345,7 +803,12 @@ def optimize_unified_fiber_stage2(
     if frame_limit is not None and int(frame_limit) > 0:
         frame_indices = frame_indices[: int(frame_limit)]
     calibration_count = (
-        int(cfg.fiber_calibration_frames) if representation == "unified" else 0
+        int(cfg.fiber_calibration_frames)
+        if (
+            representation == "unified"
+            or float(cfg.fiber_teacher_nonregression_weight) > 0.0
+        )
+        else 0
     )
     frame_indices, calibration_frame_indices = _split_training_and_calibration_frames(
         frame_indices, calibration_count
@@ -365,23 +828,68 @@ def optimize_unified_fiber_stage2(
         for index in calibration_frame_indices
     ]
     if (
-        representation == "unified"
-        and float(cfg.fiber_teacher_nonregression_weight) > 0.0
+        float(cfg.fiber_teacher_nonregression_weight) > 0.0
         and not calibration_frame_indices
     ):
         raise ValueError(
             "fiber_teacher_nonregression_weight requires fiber_calibration_frames > 0"
         )
     orientation_targets = _load_orientation_targets(
-        frame_paths, frame_indices, width, height, device, cfg.fiber_orientation_dir
+        frame_paths,
+        frame_indices,
+        width,
+        height,
+        device,
+        cfg.fiber_orientation_dir,
+        distribution_radius=int(cfg.fiber_orientation_distribution_radius),
     )
+
+    semantic_migration_equivalence: dict[str, object] | None = None
+    if semantic_migration_report is not None:
+        if teacher_field is None:
+            raise RuntimeError("semantic migration lost its frozen teacher")
+        first_frame = frame_indices[0]
+        with torch.no_grad():
+            _tet_nodes, equivalence_vertices, _joints = motion.driven_points(
+                motion_indices[first_frame]
+            )
+        semantic_migration_equivalence = (
+            _measure_semantic_migration_render_equivalence(
+                field,
+                teacher_field,
+                equivalence_vertices,
+                motion.surface_faces,
+                cameras[first_frame],
+                cfg,
+                renderer_name,
+            )
+        )
+        equivalence_path = out_dir / "semantic_migration_equivalence.json"
+        equivalence_path.write_text(
+            json.dumps(semantic_migration_equivalence, indent=2),
+            encoding="utf-8",
+        )
+        tolerance = float(cfg.fiber_teacher_semantic_migration_tolerance)
+        if (
+            tolerance > 0.0
+            and float(semantic_migration_equivalence["maximum_mean_absolute_error"])
+            > tolerance
+        ):
+            raise RuntimeError(
+                "Render-preserving semantic migration exceeded tolerance: "
+                f"{semantic_migration_equivalence['maximum_mean_absolute_error']:.6g} "
+                f"> {tolerance:.6g}; see {equivalence_path}"
+            )
 
     visual_hull_frame_indices = frame_indices + calibration_frame_indices
     visual_hull_ground_truth = ground_truth + calibration_ground_truth
     visual_hull_vertices: list[torch.Tensor] = []
     if (
         representation == "unified"
-        and int(cfg.fiber_visual_hull_update_every) > 0
+        and (
+            int(cfg.fiber_visual_hull_update_every) > 0
+            or int(cfg.fiber_coverage_seed_count) > 0
+        )
     ):
         with torch.no_grad():
             for visual_frame in visual_hull_frame_indices:
@@ -391,6 +899,39 @@ def optimize_unified_fiber_stage2(
                 visual_hull_vertices.append(vertices)
 
     _validate_route_training_config(cfg)
+    coverage_seed_report: dict[str, object] | None = None
+    coverage_seed_teacher_masks: dict[int, torch.Tensor] = {}
+    if representation == "unified" and int(cfg.fiber_coverage_seed_count) > 0:
+        if teacher_field is None:
+            raise ValueError("Coverage seeding requires a frozen residual teacher")
+        coverage_orientation_targets = None
+        if bool(cfg.fiber_coverage_seed_orientation_init):
+            coverage_orientation_targets = _load_orientation_targets(
+                frame_paths,
+                visual_hull_frame_indices,
+                width,
+                height,
+                device,
+                cfg.fiber_orientation_dir,
+                distribution_radius=int(
+                    cfg.fiber_orientation_distribution_radius
+                ),
+            )
+        coverage_seed_report, coverage_seed_teacher_masks = (
+            _initialize_multiview_coverage_seeds(
+                field,
+                teacher_field,
+                motion.surface_faces,
+                visual_hull_vertices,
+                cameras,
+                visual_hull_frame_indices,
+                visual_hull_ground_truth,
+                coverage_orientation_targets,
+                cfg,
+                renderer_name,
+                out_dir,
+            )
+        )
     route_rng = np.random.default_rng(int(cfg.fiber_random_seed))
 
     base_lr = float(lr or cfg.optimize_lr)
@@ -419,6 +960,9 @@ def optimize_unified_fiber_stage2(
     if not 0.0 <= ema_decay < 1.0:
         raise ValueError("fiber_ema_decay must be in [0, 1)")
     metrics_jsonl = out_dir / "training_metrics.jsonl"
+    topology_jsonl = out_dir / "topology_events.jsonl"
+    topology_jsonl.write_text("", encoding="utf-8")
+    topology_events: list[dict[str, object]] = []
     checkpoint_dir = out_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ema: dict[str, float] = {}
@@ -429,10 +973,17 @@ def optimize_unified_fiber_stage2(
     latest_calibration_loss: float | None = None
     latest_calibration_frames: list[int] | None = None
     risk_update_count = 0
+    latest_teacher_calibration_student: float | None = None
+    latest_teacher_calibration_residual: float | None = None
+    latest_teacher_calibration_step: int | None = None
     dropout_counts = {name: 0 for name in ROUTE_NAMES}
+    shell_visibility: torch.Tensor | None = None
     strand_visibility: torch.Tensor | None = None
     latest_visual_hull_report: dict[str, float] | None = None
     visual_hull_update_count = 0
+    teacher_mask_cache: dict[int, torch.Tensor] = dict(
+        coverage_seed_teacher_masks
+    )
 
     with open(metrics_jsonl, "w", encoding="utf-8", buffering=1) as metrics_file:
         for step in range(total_steps):
@@ -444,6 +995,8 @@ def optimize_unified_fiber_stage2(
                 _tet_nodes, surface_vertices, _joints = motion.driven_points(
                     motion_indices[frame_index]
                 )
+            target_shell_points: torch.Tensor | None = None
+            target_strand_points: torch.Tensor | None = None
 
             if representation == "residual_only":
                 phase = "residual_only_3dgs"
@@ -462,6 +1015,12 @@ def optimize_unified_fiber_stage2(
                 route_blend, route_hardening = _routing_continuation(
                     step, total_steps, warmup_steps, routing_end, phase, cfg
                 )
+                if adaptive_hard_router:
+                    # A one-route forward pass keeps the residual-free
+                    # migration exactly one primitive per teacher source.
+                    # route_probabilities uses a straight-through estimator,
+                    # so shell/strand logits still receive soft gradients.
+                    route_hardening = 1.0
                 geometry_blend = route_blend * route_blend
                 route_dropout_probability = _scheduled_route_dropout_probability(
                     step,
@@ -489,8 +1048,11 @@ def optimize_unified_fiber_stage2(
                     )
                 )
                 if should_update_visual_hull:
-                    strand_visibility, latest_visual_hull_report = (
-                        _compute_visual_hull_gate(
+                    (
+                        shell_visibility,
+                        strand_visibility,
+                        latest_visual_hull_report,
+                    ) = _compute_visual_hull_gates(
                             field,
                             visual_hull_vertices,
                             motion.surface_faces,
@@ -500,7 +1062,7 @@ def optimize_unified_fiber_stage2(
                             temperature,
                             geometry_blend,
                         )
-                    )
+                    field.shell_visibility_gate = shell_visibility.detach()
                     field.strand_visibility_gate = strand_visibility.detach()
                     visual_hull_update_count += 1
                 primitives = field.primitives(
@@ -516,10 +1078,28 @@ def optimize_unified_fiber_stage2(
                     route_hardening=route_hardening,
                     dropped_route=dropped_route,
                     hard_route_policy=cfg.fiber_hard_route_policy,
+                    shell_visibility=shell_visibility,
                     strand_visibility=strand_visibility,
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
+                    teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
                 )
+                if (
+                    phase != "gaussian_scaffold"
+                    and bool(cfg.fiber_visual_hull_target_geometry)
+                ):
+                    target_shell_points = field.shell_target_geometry(
+                        surface_vertices,
+                        motion.surface_faces,
+                        shell_samples=int(cfg.fiber_shell_samples),
+                    )
+                    target_strand_points, _target_directions = (
+                        field.strand_target_geometry(
+                            surface_vertices,
+                            motion.surface_faces,
+                            strand_samples=int(cfg.fiber_strand_samples),
+                        )
+                    )
             orientation_target = (
                 orientation_targets[local_frame_index]
                 if phase != "gaussian_scaffold"
@@ -542,14 +1122,261 @@ def optimize_unified_fiber_stage2(
                 cfg.mask_boundary_radius,
                 cfg.mask_balance_weight,
             )
+            deployment_prediction = None
+            deployment_render_loss = render_loss.new_zeros(())
+            needs_deployment_prediction = (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and (
+                    float(cfg.fiber_deployment_render_weight) > 0.0
+                    or float(cfg.fiber_rgb_gradient_weight) > 0.0
+                    or float(cfg.fiber_structured_spill_weight) > 0.0
+                    or float(cfg.fiber_shell_render_spill_weight) > 0.0
+                    or float(cfg.fiber_mask_inside_coverage_weight) > 0.0
+                    or float(cfg.fiber_mask_outside_spill_weight) > 0.0
+                    or float(
+                        cfg.fiber_structured_mask_inside_coverage_weight
+                    )
+                    > 0.0
+                    or float(cfg.fiber_structured_mask_outside_spill_weight)
+                    > 0.0
+                )
+            )
+            if needs_deployment_prediction:
+                # Match fiber-eval exactly: checkpoints are rendered with the
+                # analytic shell/strand geometry fully deployed, irrespective
+                # of the continuation blend at the step that saved them.
+                deployment_primitives = field.primitives(
+                    surface_vertices,
+                    motion.surface_faces,
+                    shell_samples=cfg.fiber_shell_samples,
+                    strand_samples=cfg.fiber_strand_samples,
+                    temperature=cfg.fiber_final_temperature,
+                    hard_route=False,
+                    route_blend=1.0,
+                    geometry_blend=1.0,
+                    route_hardening=(1.0 if adaptive_hard_router else 0.0),
+                    hard_route_policy=cfg.fiber_hard_route_policy,
+                    shell_visibility=shell_visibility,
+                    strand_visibility=strand_visibility,
+                    fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                    additive_teacher=cfg.fiber_additive_teacher_mode,
+                    teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                )
+                deployment_prediction = _render(
+                    deployment_primitives, camera, cfg, renderer_name
+                )
+                if float(cfg.fiber_deployment_render_weight) > 0.0:
+                    deployment_render_loss, _deployment_parts = (
+                        differentiable_render_loss(
+                            deployment_prediction,
+                            ground_truth[local_frame_index]["rgb"],
+                            ground_truth[local_frame_index]["mask"],
+                            cfg.color_loss_weight,
+                            cfg.mask_loss_weight,
+                            cfg.mask_boundary_weight,
+                            cfg.mask_boundary_radius,
+                            cfg.mask_balance_weight,
+                        )
+                    )
+                    render_loss = render_loss + (
+                        float(cfg.fiber_deployment_render_weight)
+                        * deployment_render_loss
+                    )
+            rgb_gradient_loss = render_loss.new_zeros(())
+            if float(cfg.fiber_rgb_gradient_weight) > 0.0:
+                gradient_prediction = (
+                    deployment_prediction
+                    if deployment_prediction is not None
+                    else prediction
+                )
+                rgb_gradient_loss = _masked_rgb_gradient_loss(
+                    gradient_prediction["rgb"],
+                    ground_truth[local_frame_index]["rgb"],
+                    ground_truth[local_frame_index]["mask"],
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_rgb_gradient_weight) * rgb_gradient_loss
+                )
+            structured_spill_loss = render_loss.new_zeros(())
+            teacher_mask = None
+            needs_teacher_mask = (
+                phase != "gaussian_scaffold"
+                and teacher_field is not None
+                and (
+                    float(cfg.fiber_structured_spill_weight) > 0.0
+                    or float(cfg.fiber_mask_outside_spill_weight) > 0.0
+                )
+            )
+            if needs_teacher_mask:
+                teacher_mask = teacher_mask_cache.get(frame_index)
+                if teacher_mask is None:
+                    with torch.no_grad():
+                        teacher_primitives = teacher_field.residual_primitives(
+                            surface_vertices, motion.surface_faces
+                        )
+                        teacher_prediction = _render(
+                            teacher_primitives,
+                            camera,
+                            cfg,
+                            renderer_name,
+                        )
+                        teacher_mask = teacher_prediction["mask"].detach()
+                        teacher_mask_cache[frame_index] = teacher_mask
+            if (
+                phase != "gaussian_scaffold"
+                and float(cfg.fiber_structured_spill_weight) > 0.0
+            ):
+                if teacher_field is None:
+                    raise RuntimeError(
+                        "Structured spill supervision requires a residual teacher"
+                    )
+                if teacher_mask is None:
+                    raise RuntimeError("Residual teacher mask was not rendered")
+                structured_spill_loss = _structured_spill_loss(
+                    (
+                        deployment_prediction["mask"]
+                        if deployment_prediction is not None
+                        else prediction["mask"]
+                    ),
+                    teacher_mask,
+                    ground_truth[local_frame_index]["mask"],
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_structured_spill_weight)
+                    * structured_spill_loss
+                )
+            mask_inside_coverage_loss = render_loss.new_zeros(())
+            mask_outside_spill_loss = render_loss.new_zeros(())
+            structured_mask_inside_coverage_loss = render_loss.new_zeros(())
+            structured_mask_outside_spill_loss = render_loss.new_zeros(())
+            if (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and (
+                    float(cfg.fiber_mask_inside_coverage_weight) > 0.0
+                    or float(cfg.fiber_mask_outside_spill_weight) > 0.0
+                )
+            ):
+                if deployment_prediction is None:
+                    raise RuntimeError(
+                        "Bidirectional mask supervision requires deployed primitives"
+                    )
+                (
+                    mask_inside_coverage_loss,
+                    mask_outside_spill_loss,
+                ) = _bidirectional_mask_losses(
+                    deployment_prediction["mask"],
+                    ground_truth[local_frame_index]["mask"],
+                    inside_alpha_target=float(
+                        cfg.fiber_mask_inside_alpha_target
+                    ),
+                    outside_margin_px=int(cfg.fiber_mask_outside_margin_px),
+                    outside_reference_mask=(
+                        teacher_mask
+                        if (
+                            teacher_field is not None
+                            and bool(cfg.fiber_additive_teacher_mode)
+                        )
+                        else None
+                    ),
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_mask_inside_coverage_weight)
+                    * mask_inside_coverage_loss
+                    + float(cfg.fiber_mask_outside_spill_weight)
+                    * mask_outside_spill_loss
+                )
+            if (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and (
+                    float(cfg.fiber_structured_mask_inside_coverage_weight)
+                    > 0.0
+                    or float(cfg.fiber_structured_mask_outside_spill_weight)
+                    > 0.0
+                )
+            ):
+                if deployment_prediction is None:
+                    raise RuntimeError(
+                        "Structured mask supervision requires deployed primitives"
+                    )
+                structured_keep = (
+                    deployment_primitives.route_id
+                    != ROUTE_NAMES.index("residual")
+                ).to(deployment_primitives.opacity.dtype)
+                structured_prediction = _render(
+                    replace(
+                        deployment_primitives,
+                        opacity=deployment_primitives.opacity * structured_keep,
+                    ),
+                    camera,
+                    cfg,
+                    renderer_name,
+                )
+                (
+                    structured_mask_inside_coverage_loss,
+                    structured_mask_outside_spill_loss,
+                ) = _bidirectional_mask_losses(
+                    structured_prediction["mask"],
+                    ground_truth[local_frame_index]["mask"],
+                    inside_alpha_target=float(
+                        cfg.fiber_structured_mask_inside_alpha_target
+                    ),
+                    outside_margin_px=int(cfg.fiber_mask_outside_margin_px),
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_structured_mask_inside_coverage_weight)
+                    * structured_mask_inside_coverage_loss
+                    + float(cfg.fiber_structured_mask_outside_spill_weight)
+                    * structured_mask_outside_spill_loss
+                )
+            shell_render_spill_loss = render_loss.new_zeros(())
+            if (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and float(cfg.fiber_shell_render_spill_weight) > 0.0
+            ):
+                if deployment_prediction is None:
+                    raise RuntimeError(
+                        "Shell render spill requires deployed primitives"
+                    )
+                shell_keep = (
+                    deployment_primitives.route_id
+                    == ROUTE_NAMES.index("shell")
+                ).to(deployment_primitives.opacity.dtype)
+                shell_prediction = _render(
+                    replace(
+                        deployment_primitives,
+                        opacity=deployment_primitives.opacity * shell_keep,
+                    ),
+                    camera,
+                    cfg,
+                    renderer_name,
+                )
+                shell_render_spill_loss = _rendered_route_spill_loss(
+                    shell_prediction["mask"],
+                    ground_truth[local_frame_index]["mask"],
+                    margin_px=max(int(cfg.fiber_visual_hull_margin_px), 0),
+                )
             orientation_loss = render_loss.new_zeros(())
+            orientation_distribution_loss = render_loss.new_zeros(())
             if orientation_target is not None:
                 orientation_loss = _orientation_consistency_loss(
                     prediction["orientation"], orientation_target,
                     ground_truth[local_frame_index]["mask"],
                 )
+                orientation_distribution_loss = _orientation_distribution_loss(
+                    prediction["orientation"],
+                    prediction["orientation4"],
+                    orientation_target,
+                    ground_truth[local_frame_index]["mask"],
+                    prediction.get("physical_mask", prediction["mask"]),
+                )
                 render_loss = render_loss + (
                     float(cfg.fiber_orientation_weight) * orientation_loss
+                    + float(cfg.fiber_orientation_distribution_weight)
+                    * orientation_distribution_loss
                 )
             visual_hull_loss = render_loss.new_zeros(())
             if (
@@ -557,15 +1384,72 @@ def optimize_unified_fiber_stage2(
                 and phase != "gaussian_scaffold"
                 and float(cfg.fiber_visual_hull_weight) > 0.0
             ):
-                strand_points = _strand_points_from_primitives(
-                    primitives, field.point_count, int(cfg.fiber_strand_samples)
+                strand_points = (
+                    target_strand_points
+                    if target_strand_points is not None
+                    else _strand_points_from_primitives(
+                        primitives,
+                        field.point_count,
+                        int(cfg.fiber_strand_samples),
+                    )
                 )
+                strand_front_visibility = None
+                if bool(cfg.fiber_visual_hull_occlusion_aware):
+                    strand_front_visibility = _front_visible_sample_gate(
+                        strand_points,
+                        surface_vertices,
+                        camera,
+                        bin_px=int(cfg.fiber_visual_hull_occlusion_bin_px),
+                        depth_tolerance=(
+                            float(field.scene_scale.detach().cpu())
+                            * float(cfg.fiber_visual_hull_occlusion_depth_scale)
+                        ),
+                    )
                 visual_hull_loss = _visual_hull_soft_loss(
                     strand_points,
                     primitives.route_probabilities,
                     camera,
                     ground_truth[local_frame_index]["mask"],
                     int(cfg.fiber_visual_hull_margin_px),
+                    sample_gate=strand_visibility,
+                    visibility_gate=strand_front_visibility,
+                )
+            shell_visual_hull_loss = render_loss.new_zeros(())
+            if (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and float(cfg.fiber_shell_visual_hull_weight) > 0.0
+            ):
+                shell_points = (
+                    target_shell_points
+                    if target_shell_points is not None
+                    else _shell_points_from_primitives(
+                        primitives,
+                        field.point_count,
+                        int(cfg.fiber_shell_samples),
+                    )
+                )
+                shell_front_visibility = None
+                if bool(cfg.fiber_visual_hull_occlusion_aware):
+                    shell_front_visibility = _front_visible_sample_gate(
+                        shell_points,
+                        surface_vertices,
+                        camera,
+                        bin_px=int(cfg.fiber_visual_hull_occlusion_bin_px),
+                        depth_tolerance=(
+                            float(field.scene_scale.detach().cpu())
+                            * float(cfg.fiber_visual_hull_occlusion_depth_scale)
+                        ),
+                    )
+                shell_visual_hull_loss = _route_visual_hull_soft_loss(
+                    shell_points,
+                    primitives.route_probabilities,
+                    ROUTE_NAMES.index("shell"),
+                    camera,
+                    ground_truth[local_frame_index]["mask"],
+                    int(cfg.fiber_visual_hull_margin_px),
+                    sample_gate=shell_visibility,
+                    visibility_gate=shell_front_visibility,
                 )
             fin_silhouette_loss = render_loss.new_zeros(())
             if (
@@ -592,9 +1476,22 @@ def optimize_unified_fiber_stage2(
                     camera,
                     ground_truth[local_frame_index]["mask"],
                     int(cfg.fiber_visual_hull_margin_px),
+                    strand_points=target_strand_points,
                 )
             regularizers = field.regularizers(
-                surface_vertices, motion.surface_faces, temperature=temperature
+                surface_vertices,
+                motion.surface_faces,
+                temperature=temperature,
+                structure_min_deployment_gain=float(
+                    cfg.fiber_structure_min_deployment_gain
+                ),
+                strand_min_deployment_gain=float(
+                    cfg.fiber_strand_min_deployment_gain
+                ),
+                strand_min_deployed_length_scale=float(
+                    cfg.fiber_strand_min_deployed_length_scale
+                ),
+                strand_coverage_target=float(cfg.fiber_strand_coverage_target),
             )
             calibration_every = int(cfg.fiber_risk_calibration_every)
             should_update_risk = (
@@ -638,8 +1535,8 @@ def optimize_unified_fiber_stage2(
                         calibration_ground_truth,
                         cfg,
                         renderer_name,
-                        temperature,
-                        geometry_blend,
+                        float(cfg.fiber_final_temperature),
+                        1.0,
                         strand_visibility,
                     )
                 )
@@ -673,68 +1570,69 @@ def optimize_unified_fiber_stage2(
                 )
 
             teacher_nonregression = render_loss.new_zeros(())
-            teacher_calibration_student = None
-            teacher_calibration_residual = None
+            teacher_calibration_student = latest_teacher_calibration_student
+            teacher_calibration_residual = latest_teacher_calibration_residual
             nonreg_every = int(cfg.fiber_teacher_nonregression_every)
             if (
-                representation == "unified"
-                and phase != "gaussian_scaffold"
+                phase != "gaussian_scaffold"
                 and teacher_field is not None
                 and calibration_frame_indices
                 and float(cfg.fiber_teacher_nonregression_weight) > 0.0
                 and (step - warmup_steps) % nonreg_every == 0
             ):
-                calibration_local = (
-                    (step - warmup_steps) // nonreg_every
-                ) % len(calibration_frame_indices)
-                calibration_frame = calibration_frame_indices[calibration_local]
-                with torch.no_grad():
-                    _tet_nodes, calibration_vertices, _joints = motion.driven_points(
-                        motion_indices[calibration_frame]
-                    )
-                calibration_student_primitives = field.primitives(
-                    calibration_vertices,
-                    motion.surface_faces,
-                    shell_samples=cfg.fiber_shell_samples,
-                    strand_samples=cfg.fiber_strand_samples,
-                    temperature=temperature,
-                    hard_route=False,
-                    route_blend=route_blend,
-                    geometry_blend=geometry_blend,
-                    route_hardening=route_hardening,
-                    hard_route_policy=cfg.fiber_hard_route_policy,
-                    strand_visibility=strand_visibility,
-                    fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
-                    additive_teacher=cfg.fiber_additive_teacher_mode,
+                event_index = (step - warmup_steps) // nonreg_every
+                view_count = min(
+                    int(cfg.fiber_teacher_nonregression_views_per_step),
+                    len(calibration_frame_indices),
                 )
-                calibration_student_prediction = _render(
-                    calibration_student_primitives,
-                    cameras[calibration_frame],
-                    cfg,
-                    renderer_name,
+                start_local = (event_index * view_count) % len(
+                    calibration_frame_indices
                 )
-                calibration_student_loss, _parts = differentiable_render_loss(
-                    calibration_student_prediction,
-                    calibration_ground_truth[calibration_local]["rgb"],
-                    calibration_ground_truth[calibration_local]["mask"],
-                    cfg.color_loss_weight,
-                    cfg.mask_loss_weight,
-                    cfg.mask_boundary_weight,
-                    cfg.mask_boundary_radius,
-                    cfg.mask_balance_weight,
-                )
-                with torch.no_grad():
-                    teacher_primitives = teacher_field.residual_primitives(
-                        calibration_vertices, motion.surface_faces
-                    )
-                    teacher_prediction = _render(
-                        teacher_primitives,
+                calibration_locals = [
+                    (start_local + offset) % len(calibration_frame_indices)
+                    for offset in range(view_count)
+                ]
+                student_losses: list[torch.Tensor] = []
+                teacher_losses: list[torch.Tensor] = []
+                for calibration_local in calibration_locals:
+                    calibration_frame = calibration_frame_indices[calibration_local]
+                    with torch.no_grad():
+                        _tet_nodes, calibration_vertices, _joints = motion.driven_points(
+                            motion_indices[calibration_frame]
+                        )
+                    if representation == "residual_only":
+                        calibration_student_primitives = field.residual_primitives(
+                            calibration_vertices, motion.surface_faces
+                        )
+                    else:
+                        calibration_student_primitives = field.primitives(
+                            calibration_vertices,
+                            motion.surface_faces,
+                            shell_samples=cfg.fiber_shell_samples,
+                            strand_samples=cfg.fiber_strand_samples,
+                            temperature=cfg.fiber_final_temperature,
+                            hard_route=False,
+                            route_blend=1.0,
+                            geometry_blend=1.0,
+                            route_hardening=(
+                                1.0 if adaptive_hard_router else 0.0
+                            ),
+                            hard_route_policy=cfg.fiber_hard_route_policy,
+                            strand_visibility=strand_visibility,
+                            fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                            additive_teacher=cfg.fiber_additive_teacher_mode,
+                            teacher_opacity_transfer=(
+                                cfg.fiber_teacher_opacity_transfer
+                            ),
+                        )
+                    calibration_student_prediction = _render(
+                        calibration_student_primitives,
                         cameras[calibration_frame],
                         cfg,
                         renderer_name,
                     )
-                    teacher_loss, _parts = differentiable_render_loss(
-                        teacher_prediction,
+                    calibration_student_loss, _parts = differentiable_render_loss(
+                        calibration_student_prediction,
                         calibration_ground_truth[calibration_local]["rgb"],
                         calibration_ground_truth[calibration_local]["mask"],
                         cfg.color_loss_weight,
@@ -743,15 +1641,48 @@ def optimize_unified_fiber_stage2(
                         cfg.mask_boundary_radius,
                         cfg.mask_balance_weight,
                     )
-                teacher_nonregression = F.relu(
-                    calibration_student_loss
-                    - teacher_loss
+                    with torch.no_grad():
+                        teacher_primitives = teacher_field.residual_primitives(
+                            calibration_vertices, motion.surface_faces
+                        )
+                        teacher_prediction = _render(
+                            teacher_primitives,
+                            cameras[calibration_frame],
+                            cfg,
+                            renderer_name,
+                        )
+                        teacher_loss, _parts = differentiable_render_loss(
+                            teacher_prediction,
+                            calibration_ground_truth[calibration_local]["rgb"],
+                            calibration_ground_truth[calibration_local]["mask"],
+                            cfg.color_loss_weight,
+                            cfg.mask_loss_weight,
+                            cfg.mask_boundary_weight,
+                            cfg.mask_boundary_radius,
+                            cfg.mask_balance_weight,
+                        )
+                    student_losses.append(calibration_student_loss)
+                    teacher_losses.append(teacher_loss)
+                student_loss_stack = torch.stack(student_losses)
+                teacher_loss_stack = torch.stack(teacher_losses)
+                calibration_violations = F.relu(
+                    student_loss_stack
+                    - teacher_loss_stack
                     - float(cfg.fiber_teacher_nonregression_margin)
                 )
+                if cfg.fiber_teacher_nonregression_reduction == "max":
+                    teacher_nonregression = calibration_violations.max()
+                else:
+                    teacher_nonregression = calibration_violations.mean()
                 teacher_calibration_student = float(
-                    calibration_student_loss.detach().cpu()
+                    student_loss_stack.detach().mean().cpu()
                 )
-                teacher_calibration_residual = float(teacher_loss.detach().cpu())
+                teacher_calibration_residual = float(
+                    teacher_loss_stack.detach().mean().cpu()
+                )
+                latest_teacher_calibration_student = teacher_calibration_student
+                latest_teacher_calibration_residual = teacher_calibration_residual
+                latest_teacher_calibration_step = step
             if representation == "residual_only":
                 regularization = (
                     cfg.fiber_residual_drift_weight
@@ -777,8 +1708,20 @@ def optimize_unified_fiber_stage2(
                     + cfg.fiber_teacher_nonregression_weight
                     * teacher_nonregression
                     + cfg.fiber_visual_hull_weight * visual_hull_loss
+                    + cfg.fiber_shell_visual_hull_weight
+                    * shell_visual_hull_loss
+                    + cfg.fiber_shell_render_spill_weight
+                    * shell_render_spill_loss
                     + cfg.fiber_fin_silhouette_weight * fin_silhouette_loss
                     + cfg.fiber_strand_support_weight * strand_support_loss
+                    + cfg.fiber_structure_deployment_weight
+                    * regularizers["structure_deployment"]
+                    + cfg.fiber_strand_field_weight
+                    * regularizers["strand_field"]
+                    + cfg.fiber_strand_deployability_weight
+                    * regularizers["strand_deployability"]
+                    + cfg.fiber_strand_coverage_weight
+                    * regularizers["strand_coverage_deficit"]
                     + cfg.fiber_shell_normal_weight * regularizers["shell_normal"]
                     + cfg.fiber_shell_length_weight * regularizers["shell_length"]
                     + cfg.fiber_strand_thinness_weight * regularizers["strand_thinness"]
@@ -827,6 +1770,51 @@ def optimize_unified_fiber_stage2(
             torch.nn.utils.clip_grad_norm_(field.parameters(), cfg.fiber_gradient_clip)
             optimizer.step()
 
+            topology_event: dict[str, object] | None = None
+            topology_every = int(cfg.fiber_topology_update_every)
+            topology_start = max(int(cfg.fiber_topology_start_step), warmup_steps)
+            topology_stop = int(cfg.fiber_topology_stop_step)
+            completed_step = step + 1
+            should_update_topology = (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and topology_every > 0
+                and completed_step >= topology_start
+                and (topology_stop <= 0 or completed_step <= topology_stop)
+                and (completed_step - topology_start) % topology_every == 0
+            )
+            if should_update_topology:
+                topology_event = _update_adaptive_topology(
+                    field,
+                    optimizer,
+                    visual_hull_vertices,
+                    motion.surface_faces,
+                    [cameras[index] for index in visual_hull_frame_indices],
+                    visual_hull_ground_truth,
+                    cfg,
+                    renderer_name,
+                    step=completed_step,
+                    validation_surface_vertices=(
+                        visual_hull_vertices[-len(calibration_frame_indices) :]
+                        if calibration_frame_indices
+                        else []
+                    ),
+                    validation_cameras=[
+                        cameras[index] for index in calibration_frame_indices
+                    ],
+                    validation_targets=calibration_ground_truth,
+                )
+                topology_events.append(topology_event)
+                with open(topology_jsonl, "a", encoding="utf-8") as topology_file:
+                    topology_file.write(
+                        json.dumps(topology_event, sort_keys=True) + "\n"
+                    )
+                print(
+                    "fiber_topology="
+                    + json.dumps(topology_event, sort_keys=True),
+                    flush=True,
+                )
+
             scalar_values = {
                 "total": float(objective.detach().cpu()),
                 "render": float(render_loss.detach().cpu()),
@@ -845,7 +1833,30 @@ def optimize_unified_fiber_stage2(
                     render_parts["mask_background"].detach().cpu()
                 ),
                 "mask_boundary": float(render_parts["mask_boundary"].detach().cpu()),
+                "rgb_gradient": float(rgb_gradient_loss.detach().cpu()),
+                "deployment_render": float(
+                    deployment_render_loss.detach().cpu()
+                ),
+                "structured_spill": float(structured_spill_loss.detach().cpu()),
+                "mask_inside_coverage": float(
+                    mask_inside_coverage_loss.detach().cpu()
+                ),
+                "mask_outside_spill": float(
+                    mask_outside_spill_loss.detach().cpu()
+                ),
+                "structured_mask_inside_coverage": float(
+                    structured_mask_inside_coverage_loss.detach().cpu()
+                ),
+                "structured_mask_outside_spill": float(
+                    structured_mask_outside_spill_loss.detach().cpu()
+                ),
+                "shell_render_spill": float(
+                    shell_render_spill_loss.detach().cpu()
+                ),
                 "orientation": float(orientation_loss.detach().cpu()),
+                "orientation_distribution": float(
+                    orientation_distribution_loss.detach().cpu()
+                ),
                 "risk_calibration": float(risk_calibration.detach().cpu()),
                 "negative_contribution": float(
                     negative_contribution.detach().cpu()
@@ -854,8 +1865,16 @@ def optimize_unified_fiber_stage2(
                     teacher_nonregression.detach().cpu()
                 ),
                 "visual_hull": float(visual_hull_loss.detach().cpu()),
+                "shell_visual_hull": float(
+                    shell_visual_hull_loss.detach().cpu()
+                ),
                 "fin_silhouette": float(fin_silhouette_loss.detach().cpu()),
                 "strand_support": float(strand_support_loss.detach().cpu()),
+                "structure_deployment": float(
+                    regularizers["structure_deployment"].detach().cpu()
+                    if representation == "unified"
+                    else 0.0
+                ),
             }
             for name, value in scalar_values.items():
                 ema[name] = value if name not in ema else (
@@ -917,8 +1936,16 @@ def optimize_unified_fiber_stage2(
                     "visual_hull_report": latest_visual_hull_report,
                     "teacher_calibration_student": teacher_calibration_student,
                     "teacher_calibration_residual": teacher_calibration_residual,
+                    "latest_teacher_calibration_step": (
+                        latest_teacher_calibration_step
+                    ),
                     "latest_calibration_frames": latest_calibration_frames,
                     "latest_calibration_loss": latest_calibration_loss,
+                    "topology_event": topology_event,
+                    "active_topology": field.active_topology_summary(
+                        shell_samples=int(cfg.fiber_shell_samples),
+                        strand_samples=int(cfg.fiber_strand_samples),
+                    ),
                     **{
                         name: float(value.detach().cpu())
                         for name, value in regularizers.items()
@@ -932,7 +1959,6 @@ def optimize_unified_fiber_stage2(
             if (
                 checkpoint_interval > 0
                 and (step + 1) % checkpoint_interval == 0
-                and step != total_steps - 1
             ):
                 _save_training_checkpoint(
                     checkpoint_dir / f"step_{step + 1:06d}.pt",
@@ -955,6 +1981,27 @@ def optimize_unified_fiber_stage2(
                 "capacity_mode": cfg.fiber_capacity_mode,
                 "point_sampling_mode": cfg.fiber_point_sampling_mode,
                 "exact_vertex_binding": bool(cfg.fiber_exact_vertex_binding),
+                "binding_mode": str(cfg.fiber_binding_mode),
+                "source_mask_mode": learnable_source_mask_mode,
+                "split_fixed_base": split_fixed_base,
+                "fixed_base_count": fixed_base_count,
+                "fixed_base_gaussian_ply": (
+                    str(fixed_base_source.resolve()) if split_fixed_base else None
+                ),
+                "fixed_base_max_scale_fraction": float(
+                    cfg.fiber_fixed_base_max_scale_fraction
+                ),
+                "semantic_mask_from_source": bool(
+                    cfg.fiber_semantic_mask_from_source
+                ),
+                "structured_foreground_only": bool(
+                    cfg.fiber_structured_foreground_only
+                ),
+                "source_mask_threshold": float(cfg.fiber_source_mask_threshold),
+                "source_min_opacity": float(cfg.fiber_source_min_opacity),
+                "residual_max_scale_fraction": float(
+                    cfg.fiber_residual_max_scale_fraction
+                ),
                 "scene_scale": float(field.scene_scale.detach().cpu()),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
@@ -972,6 +2019,19 @@ def optimize_unified_fiber_stage2(
                 "residual_bootstrap": bootstrap_metadata,
                 "fixed_residual_teacher": bool(cfg.fiber_freeze_residual_teacher),
                 "visual_hull_update_count": visual_hull_update_count,
+                "coverage_seed_report": coverage_seed_report,
+                "semantic_migration_report": semantic_migration_report,
+                "semantic_migration_equivalence": (
+                    semantic_migration_equivalence
+                ),
+                "adaptive_topology": bool(
+                    int(cfg.fiber_topology_update_every) > 0
+                ),
+                "active_topology": field.active_topology_summary(
+                    shell_samples=int(cfg.fiber_shell_samples),
+                    strand_samples=int(cfg.fiber_strand_samples),
+                ),
+                "topology_update_count": len(topology_events),
             },
         },
         checkpoint_pt,
@@ -1059,17 +2119,78 @@ def optimize_unified_fiber_stage2(
         "risk_update_count": risk_update_count,
         "visual_hull_update_count": visual_hull_update_count,
         "final_visual_hull_report": latest_visual_hull_report,
+        "coverage_seed_report": coverage_seed_report,
+        "semantic_migration_report": semantic_migration_report,
+        "semantic_migration_equivalence": semantic_migration_equivalence,
+        "final_structure_deployment": (
+            _structure_deployment_summary(field, cfg.fiber_final_temperature)
+            if representation == "unified"
+            else {"shell": 0.0, "strand": 0.0, "structured_mean": 0.0}
+        ),
+        "final_active_topology": field.active_topology_summary(
+            shell_samples=int(cfg.fiber_shell_samples),
+            strand_samples=int(cfg.fiber_strand_samples),
+        ),
+        "topology_update_count": len(topology_events),
+        "topology_events": topology_events,
         "hard_route_policy": cfg.fiber_hard_route_policy,
         "config": {
             "representation": representation,
             "shell_samples": cfg.fiber_shell_samples,
             "strand_samples": cfg.fiber_strand_samples,
             "max_points": int(max_points or cfg.fiber_max_points),
+            "binding_mode": str(cfg.fiber_binding_mode),
+            "source_mask_mode": learnable_source_mask_mode,
+            "split_fixed_base": split_fixed_base,
+            "fixed_base_count": fixed_base_count,
+            "fixed_base_gaussian_ply": (
+                str(fixed_base_source.resolve()) if split_fixed_base else None
+            ),
+            "fixed_base_max_scale_fraction": float(
+                cfg.fiber_fixed_base_max_scale_fraction
+            ),
+            "semantic_mask_from_source": bool(cfg.fiber_semantic_mask_from_source),
+            "structured_foreground_only": bool(
+                cfg.fiber_structured_foreground_only
+            ),
+            "source_mask_threshold": float(cfg.fiber_source_mask_threshold),
+            "source_min_opacity": float(cfg.fiber_source_min_opacity),
+            "residual_max_scale_fraction": float(
+                cfg.fiber_residual_max_scale_fraction
+            ),
             "base_lr": base_lr,
             "residual_bootstrap": bootstrap_metadata,
             "route_neighbor_k": int(cfg.fiber_route_neighbor_k),
             "route_neighbor_weight": float(cfg.fiber_route_neighbor_weight),
             "initial_residual_trust": float(cfg.fiber_initial_residual_trust),
+            "teacher_semantic_migration_mass": (
+                list(cfg.fiber_teacher_semantic_migration_mass)
+                if cfg.fiber_teacher_semantic_migration_mass is not None
+                else None
+            ),
+            "teacher_adaptive_migration_domain": (
+                str(cfg.fiber_teacher_adaptive_migration_domain)
+                if cfg.fiber_teacher_adaptive_migration_domain is not None
+                else None
+            ),
+            "teacher_adaptive_migration_bias": float(
+                cfg.fiber_teacher_adaptive_migration_bias
+            ),
+            "adaptive_migration_hard_router": bool(
+                cfg.fiber_adaptive_migration_hard_router
+            ),
+            "optimize_structured_base_appearance": bool(
+                cfg.fiber_optimize_structured_base_appearance
+            ),
+            "teacher_semantic_migration_tolerance": float(
+                cfg.fiber_teacher_semantic_migration_tolerance
+            ),
+            "structure_deployment_weight": float(
+                cfg.fiber_structure_deployment_weight
+            ),
+            "structure_min_deployment_gain": float(
+                cfg.fiber_structure_min_deployment_gain
+            ),
             "residual_trust_weight": float(cfg.fiber_residual_trust_weight),
             "route_dropout_probability": float(
                 cfg.fiber_route_dropout_probability
@@ -1092,24 +2213,176 @@ def optimize_unified_fiber_stage2(
                 cfg.fiber_risk_target_prior_blend
             ),
             "freeze_residual_teacher": bool(cfg.fiber_freeze_residual_teacher),
+            "teacher_opacity_transfer": float(
+                cfg.fiber_teacher_opacity_transfer
+            ),
             "teacher_nonregression_weight": float(
                 cfg.fiber_teacher_nonregression_weight
             ),
             "teacher_nonregression_margin": float(
                 cfg.fiber_teacher_nonregression_margin
             ),
+            "teacher_nonregression_views_per_step": int(
+                cfg.fiber_teacher_nonregression_views_per_step
+            ),
+            "teacher_nonregression_reduction": str(
+                cfg.fiber_teacher_nonregression_reduction
+            ),
             "negative_contribution_weight": float(
                 cfg.fiber_negative_contribution_weight
             ),
             "visual_hull_weight": float(cfg.fiber_visual_hull_weight),
+            "visual_hull_target_geometry": bool(
+                cfg.fiber_visual_hull_target_geometry
+            ),
             "visual_hull_update_every": int(cfg.fiber_visual_hull_update_every),
             "visual_hull_min_views": int(cfg.fiber_visual_hull_min_views),
             "visual_hull_min_fraction": float(
                 cfg.fiber_visual_hull_min_fraction
             ),
+            "visual_hull_occlusion_aware": bool(
+                cfg.fiber_visual_hull_occlusion_aware
+            ),
+            "visual_hull_occlusion_bin_px": int(
+                cfg.fiber_visual_hull_occlusion_bin_px
+            ),
+            "visual_hull_occlusion_depth_scale": float(
+                cfg.fiber_visual_hull_occlusion_depth_scale
+            ),
+            "orientation_distribution_weight": float(
+                cfg.fiber_orientation_distribution_weight
+            ),
+            "orientation_distribution_radius": int(
+                cfg.fiber_orientation_distribution_radius
+            ),
+            "strand_field_weight": float(cfg.fiber_strand_field_weight),
+            "strand_deployability_weight": float(
+                cfg.fiber_strand_deployability_weight
+            ),
+            "strand_min_deployment_gain": float(
+                cfg.fiber_strand_min_deployment_gain
+            ),
+            "strand_min_deployed_length_scale": float(
+                cfg.fiber_strand_min_deployed_length_scale
+            ),
+            "strand_coverage_weight": float(cfg.fiber_strand_coverage_weight),
+            "strand_coverage_target": float(cfg.fiber_strand_coverage_target),
+            "rgb_gradient_weight": float(cfg.fiber_rgb_gradient_weight),
+            "deployment_render_weight": float(
+                cfg.fiber_deployment_render_weight
+            ),
+            "structured_spill_weight": float(
+                cfg.fiber_structured_spill_weight
+            ),
+            "mask_inside_coverage_weight": float(
+                cfg.fiber_mask_inside_coverage_weight
+            ),
+            "mask_outside_spill_weight": float(
+                cfg.fiber_mask_outside_spill_weight
+            ),
+            "mask_inside_alpha_target": float(
+                cfg.fiber_mask_inside_alpha_target
+            ),
+            "mask_outside_margin_px": int(
+                cfg.fiber_mask_outside_margin_px
+            ),
+            "structured_mask_inside_coverage_weight": float(
+                cfg.fiber_structured_mask_inside_coverage_weight
+            ),
+            "structured_mask_outside_spill_weight": float(
+                cfg.fiber_structured_mask_outside_spill_weight
+            ),
+            "structured_mask_inside_alpha_target": float(
+                cfg.fiber_structured_mask_inside_alpha_target
+            ),
+            "coverage_seed_count": int(cfg.fiber_coverage_seed_count),
+            "coverage_seed_samples": int(cfg.fiber_coverage_seed_samples),
+            "coverage_seed_min_views": int(
+                cfg.fiber_coverage_seed_min_views
+            ),
+            "coverage_seed_min_fraction": float(
+                cfg.fiber_coverage_seed_min_fraction
+            ),
+            "coverage_seed_min_deficit": float(
+                cfg.fiber_coverage_seed_min_deficit
+            ),
+            "coverage_seed_voxel_scale": float(
+                cfg.fiber_coverage_seed_voxel_scale
+            ),
+            "coverage_seed_visibility_cull": bool(
+                cfg.fiber_coverage_seed_visibility_cull
+            ),
+            "coverage_seed_visibility_bin_px": int(
+                cfg.fiber_coverage_seed_visibility_bin_px
+            ),
+            "coverage_seed_visibility_depth_scale": float(
+                cfg.fiber_coverage_seed_visibility_depth_scale
+            ),
+            "coverage_seed_structured_opacity": float(
+                cfg.fiber_coverage_seed_structured_opacity
+            ),
+            "coverage_seed_geometry_gain": float(
+                cfg.fiber_coverage_seed_geometry_gain
+            ),
+            "coverage_seed_shell_length_scale": float(
+                cfg.fiber_coverage_seed_shell_length_scale
+            ),
+            "coverage_seed_strand_length_scale": float(
+                cfg.fiber_coverage_seed_strand_length_scale
+            ),
+            "coverage_seed_orientation_init": bool(
+                cfg.fiber_coverage_seed_orientation_init
+            ),
+            "coverage_seed_orientation_normal_bias": float(
+                cfg.fiber_coverage_seed_orientation_normal_bias
+            ),
+            "coverage_seed_orientation_confidence_floor": float(
+                cfg.fiber_coverage_seed_orientation_confidence_floor
+            ),
+            "coverage_seed_route_mass": list(
+                cfg.fiber_coverage_seed_route_mass
+            ),
+            "topology_update_every": int(cfg.fiber_topology_update_every),
+            "topology_start_step": int(cfg.fiber_topology_start_step),
+            "topology_stop_step": int(cfg.fiber_topology_stop_step),
+            "topology_prune_count": int(cfg.fiber_topology_prune_count),
+            "topology_grow_count": int(cfg.fiber_topology_grow_count),
+            "topology_densify_count": int(cfg.fiber_topology_densify_count),
+            "topology_min_views": int(cfg.fiber_topology_min_views),
+            "topology_prune_max_support": float(
+                cfg.fiber_topology_prune_max_support
+            ),
+            "topology_prune_footprint_sigma": float(
+                cfg.fiber_topology_prune_footprint_sigma
+            ),
+            "topology_grow_min_support": float(
+                cfg.fiber_topology_grow_min_support
+            ),
+            "topology_grow_min_deficit": float(
+                cfg.fiber_topology_grow_min_deficit
+            ),
+            "topology_boundary_radius": int(
+                cfg.fiber_topology_boundary_radius
+            ),
+            "topology_detail_radius_scale": float(
+                cfg.fiber_topology_detail_radius_scale
+            ),
+            "topology_max_residual_prune_fraction": float(
+                cfg.fiber_topology_max_residual_prune_fraction
+            ),
+            "topology_initial_structured_off": bool(
+                cfg.fiber_topology_initial_structured_off
+            ),
+            "shell_visual_hull_weight": float(
+                cfg.fiber_shell_visual_hull_weight
+            ),
+            "shell_render_spill_weight": float(
+                cfg.fiber_shell_render_spill_weight
+            ),
         },
         "history": history,
         "metrics_jsonl": str(metrics_jsonl),
+        "topology_jsonl": str(topology_jsonl),
         "loss_curve_png": str(loss_curve_png),
     }
     with open(report_json, "w", encoding="utf-8") as file:
@@ -1195,6 +2468,27 @@ def _representation_route_summary(
     )
 
 
+def _structure_deployment_summary(
+    field: UnifiedFiberField, temperature: float
+) -> dict[str, float]:
+    probabilities = field.route_probabilities(temperature).detach()
+    gain = field.structured_delta_gain.detach()
+    summary: dict[str, float] = {}
+    for route_index, route_name in enumerate(ROUTE_NAMES[:2]):
+        weight = probabilities[:, route_index]
+        summary[route_name] = float(
+            (weight * gain[:, route_index]).sum().cpu()
+            / weight.sum().clamp_min(1e-8).cpu()
+        )
+    summary["structured_mean"] = float(
+        (
+            probabilities[:, :2] * gain
+        ).sum().cpu()
+        / probabilities[:, :2].sum().clamp_min(1e-8).cpu()
+    )
+    return summary
+
+
 def _split_training_and_calibration_frames(
     frame_indices: list[int], calibration_frames: int
 ) -> tuple[list[int], list[int]]:
@@ -1205,8 +2499,25 @@ def _split_training_and_calibration_frames(
         raise ValueError(
             "fiber_calibration_frames must leave at least one photometric training frame"
         )
-    split = len(frame_indices) - calibration_count
-    return list(frame_indices[:split]), list(frame_indices[split:])
+    # The cameras are ordered around the subject.  A tail split therefore validates
+    # several neighbouring cameras and can accept a topology edit that fails on the
+    # opposite side of the head.  Reserve evenly distributed leave-one-view-out
+    # cameras instead.  Rounded linspace indices are unique because count < length.
+    calibration_positions = np.rint(
+        np.linspace(0, len(frame_indices) - 1, calibration_count)
+    ).astype(np.int64)
+    calibration_position_set = set(int(index) for index in calibration_positions)
+    training = [
+        frame_index
+        for position, frame_index in enumerate(frame_indices)
+        if position not in calibration_position_set
+    ]
+    calibration = [
+        frame_index
+        for position, frame_index in enumerate(frame_indices)
+        if position in calibration_position_set
+    ]
+    return training, calibration
 
 
 def _validate_route_training_config(cfg: PipelineConfig) -> None:
@@ -1247,6 +2558,52 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_risk_target_prior_blend must be in [0, 1]")
     if int(cfg.fiber_route_neighbor_k) < 0:
         raise ValueError("fiber_route_neighbor_k must be non-negative")
+    migration_mass = cfg.fiber_teacher_semantic_migration_mass
+    if migration_mass is not None:
+        values = np.asarray(migration_mass, dtype=np.float64).reshape(-1)
+        if values.shape != (len(ROUTE_NAMES),):
+            raise ValueError(
+                "fiber_teacher_semantic_migration_mass must contain "
+                f"[{', '.join(ROUTE_NAMES)}] source fractions"
+            )
+        if (
+            not np.isfinite(values).all()
+            or np.any(values < 0.0)
+            or float(values.sum()) <= 0.0
+        ):
+            raise ValueError(
+                "fiber_teacher_semantic_migration_mass must be finite, "
+                "non-negative, and sum to a positive value"
+            )
+    adaptive_domain = cfg.fiber_teacher_adaptive_migration_domain
+    if migration_mass is not None and adaptive_domain is not None:
+        raise ValueError(
+            "Fixed semantic migration and adaptive residual-free migration "
+            "are mutually exclusive"
+        )
+    if adaptive_domain is not None and str(adaptive_domain).lower() not in {
+        "hair",
+        "fur",
+        "auto",
+    }:
+        raise ValueError(
+            "fiber_teacher_adaptive_migration_domain must be 'hair', 'fur', "
+            "or 'auto'"
+        )
+    adaptive_bias = float(cfg.fiber_teacher_adaptive_migration_bias)
+    if not math.isfinite(adaptive_bias) or adaptive_bias < 0.0:
+        raise ValueError(
+            "fiber_teacher_adaptive_migration_bias must be finite and non-negative"
+        )
+    if float(cfg.fiber_teacher_semantic_migration_tolerance) < 0.0:
+        raise ValueError(
+            "fiber_teacher_semantic_migration_tolerance must be non-negative"
+        )
+    if float(cfg.fiber_structure_deployment_weight) < 0.0:
+        raise ValueError("fiber_structure_deployment_weight must be non-negative")
+    structure_gain = float(cfg.fiber_structure_min_deployment_gain)
+    if not 0.0 <= structure_gain <= 1.0:
+        raise ValueError("fiber_structure_min_deployment_gain must be in [0, 1]")
     fin_strength = float(cfg.fiber_fin_gate_strength)
     if not 0.0 <= fin_strength <= 1.0:
         raise ValueError("fiber_fin_gate_strength must be in [0, 1]")
@@ -1263,6 +2620,150 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_fin_silhouette_radius must be positive")
     if float(cfg.fiber_strand_support_weight) < 0.0:
         raise ValueError("fiber_strand_support_weight must be non-negative")
+    if float(cfg.fiber_shell_visual_hull_weight) < 0.0:
+        raise ValueError("fiber_shell_visual_hull_weight must be non-negative")
+    if float(cfg.fiber_shell_render_spill_weight) < 0.0:
+        raise ValueError("fiber_shell_render_spill_weight must be non-negative")
+    if float(cfg.fiber_rgb_gradient_weight) < 0.0:
+        raise ValueError("fiber_rgb_gradient_weight must be non-negative")
+    if float(cfg.fiber_structured_spill_weight) < 0.0:
+        raise ValueError("fiber_structured_spill_weight must be non-negative")
+    for name in (
+        "fiber_mask_inside_coverage_weight",
+        "fiber_mask_outside_spill_weight",
+        "fiber_structured_mask_inside_coverage_weight",
+        "fiber_structured_mask_outside_spill_weight",
+    ):
+        if float(getattr(cfg, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    for name in (
+        "fiber_mask_inside_alpha_target",
+        "fiber_structured_mask_inside_alpha_target",
+    ):
+        value = float(getattr(cfg, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if int(cfg.fiber_mask_outside_margin_px) < 0:
+        raise ValueError("fiber_mask_outside_margin_px must be non-negative")
+    if int(cfg.fiber_coverage_seed_count) < 0:
+        raise ValueError("fiber_coverage_seed_count must be non-negative")
+    if int(cfg.fiber_coverage_seed_samples) <= 0:
+        raise ValueError("fiber_coverage_seed_samples must be positive")
+    if int(cfg.fiber_coverage_seed_min_views) <= 0:
+        raise ValueError("fiber_coverage_seed_min_views must be positive")
+    for name in (
+        "fiber_coverage_seed_min_fraction",
+        "fiber_coverage_seed_min_deficit",
+        "fiber_coverage_seed_structured_opacity",
+        "fiber_coverage_seed_geometry_gain",
+    ):
+        value = float(getattr(cfg, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    for name in (
+        "fiber_coverage_seed_voxel_scale",
+        "fiber_coverage_seed_shell_length_scale",
+        "fiber_coverage_seed_strand_length_scale",
+    ):
+        if float(getattr(cfg, name)) <= 0.0:
+            raise ValueError(f"{name} must be positive")
+    if int(cfg.fiber_coverage_seed_visibility_bin_px) <= 0:
+        raise ValueError("fiber_coverage_seed_visibility_bin_px must be positive")
+    if float(cfg.fiber_coverage_seed_visibility_depth_scale) < 0.0:
+        raise ValueError(
+            "fiber_coverage_seed_visibility_depth_scale must be non-negative"
+        )
+    orientation_normal_bias = float(
+        cfg.fiber_coverage_seed_orientation_normal_bias
+    )
+    if not 0.0 <= orientation_normal_bias <= 1.0:
+        raise ValueError(
+            "fiber_coverage_seed_orientation_normal_bias must be in [0, 1]"
+        )
+    orientation_confidence_floor = float(
+        cfg.fiber_coverage_seed_orientation_confidence_floor
+    )
+    if not 0.0 <= orientation_confidence_floor <= 1.0:
+        raise ValueError(
+            "fiber_coverage_seed_orientation_confidence_floor must be in [0, 1]"
+        )
+    if (
+        bool(cfg.fiber_coverage_seed_orientation_init)
+        and cfg.fiber_orientation_dir is None
+    ):
+        raise ValueError(
+            "fiber_coverage_seed_orientation_init requires fiber_orientation_dir"
+        )
+    coverage_route_mass = np.asarray(
+        cfg.fiber_coverage_seed_route_mass, dtype=np.float64
+    ).reshape(-1)
+    if coverage_route_mass.shape != (len(ROUTE_NAMES),):
+        raise ValueError(
+            "fiber_coverage_seed_route_mass must contain "
+            f"[{', '.join(ROUTE_NAMES)}] mass"
+        )
+    if (
+        not np.isfinite(coverage_route_mass).all()
+        or np.any(coverage_route_mass < 0.0)
+        or float(coverage_route_mass.sum()) <= 0.0
+        or float(coverage_route_mass[ROUTE_NAMES.index("residual")]) <= 0.0
+    ):
+        raise ValueError(
+            "fiber_coverage_seed_route_mass must be finite, non-negative, "
+            "sum to a positive value, and retain positive residual mass"
+        )
+    for name in (
+        "fiber_topology_update_every",
+        "fiber_topology_start_step",
+        "fiber_topology_stop_step",
+        "fiber_topology_prune_count",
+        "fiber_topology_grow_count",
+        "fiber_topology_densify_count",
+    ):
+        if int(getattr(cfg, name)) < 0:
+            raise ValueError(f"{name} must be non-negative")
+    if int(cfg.fiber_topology_min_views) <= 0:
+        raise ValueError("fiber_topology_min_views must be positive")
+    for name in (
+        "fiber_topology_prune_max_support",
+        "fiber_topology_grow_min_support",
+        "fiber_topology_grow_min_deficit",
+        "fiber_topology_max_residual_prune_fraction",
+    ):
+        value = float(getattr(cfg, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    footprint_sigma = float(cfg.fiber_topology_prune_footprint_sigma)
+    if not math.isfinite(footprint_sigma) or footprint_sigma <= 0.0:
+        raise ValueError("fiber_topology_prune_footprint_sigma must be positive")
+    if int(cfg.fiber_topology_boundary_radius) <= 0:
+        raise ValueError("fiber_topology_boundary_radius must be positive")
+    detail_scale = float(cfg.fiber_topology_detail_radius_scale)
+    if not 0.0 < detail_scale <= 1.0:
+        raise ValueError("fiber_topology_detail_radius_scale must be in (0, 1]")
+    if float(cfg.fiber_topology_validation_margin) < 0.0:
+        raise ValueError("fiber_topology_validation_margin must be non-negative")
+    if (
+        bool(cfg.fiber_topology_validate_events)
+        and int(cfg.fiber_calibration_frames) < 2
+    ):
+        raise ValueError(
+            "fiber_topology_validate_events requires at least two calibration views"
+        )
+    if float(cfg.fiber_deployment_render_weight) < 0.0:
+        raise ValueError("fiber_deployment_render_weight must be non-negative")
+    for name in (
+        "fiber_strand_field_weight",
+        "fiber_strand_deployability_weight",
+        "fiber_strand_min_deployed_length_scale",
+        "fiber_strand_coverage_weight",
+        "fiber_strand_coverage_target",
+    ):
+        if float(getattr(cfg, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    deployment_gain = float(cfg.fiber_strand_min_deployment_gain)
+    if not 0.0 <= deployment_gain <= 1.0:
+        raise ValueError("fiber_strand_min_deployment_gain must be in [0, 1]")
     if int(cfg.fiber_risk_calibration_every) < 0:
         raise ValueError("fiber_risk_calibration_every must be non-negative")
     calibration_start_blend = float(
@@ -1276,8 +2777,19 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_risk_floor must be positive")
     if int(cfg.fiber_teacher_nonregression_every) <= 0:
         raise ValueError("fiber_teacher_nonregression_every must be positive")
+    if int(cfg.fiber_teacher_nonregression_views_per_step) <= 0:
+        raise ValueError(
+            "fiber_teacher_nonregression_views_per_step must be positive"
+        )
+    if cfg.fiber_teacher_nonregression_reduction not in {"mean", "max"}:
+        raise ValueError(
+            "fiber_teacher_nonregression_reduction must be 'mean' or 'max'"
+        )
     if float(cfg.fiber_teacher_nonregression_weight) < 0.0:
         raise ValueError("fiber_teacher_nonregression_weight must be non-negative")
+    teacher_transfer = float(cfg.fiber_teacher_opacity_transfer)
+    if not 0.0 <= teacher_transfer <= 1.0:
+        raise ValueError("fiber_teacher_opacity_transfer must be in [0, 1]")
     if float(cfg.fiber_negative_contribution_weight) < 0.0:
         raise ValueError("fiber_negative_contribution_weight must be non-negative")
     if int(cfg.fiber_visual_hull_update_every) < 0:
@@ -1289,6 +2801,22 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_visual_hull_min_fraction must be in [0, 1]")
     if int(cfg.fiber_visual_hull_margin_px) < 0:
         raise ValueError("fiber_visual_hull_margin_px must be non-negative")
+    if float(cfg.fiber_orientation_distribution_weight) < 0.0:
+        raise ValueError(
+            "fiber_orientation_distribution_weight must be non-negative"
+        )
+    if int(cfg.fiber_orientation_distribution_radius) < 0:
+        raise ValueError(
+            "fiber_orientation_distribution_radius must be non-negative"
+        )
+    if int(cfg.fiber_visual_hull_occlusion_bin_px) <= 0:
+        raise ValueError(
+            "fiber_visual_hull_occlusion_bin_px must be positive"
+        )
+    if float(cfg.fiber_visual_hull_occlusion_depth_scale) < 0.0:
+        raise ValueError(
+            "fiber_visual_hull_occlusion_depth_scale must be non-negative"
+        )
     for name in (
         "fiber_carrier_entropy_weight",
         "fiber_carrier_prior_weight",
@@ -1448,6 +2976,1279 @@ def _sample_mask_at_world_points(
     return sampled.reshape(original_shape), valid.reshape(original_shape)
 
 
+def _residual_footprint_probe_points(
+    center: torch.Tensor,
+    tangent: torch.Tensor,
+    bitangent: torch.Tensor,
+    normal: torch.Tensor,
+    scaling: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """Return conservative probes for residual Gaussian mask support.
+
+    Center-only pruning opens holes when the center is outside a thin hair
+    mask but the Gaussian footprint still covers valid foreground.  Probe the
+    center and both signs of the local surface-frame axes at ``sigma`` times
+    the largest Gaussian scale.  A residual is prunable only when this whole
+    footprint lacks multi-view support.
+    """
+
+    if center.ndim != 2 or center.shape[-1] != 3:
+        raise ValueError("center must have shape [N, 3]")
+    for name, axis in (
+        ("tangent", tangent),
+        ("bitangent", bitangent),
+        ("normal", normal),
+    ):
+        if axis.shape != center.shape:
+            raise ValueError(f"{name} must match center shape")
+    if scaling.ndim != 2 or scaling.shape[0] != center.shape[0]:
+        raise ValueError("scaling must have shape [N, C]")
+    if not math.isfinite(float(sigma)) or float(sigma) <= 0.0:
+        raise ValueError("sigma must be positive")
+    extent = float(sigma) * scaling.detach().amax(dim=-1, keepdim=True)
+    offsets = torch.stack(
+        [tangent, -tangent, bitangent, -bitangent, normal, -normal], dim=1
+    )
+    return torch.cat(
+        [center[:, None, :], center[:, None, :] + extent[:, None, :] * offsets],
+        dim=1,
+    )
+
+
+def _front_surface_visibility(
+    points: torch.Tensor,
+    camera,
+    *,
+    bin_px: int,
+    depth_tolerance: float,
+) -> torch.Tensor:
+    """Approximate head-surface visibility with a point z-buffer.
+
+    Dense head vertices are binned into small image blocks and only points
+    near the minimum camera-space depth survive.  This prevents back-side
+    face/neck vertices from receiving scalp occupancy merely because their 2D
+    projection overlaps a front-side hair silhouette.
+    """
+
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError("Visibility points must have shape (N, 3)")
+    block = int(bin_px)
+    if block <= 0:
+        raise ValueError("bin_px must be positive")
+    if float(depth_tolerance) < 0.0:
+        raise ValueError("depth_tolerance must be non-negative")
+    dtype, device = points.dtype, points.device
+    world_to_camera = torch.as_tensor(
+        camera.world_to_camera, dtype=dtype, device=device
+    )
+    camera_xyz = points @ world_to_camera[:3, :3].T + world_to_camera[:3, 3]
+    z = camera_xyz[:, 2]
+    safe_z = z.clamp_min(1e-6)
+    x = float(camera.fx) * camera_xyz[:, 0] / safe_z + float(camera.cx)
+    y_sign = 1.0 if camera.image_y_down else -1.0
+    y = float(camera.cy) + y_sign * float(camera.fy) * camera_xyz[:, 1] / safe_z
+    width, height = int(camera.width), int(camera.height)
+    valid = (
+        (z > 1e-5)
+        & (x >= 0.0)
+        & (x <= max(width - 1, 0))
+        & (y >= 0.0)
+        & (y <= max(height - 1, 0))
+    )
+    bins_x = int(math.ceil(width / block))
+    bins_y = int(math.ceil(height / block))
+    bin_x = torch.floor(x / block).to(torch.long).clamp(0, bins_x - 1)
+    bin_y = torch.floor(y / block).to(torch.long).clamp(0, bins_y - 1)
+    linear = bin_y * bins_x + bin_x
+    depth = torch.full(
+        (bins_x * bins_y,), float("inf"), device=device, dtype=dtype
+    )
+    if torch.any(valid):
+        depth.scatter_reduce_(
+            0,
+            linear[valid],
+            z[valid],
+            reduce="amin",
+            include_self=True,
+        )
+    closest = depth[linear]
+    return valid & (z <= closest + float(depth_tolerance))
+
+
+def _front_visible_sample_gate(
+    points: torch.Tensor,
+    occluders: torch.Tensor,
+    camera,
+    *,
+    bin_px: int,
+    depth_tolerance: float,
+) -> torch.Tensor:
+    """Return front-visible samples using shared geometry as z-buffer occluders."""
+
+    if points.ndim < 2 or points.shape[-1] != 3:
+        raise ValueError("points must end in XYZ")
+    if occluders.ndim != 2 or occluders.shape[-1] != 3:
+        raise ValueError("occluders must have shape [N, 3]")
+    original_shape = points.shape[:-1]
+    flat = points.detach().reshape(-1, 3)
+    with torch.no_grad():
+        combined = torch.cat([occluders.detach(), flat], dim=0)
+        visible = _front_surface_visibility(
+            combined,
+            camera,
+            bin_px=int(bin_px),
+            depth_tolerance=float(depth_tolerance),
+        )
+    return visible[-flat.shape[0] :].reshape(original_shape)
+
+
+def _positive_parameter_raw(
+    value: torch.Tensor, *, eps: float
+) -> torch.Tensor:
+    """Invert ``softplus(raw) + eps`` without producing infinities."""
+
+    positive = (value - float(eps)).clamp_min(1e-8)
+    return torch.log(torch.expm1(positive).clamp_min(1e-12))
+
+
+def _topk_masked(
+    score: torch.Tensor, eligible: torch.Tensor, count: int
+) -> torch.Tensor:
+    """Deterministically select the highest-scoring eligible source ids."""
+
+    indices = torch.nonzero(eligible, as_tuple=False).flatten()
+    limit = min(max(int(count), 0), int(indices.numel()))
+    if limit == 0:
+        return torch.empty((0,), dtype=torch.long, device=score.device)
+    # Stable tie-breaking by source id keeps topology runs reproducible.
+    tie = indices.to(score.dtype) * (
+        torch.finfo(score.dtype).eps / float(max(score.numel(), 1))
+    )
+    order = torch.argsort(score[indices] - tie, descending=True)
+    return indices[order[:limit]]
+
+
+def _set_effective_route_mass(
+    field: UnifiedFiberField,
+    indices: torch.Tensor,
+    desired_mass: torch.Tensor,
+    *,
+    temperature: float,
+    residual_trust: float = 0.02,
+) -> None:
+    """Initialize selected rows to a requested effective route distribution."""
+
+    if indices.numel() == 0:
+        return
+    desired = desired_mass.to(
+        device=field.route_logits.device, dtype=field.route_logits.dtype
+    ).reshape(-1)
+    if desired.numel() != len(ROUTE_NAMES) or torch.any(desired < 0.0):
+        raise ValueError("desired route mass must be non-negative shell/strand/residual")
+    desired = desired / desired.sum().clamp_min(1e-8)
+    residual_index = ROUTE_NAMES.index("residual")
+    trust = min(max(float(residual_trust), 1e-4), 0.95)
+    # The effective residual probability contains an explicit trust floor.
+    # Keep the requested residual mass just above it before inverting the
+    # mixture; topology gates later remove inactive routes exactly.
+    effective = desired.clone()
+    effective[residual_index] = max(float(effective[residual_index]), trust + 1e-4)
+    effective = effective / effective.sum()
+    base = effective.clone()
+    base[:residual_index] /= 1.0 - trust
+    base[residual_index] = (
+        effective[residual_index] - trust
+    ) / (1.0 - trust)
+    base = base.clamp_min(1e-6)
+    base = base / base.sum()
+    field.residual_trust_logits[indices, 0] = torch.logit(
+        torch.tensor(
+            trust,
+            device=field.residual_trust_logits.device,
+            dtype=field.residual_trust_logits.dtype,
+        )
+    )
+    field.route_logits[indices] = float(temperature) * torch.log(base)
+    field.initial_route_probabilities[indices] = effective
+
+
+def _clear_adam_rows(
+    optimizer: torch.optim.Optimizer,
+    parameters: list[torch.nn.Parameter],
+    indices: torch.Tensor,
+) -> None:
+    """Remove stale Adam momentum from rows changed by a topology event."""
+
+    if indices.numel() == 0:
+        return
+    for parameter in parameters:
+        state = optimizer.state.get(parameter)
+        if not state:
+            continue
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            value = state.get(name)
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                value[indices] = 0.0
+
+
+def _apply_adaptive_topology_scores(
+    field: UnifiedFiberField,
+    optimizer: torch.optim.Optimizer,
+    cfg: PipelineConfig,
+    *,
+    visible_views: torch.Tensor,
+    residual_support: torch.Tensor,
+    structured_support: torch.Tensor,
+    deficit_score: torch.Tensor,
+    boundary_score: torch.Tensor,
+    step: int,
+    clear_optimizer_state: bool = True,
+) -> dict[str, object]:
+    """Apply explicit prune/grow/densify decisions from multi-view scores.
+
+    The tensors are a capacity pool; changing route_active_gate changes the
+    actual non-zero Gaussian set seen by the rasterizer.  This is equivalent
+    to prune/clone ADC without resizing Adam parameters in the middle of a
+    training run.
+    """
+
+    device = field.route_logits.device
+    for name, value in (
+        ("visible_views", visible_views),
+        ("residual_support", residual_support),
+        ("structured_support", structured_support),
+        ("deficit_score", deficit_score),
+        ("boundary_score", boundary_score),
+    ):
+        if tuple(value.shape) != (field.point_count,):
+            raise ValueError(f"{name} must contain one value per source")
+    active = field.route_active_gate
+    shell_index = ROUTE_NAMES.index("shell")
+    strand_index = ROUTE_NAMES.index("strand")
+    residual_index = ROUTE_NAMES.index("residual")
+    min_views = float(cfg.fiber_topology_min_views)
+    structured_active = (active[:, :2] > 0.5).any(dim=1)
+    residual_active = active[:, residual_index] > 0.5
+    foreground_eligible = (
+        field.source_foreground > 0.5
+        if bool(getattr(field, "structured_foreground_only", False))
+        else torch.ones(field.point_count, dtype=torch.bool, device=device)
+    )
+
+    max_pruned = int(
+        math.floor(
+            field.point_count
+            * float(cfg.fiber_topology_max_residual_prune_fraction)
+        )
+    )
+    # A semantic migration deliberately disables residual on every source
+    # owned by shell/strand.  Those sources are not pruned; only rows with no
+    # active family consume the outlier-pruning budget.
+    already_pruned = int((~(active > 0.5).any(dim=1)).sum().detach().cpu())
+    prune_budget = min(
+        int(cfg.fiber_topology_prune_count), max(max_pruned - already_pruned, 0)
+    )
+    prune_eligible = (
+        foreground_eligible
+        &
+        residual_active
+        & (~structured_active)
+        & (visible_views >= min_views)
+        & (residual_support <= float(cfg.fiber_topology_prune_max_support))
+    )
+    prune_score = (
+        (1.0 - residual_support.clamp(0.0, 1.0))
+        * field.opacity.detach()
+    )
+    pruned = _topk_masked(prune_score, prune_eligible, prune_budget)
+
+    grow_eligible = (
+        foreground_eligible
+        & (active[:, strand_index] <= 0.5)
+        & (visible_views >= min_views)
+        & (structured_support >= float(cfg.fiber_topology_grow_min_support))
+        & (deficit_score >= float(cfg.fiber_topology_grow_min_deficit))
+    )
+    grown = _topk_masked(
+        deficit_score * structured_support,
+        grow_eligible,
+        int(cfg.fiber_topology_grow_count),
+    )
+    grow_mask = torch.zeros(field.point_count, dtype=torch.bool, device=device)
+    grow_mask[grown] = True
+
+    detail_eligible = (
+        foreground_eligible
+        & (active[:, shell_index] <= 0.5)
+        & (~grow_mask)
+        & (visible_views >= min_views)
+        & (structured_support >= float(cfg.fiber_topology_grow_min_support))
+        & (boundary_score > 0.0)
+    )
+    densified = _topk_masked(
+        boundary_score * structured_support,
+        detail_eligible,
+        int(cfg.fiber_topology_densify_count),
+    )
+
+    with torch.no_grad():
+        active[pruned, residual_index] = 0.0
+        if grown.numel() > 0:
+            if cfg.fiber_teacher_semantic_migration_mass is not None:
+                # A validated grow event transfers ownership instead of
+                # creating a residual escape hatch or double-owned source.
+                active[grown] = 0.0
+                active[grown, strand_index] = 1.0
+            else:
+                active[grown, shell_index] = 1.0
+                active[grown, strand_index] = 1.0
+            field.structured_delta_raw[grown] = 1.0
+            field.structured_opacity_raw[grown] = max(
+                float(cfg.fiber_coverage_seed_structured_opacity), 0.25
+            )
+            _set_effective_route_mass(
+                field,
+                grown,
+                torch.as_tensor(
+                    (
+                        [0.0, 1.0, 0.0]
+                        if cfg.fiber_teacher_semantic_migration_mass is not None
+                        else cfg.fiber_coverage_seed_route_mass
+                    ),
+                    device=device,
+                    dtype=field.route_logits.dtype,
+                ),
+                temperature=float(cfg.fiber_final_temperature),
+            )
+            desired_carrier = torch.tensor(
+                [0.05, 0.20, 0.75],
+                device=device,
+                dtype=field.carrier_logits.dtype,
+            )
+            field.carrier_logits[grown] = float(cfg.fiber_final_temperature) * torch.log(
+                desired_carrier
+            )
+            field.carrier_root_tip_raw[grown] = 0.0
+        if densified.numel() > 0:
+            if cfg.fiber_teacher_semantic_migration_mass is not None:
+                active[densified] = 0.0
+            active[densified, shell_index] = 1.0
+            field.structured_delta_raw[densified, shell_index] = 1.0
+            field.structured_opacity_raw[densified, shell_index] = max(
+                float(cfg.fiber_coverage_seed_structured_opacity), 0.25
+            )
+            _set_effective_route_mass(
+                field,
+                densified,
+                torch.tensor(
+                    (
+                        [1.0, 0.0, 0.0]
+                        if cfg.fiber_teacher_semantic_migration_mass is not None
+                        else [0.78, 0.12, 0.10]
+                    ),
+                    device=device,
+                    dtype=field.route_logits.dtype,
+                ),
+                temperature=float(cfg.fiber_final_temperature),
+            )
+            sharpened_radius = (
+                field.radius[densified]
+                * float(cfg.fiber_topology_detail_radius_scale)
+            )
+            field.radius_raw[densified, 0] = _positive_parameter_raw(
+                sharpened_radius, eps=field.positive_eps
+            )
+            desired_carrier = torch.tensor(
+                [0.05, 0.80, 0.15],
+                device=device,
+                dtype=field.carrier_logits.dtype,
+            )
+            field.carrier_logits[densified] = float(cfg.fiber_final_temperature) * torch.log(
+                desired_carrier
+            )
+
+    changed = torch.unique(torch.cat([pruned, grown, densified]))
+    if clear_optimizer_state:
+        _clear_adam_rows(
+            optimizer,
+            [
+                field.route_logits,
+                field.residual_trust_logits,
+                field.structured_delta_raw,
+                field.structured_opacity_raw,
+                field.radius_raw,
+                field.carrier_logits,
+                field.carrier_root_tip_raw,
+            ],
+            changed,
+        )
+    topology = field.active_topology_summary(
+        shell_samples=int(cfg.fiber_shell_samples),
+        strand_samples=int(cfg.fiber_strand_samples),
+    )
+
+    def selected_stats(values: torch.Tensor, indices: torch.Tensor) -> dict[str, float]:
+        if indices.numel() == 0:
+            return {"min": 0.0, "mean": 0.0, "max": 0.0}
+        selected = values[indices]
+        return {
+            "min": float(selected.min().cpu()),
+            "mean": float(selected.mean().cpu()),
+            "max": float(selected.max().cpu()),
+        }
+
+    report: dict[str, object] = {
+        "step": int(step),
+        "pruned_count": int(pruned.numel()),
+        "grown_count": int(grown.numel()),
+        "densified_count": int(densified.numel()),
+        "pruned_support": selected_stats(residual_support, pruned),
+        "grown_deficit": selected_stats(deficit_score, grown),
+        "densified_boundary": selected_stats(boundary_score, densified),
+        "topology": topology,
+    }
+    if not clear_optimizer_state:
+        report["_changed_indices"] = changed
+    return report
+
+
+_TOPOLOGY_MUTABLE_FIELD_NAMES = (
+    "route_active_gate",
+    "route_logits",
+    "residual_trust_logits",
+    "structured_delta_raw",
+    "structured_opacity_raw",
+    "radius_raw",
+    "carrier_logits",
+    "carrier_root_tip_raw",
+    "initial_route_probabilities",
+)
+
+
+def _topology_state_snapshot(field: UnifiedFiberField) -> dict[str, torch.Tensor]:
+    return {
+        name: getattr(field, name).detach().clone()
+        for name in _TOPOLOGY_MUTABLE_FIELD_NAMES
+    }
+
+
+def _restore_topology_state(
+    field: UnifiedFiberField, snapshot: dict[str, torch.Tensor]
+) -> None:
+    with torch.no_grad():
+        for name, value in snapshot.items():
+            getattr(field, name).copy_(value)
+
+
+def _topology_event_is_accepted(
+    before: list[float], after: list[float], margin: float
+) -> tuple[bool, list[float]]:
+    """Require per-view non-regression, not merely a better mean loss."""
+
+    if len(before) != len(after) or len(before) < 2:
+        raise ValueError("Topology validation requires at least two aligned views")
+    deltas = [float(post - pre) for pre, post in zip(before, after, strict=True)]
+    accepted = max(deltas) <= float(margin) and float(np.mean(deltas)) <= 0.0
+    return accepted, deltas
+
+
+def _topology_validation_losses(
+    field: UnifiedFiberField,
+    surface_vertices_per_view: list[torch.Tensor],
+    surface_faces: torch.Tensor,
+    cameras: list,
+    targets: list[dict[str, torch.Tensor]],
+    cfg: PipelineConfig,
+    renderer_name: str,
+) -> list[float]:
+    if len(surface_vertices_per_view) < 2 or not (
+        len(surface_vertices_per_view) == len(cameras) == len(targets)
+    ):
+        raise ValueError("Topology validation views must contain at least two items")
+    losses: list[float] = []
+    with torch.no_grad():
+        for vertices, camera, target in zip(
+            surface_vertices_per_view, cameras, targets, strict=True
+        ):
+            primitives = field.primitives(
+                vertices.to(device=field.route_logits.device),
+                surface_faces,
+                shell_samples=int(cfg.fiber_shell_samples),
+                strand_samples=int(cfg.fiber_strand_samples),
+                temperature=float(cfg.fiber_final_temperature),
+                hard_route=False,
+                route_blend=1.0,
+                geometry_blend=1.0,
+                route_hardening=0.0,
+                hard_route_policy=cfg.fiber_hard_route_policy,
+                fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
+                additive_teacher=bool(cfg.fiber_additive_teacher_mode),
+                teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+            )
+            prediction = _render(primitives, camera, cfg, renderer_name)
+            loss, _parts = differentiable_render_loss(
+                prediction,
+                target["rgb"],
+                target["mask"],
+                cfg.color_loss_weight,
+                cfg.mask_loss_weight,
+                cfg.mask_boundary_weight,
+                cfg.mask_boundary_radius,
+                cfg.mask_balance_weight,
+            )
+            losses.append(float(loss.detach().cpu()))
+    return losses
+
+
+def _update_adaptive_topology(
+    field: UnifiedFiberField,
+    optimizer: torch.optim.Optimizer,
+    surface_vertices_per_view: list[torch.Tensor],
+    surface_faces: torch.Tensor,
+    cameras: list,
+    targets: list[dict[str, torch.Tensor]],
+    cfg: PipelineConfig,
+    renderer_name: str,
+    *,
+    step: int,
+    validation_surface_vertices: list[torch.Tensor] | None = None,
+    validation_cameras: list | None = None,
+    validation_targets: list[dict[str, torch.Tensor]] | None = None,
+) -> dict[str, object]:
+    """Measure multi-view topology evidence and perform one ADC event."""
+
+    if not surface_vertices_per_view or not (
+        len(surface_vertices_per_view) == len(cameras) == len(targets)
+    ):
+        raise ValueError("Topology views, cameras, and targets must be aligned")
+    device = field.route_logits.device
+    dtype = field.route_logits.dtype
+    visible_views = torch.zeros(field.point_count, device=device, dtype=dtype)
+    residual_support_sum = torch.zeros_like(visible_views)
+    structured_support_sum = torch.zeros_like(visible_views)
+    deficit_sum = torch.zeros_like(visible_views)
+    boundary_sum = torch.zeros_like(visible_views)
+    structured_valid_views = torch.zeros_like(visible_views)
+    scene_scale = float(field.scene_scale.detach().cpu())
+
+    with torch.no_grad():
+        for vertices, camera, target in zip(
+            surface_vertices_per_view, cameras, targets, strict=True
+        ):
+            vertices = vertices.to(device=device)
+            target_mask = target["mask"].to(device=device, dtype=dtype).clamp(0.0, 1.0)
+            primitives = field.primitives(
+                vertices,
+                surface_faces,
+                shell_samples=int(cfg.fiber_shell_samples),
+                strand_samples=int(cfg.fiber_strand_samples),
+                temperature=float(cfg.fiber_final_temperature),
+                hard_route=False,
+                route_blend=1.0,
+                geometry_blend=1.0,
+                route_hardening=0.0,
+                hard_route_policy=cfg.fiber_hard_route_policy,
+                fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
+                additive_teacher=bool(cfg.fiber_additive_teacher_mode),
+                teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+            )
+            prediction = _render(primitives, camera, cfg, renderer_name)
+            deficit_image = F.relu(target_mask - prediction["mask"]) * target_mask
+            boundary_image = _silhouette_band(
+                target_mask, int(cfg.fiber_topology_boundary_radius)
+            )
+
+            roots, tangent, bitangent, normal = field.surface_frame(
+                vertices, surface_faces
+            )
+            root_visible = _front_surface_visibility(
+                roots,
+                camera,
+                bin_px=max(int(cfg.fiber_coverage_seed_visibility_bin_px), 1),
+                depth_tolerance=(
+                    scene_scale
+                    * float(cfg.fiber_coverage_seed_visibility_depth_scale)
+                ),
+            )
+            residual_xyz = roots + (
+                field.residual_offset_local[:, :1] * tangent
+                + field.residual_offset_local[:, 1:2] * bitangent
+                + field.residual_offset_local[:, 2:3] * normal
+            )
+            residual_probes = _residual_footprint_probe_points(
+                residual_xyz,
+                tangent,
+                bitangent,
+                normal,
+                field.residual_scaling,
+                float(cfg.fiber_topology_prune_footprint_sigma),
+            )
+            residual_probe_support, residual_probe_valid = _sample_mask_at_world_points(
+                residual_probes,
+                camera,
+                target_mask,
+                margin_px=max(int(cfg.fiber_mask_outside_margin_px), 0),
+            )
+            residual_valid = residual_probe_valid.any(dim=1)
+            residual_support = residual_probe_support.amax(dim=1)
+            residual_observed = root_visible & residual_valid
+            residual_observed_float = residual_observed.to(dtype)
+            visible_views.add_(residual_observed_float)
+            residual_support_sum.add_(residual_support * residual_observed_float)
+
+            strand_points, _directions = field.strand_target_geometry(
+                vertices,
+                surface_faces,
+                strand_samples=int(cfg.fiber_strand_samples),
+            )
+            support, valid = _sample_mask_at_world_points(
+                strand_points,
+                camera,
+                target_mask,
+                margin_px=max(int(cfg.fiber_visual_hull_margin_px), 0),
+            )
+            deficit, _ = _sample_mask_at_world_points(
+                strand_points, camera, deficit_image
+            )
+            boundary, _ = _sample_mask_at_world_points(
+                strand_points, camera, boundary_image
+            )
+            valid_float = valid.to(dtype)
+            sample_denominator = valid_float.sum(dim=1).clamp_min(1.0)
+            source_support = (support * valid_float).sum(dim=1) / sample_denominator
+            source_deficit = (deficit * valid_float).amax(dim=1)
+            source_boundary = (boundary * valid_float).amax(dim=1)
+            source_observed = root_visible & valid.any(dim=1)
+            source_observed_float = source_observed.to(dtype)
+            structured_valid_views.add_(source_observed_float)
+            structured_support_sum.add_(source_support * source_observed_float)
+            deficit_sum.add_(source_deficit * source_observed_float)
+            boundary_sum.add_(source_boundary * source_observed_float)
+
+    residual_support = residual_support_sum / visible_views.clamp_min(1.0)
+    structured_support = structured_support_sum / structured_valid_views.clamp_min(1.0)
+    deficit_score = deficit_sum / structured_valid_views.clamp_min(1.0)
+    boundary_score = boundary_sum / structured_valid_views.clamp_min(1.0)
+    validate_event = bool(cfg.fiber_topology_validate_events)
+    validation_surface_vertices = validation_surface_vertices or []
+    validation_cameras = validation_cameras or []
+    validation_targets = validation_targets or []
+    before_losses: list[float] = []
+    snapshot: dict[str, torch.Tensor] | None = None
+    if validate_event:
+        before_losses = _topology_validation_losses(
+            field,
+            validation_surface_vertices,
+            surface_faces,
+            validation_cameras,
+            validation_targets,
+            cfg,
+            renderer_name,
+        )
+        snapshot = _topology_state_snapshot(field)
+    report = _apply_adaptive_topology_scores(
+        field,
+        optimizer,
+        cfg,
+        visible_views=visible_views,
+        residual_support=residual_support,
+        structured_support=structured_support,
+        deficit_score=deficit_score,
+        boundary_score=boundary_score,
+        step=step,
+        clear_optimizer_state=not validate_event,
+    )
+    if not validate_event:
+        return report
+
+    changed = report.pop("_changed_indices")
+    if not isinstance(changed, torch.Tensor):
+        raise RuntimeError("Validated topology event did not report changed indices")
+    after_losses = _topology_validation_losses(
+        field,
+        validation_surface_vertices,
+        surface_faces,
+        validation_cameras,
+        validation_targets,
+        cfg,
+        renderer_name,
+    )
+    accepted, deltas = _topology_event_is_accepted(
+        before_losses,
+        after_losses,
+        float(cfg.fiber_topology_validation_margin),
+    )
+    if accepted:
+        _clear_adam_rows(
+            optimizer,
+            [
+                field.route_logits,
+                field.residual_trust_logits,
+                field.structured_delta_raw,
+                field.structured_opacity_raw,
+                field.radius_raw,
+                field.carrier_logits,
+                field.carrier_root_tip_raw,
+            ],
+            changed,
+        )
+    else:
+        if snapshot is None:
+            raise RuntimeError("Missing topology snapshot for rejected event")
+        _restore_topology_state(field, snapshot)
+        report["topology"] = field.active_topology_summary(
+            shell_samples=int(cfg.fiber_shell_samples),
+            strand_samples=int(cfg.fiber_strand_samples),
+        )
+        report["reverted_pruned_count"] = report["pruned_count"]
+        report["reverted_grown_count"] = report["grown_count"]
+        report["reverted_densified_count"] = report["densified_count"]
+        report["pruned_count"] = 0
+        report["grown_count"] = 0
+        report["densified_count"] = 0
+    report["validation"] = {
+        "accepted": bool(accepted),
+        "before": before_losses,
+        "after": after_losses,
+        "delta": deltas,
+        "margin": float(cfg.fiber_topology_validation_margin),
+        "view_count": len(before_losses),
+    }
+    return report
+
+
+def _write_coverage_seed_ply(
+    path: Path,
+    roots: torch.Tensor,
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+) -> None:
+    """Write selected carrier roots as an inspectable ASCII PLY diagnostic."""
+
+    xyz = roots.detach().cpu().numpy()
+    score = scores.detach().cpu().numpy()
+    length = lengths.detach().cpu().numpy()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("ply\nformat ascii 1.0\n")
+        file.write(f"element vertex {xyz.shape[0]}\n")
+        file.write("property float x\nproperty float y\nproperty float z\n")
+        file.write("property float deficit_score\nproperty float strand_length\n")
+        file.write("end_header\n")
+        for point, point_score, point_length in zip(
+            xyz, score, length, strict=True
+        ):
+            file.write(
+                f"{point[0]:.8g} {point[1]:.8g} {point[2]:.8g} "
+                f"{point_score:.8g} {point_length:.8g}\n"
+            )
+
+
+def _estimate_multiview_orientation_directions(
+    roots: torch.Tensor,
+    tangent: torch.Tensor,
+    bitangent: torch.Tensor,
+    normal: torch.Tensor,
+    cameras: list,
+    frame_indices: list[int],
+    targets: list[dict[str, torch.Tensor]],
+    orientation_targets: list[dict[str, torch.Tensor] | None],
+    *,
+    min_views: int,
+    normal_bias: float,
+    confidence_floor: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Triangulate sign-invariant 3D hair directions from 2D orientations.
+
+    For each calibrated view, the image orientation contributes one linear
+    constraint: the projected 3D direction must have zero component along the
+    perpendicular image direction.  The least-eigenvalue vector of the
+    confidence-weighted normal matrix solves these constraints without using
+    any 3D strand annotation.  A small outward-normal bias resolves the line
+    sign/root ambiguity and prevents immediately inward-growing carriers.
+    """
+
+    if not (
+        len(frame_indices)
+        == len(targets)
+        == len(orientation_targets)
+    ):
+        raise ValueError("Orientation initialization views must align")
+    device, dtype = roots.device, roots.dtype
+    covariance = torch.zeros(
+        (roots.shape[0], 3, 3), device=device, dtype=dtype
+    )
+    weight_sum = torch.zeros(roots.shape[0], device=device, dtype=dtype)
+    view_count = torch.zeros(roots.shape[0], device=device, dtype=torch.int32)
+
+    for frame_index, target, orientation in zip(
+        frame_indices, targets, orientation_targets, strict=True
+    ):
+        if orientation is None:
+            continue
+        camera = cameras[frame_index]
+        target_mask = target["mask"].to(device=device, dtype=dtype)
+        support, valid = _sample_mask_at_world_points(
+            roots, camera, target_mask, margin_px=1
+        )
+        confidence, _ = _sample_mask_at_world_points(
+            roots,
+            camera,
+            orientation["confidence"].to(device=device, dtype=dtype),
+        )
+        vector_x, _ = _sample_mask_at_world_points(
+            roots,
+            camera,
+            orientation["vectors"][..., 0].to(device=device, dtype=dtype),
+        )
+        vector_y, _ = _sample_mask_at_world_points(
+            roots,
+            camera,
+            orientation["vectors"][..., 1].to(device=device, dtype=dtype),
+        )
+        theta = 0.5 * torch.atan2(vector_y, vector_x)
+        perpendicular = torch.stack(
+            [-torch.sin(theta), torch.cos(theta)], dim=-1
+        )
+
+        world_to_camera = torch.as_tensor(
+            camera.world_to_camera, device=device, dtype=dtype
+        )
+        rotation = world_to_camera[:3, :3]
+        camera_xyz = roots @ rotation.T + world_to_camera[:3, 3]
+        z = camera_xyz[:, 2].clamp_min(1e-6)
+        jacobian_x = torch.stack(
+            [
+                torch.full_like(z, float(camera.fx)) / z,
+                torch.zeros_like(z),
+                -float(camera.fx) * camera_xyz[:, 0] / z.square(),
+            ],
+            dim=-1,
+        )
+        y_sign = 1.0 if camera.image_y_down else -1.0
+        jacobian_y = torch.stack(
+            [
+                torch.zeros_like(z),
+                torch.full_like(z, y_sign * float(camera.fy)) / z,
+                -y_sign * float(camera.fy) * camera_xyz[:, 1] / z.square(),
+            ],
+            dim=-1,
+        )
+        constraint_camera = (
+            perpendicular[:, :1] * jacobian_x
+            + perpendicular[:, 1:] * jacobian_y
+        )
+        constraint_world = F.normalize(
+            constraint_camera @ rotation, dim=-1, eps=1e-8
+        )
+        weight = (
+            confidence.clamp_min(float(confidence_floor))
+            * support.clamp(0.0, 1.0)
+            * valid.to(dtype)
+        )
+        covariance.add_(
+            weight[:, None, None]
+            * constraint_world[:, :, None]
+            * constraint_world[:, None, :]
+        )
+        weight_sum.add_(weight)
+        observation_threshold = max(0.5 * float(confidence_floor), 1e-6)
+        view_count.add_((weight > observation_threshold).to(view_count.dtype))
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    estimated = eigenvectors[..., 0]
+    eigengap = (eigenvalues[:, 1] - eigenvalues[:, 0]) / eigenvalues[:, 2].clamp_min(
+        1e-8
+    )
+    reliable = (
+        (view_count >= max(int(min_views), 2))
+        & (weight_sum > 1e-6)
+        & (eigengap > 1e-4)
+    )
+    # Orient the undirected line toward gravity/downward, with the outward
+    # normal as a secondary cue for nearly horizontal hair.
+    sign_score = -estimated[:, 1] + 0.20 * torch.sum(estimated * normal, dim=-1)
+    estimated = torch.where(
+        (sign_score < 0.0)[:, None], -estimated, estimated
+    )
+    estimated = F.normalize(
+        estimated + float(normal_bias) * normal, dim=-1, eps=1e-8
+    )
+    world_direction = torch.where(reliable[:, None], estimated, normal)
+    local_direction = F.normalize(
+        torch.stack(
+            [
+                torch.sum(world_direction * tangent, dim=-1),
+                torch.sum(world_direction * bitangent, dim=-1),
+                torch.sum(world_direction * normal, dim=-1),
+            ],
+            dim=-1,
+        ),
+        dim=-1,
+        eps=1e-8,
+    )
+    report = {
+        "reliable_fraction": float(reliable.float().mean().cpu()),
+        "mean_supporting_views": float(view_count.float().mean().cpu()),
+        "mean_eigengap": float(eigengap[reliable].mean().cpu())
+        if torch.any(reliable)
+        else 0.0,
+        "normal_bias": float(normal_bias),
+        "confidence_floor": float(confidence_floor),
+    }
+    return local_direction, world_direction, report
+
+
+def _initialize_multiview_coverage_seeds(
+    field: UnifiedFiberField,
+    teacher_field: UnifiedFiberField,
+    surface_faces: torch.Tensor,
+    surface_vertices_per_view: list[torch.Tensor],
+    cameras: list,
+    frame_indices: list[int],
+    targets: list[dict[str, torch.Tensor]],
+    orientation_targets: list[dict[str, torch.Tensor] | None] | None,
+    cfg: PipelineConfig,
+    renderer_name: str,
+    out_dir: Path,
+) -> tuple[dict[str, object] | None, dict[int, torch.Tensor]]:
+    """Activate structured roots that explain frozen-teacher mask deficits.
+
+    Each surface root proposes a short normal-grown segment.  Candidate
+    samples must lie inside a sufficient fraction of calibrated hair masks;
+    among those visual-hull-consistent samples, the frozen residual teacher's
+    alpha deficit provides the allocation score.  This changes the 3D support
+    of the structured representation instead of asking another scalar loss to
+    discover sparse carriers from an all-zero activation state.
+    """
+
+    requested_count = int(cfg.fiber_coverage_seed_count)
+    if requested_count <= 0:
+        return None, {}
+    if not (
+        len(surface_vertices_per_view)
+        == len(frame_indices)
+        == len(targets)
+    ):
+        raise ValueError("Coverage seed views, indices, and targets must align")
+    if not frame_indices:
+        raise ValueError("Coverage seeding requires at least one calibrated view")
+
+    sample_count = int(cfg.fiber_coverage_seed_samples)
+    min_views = int(cfg.fiber_coverage_seed_min_views)
+    min_fraction = float(cfg.fiber_coverage_seed_min_fraction)
+    min_deficit = float(cfg.fiber_coverage_seed_min_deficit)
+    device = field.route_logits.device
+    dtype = field.route_logits.dtype
+    faces = surface_faces.to(device=device)
+    scene_scale = field.scene_scale.detach().to(device=device, dtype=dtype)
+    candidate_length = scene_scale * float(
+        cfg.fiber_coverage_seed_strand_length_scale
+    )
+    candidate_t = (
+        torch.arange(1, sample_count + 1, device=device, dtype=dtype)
+        / float(sample_count)
+    )
+
+    with torch.no_grad():
+        rest_vertices = surface_vertices_per_view[0].to(device=device)
+        roots, tangent, bitangent, normals = field.surface_frame(
+            rest_vertices, faces
+        )
+        candidate_local_direction = torch.zeros_like(roots)
+        candidate_local_direction[:, 2] = 1.0
+        candidate_world_direction = normals
+        orientation_report: dict[str, float] | None = None
+        if bool(cfg.fiber_coverage_seed_orientation_init):
+            if orientation_targets is None:
+                raise ValueError(
+                    "Coverage orientation initialization requires orientation targets"
+                )
+            (
+                candidate_local_direction,
+                candidate_world_direction,
+                orientation_report,
+            ) = _estimate_multiview_orientation_directions(
+                roots,
+                tangent,
+                bitangent,
+                normals,
+                cameras,
+                frame_indices,
+                targets,
+                orientation_targets,
+                min_views=min_views,
+                normal_bias=float(
+                    cfg.fiber_coverage_seed_orientation_normal_bias
+                ),
+                confidence_floor=float(
+                    cfg.fiber_coverage_seed_orientation_confidence_floor
+                ),
+            )
+            # Direction is structured-only, so initialize every reliable root.
+            # Hard routing may later activate carriers beyond the explicit
+            # deficit-seed budget; those roots must not fall back to radial
+            # surface normals.
+            field.direction_local_raw.copy_(candidate_local_direction)
+        candidate_points = roots[:, None, :] + (
+            candidate_length
+            * candidate_t[None, :, None]
+            * candidate_world_direction[:, None, :]
+        )
+        valid_count = torch.zeros(
+            (field.point_count, sample_count), device=device, dtype=dtype
+        )
+        support_sum = torch.zeros_like(valid_count)
+        deficit_sum = torch.zeros_like(valid_count)
+        root_visible_count = torch.zeros(
+            field.point_count, device=device, dtype=dtype
+        )
+        root_visible_hair_support = torch.zeros_like(root_visible_count)
+        teacher_masks: dict[int, torch.Tensor] = {}
+        teacher_deficit_mean: list[float] = []
+
+        for vertices, frame_index, target in zip(
+            surface_vertices_per_view, frame_indices, targets, strict=True
+        ):
+            camera = cameras[frame_index]
+            vertices = vertices.to(device=device)
+            teacher_prediction = _render(
+                teacher_field.residual_primitives(vertices, faces),
+                camera,
+                cfg,
+                renderer_name,
+            )
+            teacher_mask = teacher_prediction["mask"].detach().clamp(0.0, 1.0)
+            teacher_masks[frame_index] = teacher_mask
+            target_mask = target["mask"].to(
+                device=device, dtype=dtype
+            ).clamp(0.0, 1.0)
+            deficit_image = F.relu(target_mask - teacher_mask)
+            teacher_deficit_mean.append(
+                float(
+                    (deficit_image * target_mask).sum().cpu()
+                    / target_mask.sum().clamp_min(1.0).cpu()
+                )
+            )
+            root_support, root_valid = _sample_mask_at_world_points(
+                roots,
+                camera,
+                target_mask,
+                margin_px=int(cfg.fiber_visual_hull_margin_px),
+            )
+            root_visible = root_valid
+            if bool(cfg.fiber_coverage_seed_visibility_cull):
+                root_visible = root_visible & _front_surface_visibility(
+                    roots,
+                    camera,
+                    bin_px=int(cfg.fiber_coverage_seed_visibility_bin_px),
+                    depth_tolerance=float(scene_scale.cpu())
+                    * float(cfg.fiber_coverage_seed_visibility_depth_scale),
+                )
+            root_visible_float = root_visible.to(dtype)
+            root_visible_count.add_(root_visible_float)
+            root_visible_hair_support.add_(root_support * root_visible_float)
+
+            support, valid = _sample_mask_at_world_points(
+                candidate_points,
+                camera,
+                target_mask,
+                margin_px=int(cfg.fiber_visual_hull_margin_px),
+            )
+            deficit, _ = _sample_mask_at_world_points(
+                candidate_points,
+                camera,
+                deficit_image,
+            )
+            valid_float = valid.to(dtype=dtype) * root_visible_float[:, None]
+            valid_count.add_(valid_float)
+            support_sum.add_(support * valid_float)
+            deficit_sum.add_(deficit * valid_float)
+
+        denominator = valid_count.clamp_min(1.0)
+        support_fraction = support_sum / denominator
+        deficit_mean = deficit_sum / denominator
+        accepted_samples = (
+            (valid_count >= float(min_views))
+            & (support_fraction >= min_fraction)
+            & (deficit_mean >= min_deficit)
+        )
+        sample_score = torch.where(
+            accepted_samples,
+            deficit_mean * support_fraction,
+            torch.zeros_like(deficit_mean),
+        )
+        root_score, best_sample_index = sample_score.max(dim=1)
+        root_occupancy_fraction = (
+            root_visible_hair_support / root_visible_count.clamp_min(1.0)
+        )
+        eligible_mask = root_score > 0.0
+        if bool(getattr(field, "structured_foreground_only", False)):
+            eligible_mask &= field.source_foreground > 0.5
+        eligible = torch.nonzero(eligible_mask, as_tuple=False).reshape(-1)
+        if eligible.numel() == 0:
+            report: dict[str, object] = {
+                "requested_count": requested_count,
+                "eligible_count": 0,
+                "selected_count": 0,
+                "teacher_mask_deficit_mean": teacher_deficit_mean,
+                "visibility_cull": bool(cfg.fiber_coverage_seed_visibility_cull),
+                "mean_visible_views": float(root_visible_count.mean().cpu()),
+                "reason": "no visual-hull-consistent teacher-deficit candidates",
+            }
+            (out_dir / "coverage_seed_report.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
+            )
+            return report, teacher_masks
+
+        sorted_eligible = eligible[
+            torch.argsort(root_score[eligible], descending=True)
+        ]
+        voxel_size = max(
+            float(scene_scale.cpu()) * float(cfg.fiber_coverage_seed_voxel_scale),
+            1e-8,
+        )
+        roots_cpu = roots.detach().cpu()
+        voxels = torch.floor(
+            (roots_cpu - roots_cpu.amin(dim=0, keepdim=True)) / voxel_size
+        ).to(torch.int64)
+        ordered = sorted_eligible.detach().cpu().tolist()
+        selected_cpu: list[int] = []
+        selected_set: set[int] = set()
+        occupied_voxels: set[tuple[int, int, int]] = set()
+        limit = min(requested_count, len(ordered))
+        for index in ordered:
+            voxel = tuple(int(value) for value in voxels[index].tolist())
+            if voxel in occupied_voxels:
+                continue
+            occupied_voxels.add(voxel)
+            selected_cpu.append(index)
+            selected_set.add(index)
+            if len(selected_cpu) >= limit:
+                break
+        # If the requested budget is denser than the voxel grid, preserve the
+        # score ordering when filling the remainder instead of silently using
+        # fewer carriers.
+        if len(selected_cpu) < limit:
+            for index in ordered:
+                if index in selected_set:
+                    continue
+                selected_cpu.append(index)
+                if len(selected_cpu) >= limit:
+                    break
+
+        selected = torch.as_tensor(selected_cpu, device=device, dtype=torch.long)
+        selected_best_t = candidate_t[best_sample_index[selected]].clamp_min(0.35)
+        selected_strand_length = candidate_length * selected_best_t
+        selected_shell_length = torch.minimum(
+            selected_strand_length,
+            scene_scale * float(cfg.fiber_coverage_seed_shell_length_scale),
+        )
+
+        field.direction_local_raw[selected] = candidate_local_direction[selected]
+        field.bend_local[selected] = 0.0
+        field.bend_cubic_local[selected] = 0.0
+        field.strand_length_raw[selected, 0] = _positive_parameter_raw(
+            selected_strand_length, eps=field.positive_eps
+        )
+        field.shell_length_raw[selected, 0] = _positive_parameter_raw(
+            selected_shell_length, eps=field.positive_eps
+        )
+        field.structured_delta_raw[selected] = float(
+            cfg.fiber_coverage_seed_geometry_gain
+        )
+        field.structured_opacity_raw[selected] = float(
+            cfg.fiber_coverage_seed_structured_opacity
+        )
+        # Coverage seeds are real topology births when the structured pool is
+        # initially dormant.  Both routes are made available; their learned
+        # probabilities still decide whether a Fin or a strand is deployed.
+        field.route_active_gate[selected, ROUTE_NAMES.index("shell")] = 1.0
+        field.route_active_gate[selected, ROUTE_NAMES.index("strand")] = 1.0
+
+        desired_route = torch.as_tensor(
+            cfg.fiber_coverage_seed_route_mass, device=device, dtype=dtype
+        ).reshape(-1)
+        desired_route = desired_route / desired_route.sum()
+        residual_index = ROUTE_NAMES.index("residual")
+        seed_trust = min(0.02, 0.5 * float(desired_route[residual_index].cpu()))
+        seed_trust = max(seed_trust, 1e-4)
+        base_route = desired_route.clone()
+        base_route[:residual_index] /= 1.0 - seed_trust
+        base_route[residual_index] = (
+            base_route[residual_index] - seed_trust
+        ) / (1.0 - seed_trust)
+        temperature = float(cfg.fiber_final_temperature)
+        field.residual_trust_logits[selected, 0] = torch.logit(
+            torch.tensor(seed_trust, device=device, dtype=dtype)
+        )
+        field.route_logits[selected] = temperature * torch.log(
+            base_route.clamp_min(1e-6)
+        )
+        field.initial_route_probabilities[selected] = desired_route
+
+        desired_carrier = torch.stack(
+            [desired_route[2], desired_route[0], desired_route[1]]
+        )
+        desired_carrier = desired_carrier / desired_carrier.sum()
+        field.carrier_logits[selected] = temperature * torch.log(
+            desired_carrier.clamp_min(1e-6)
+        )
+        field.initial_carrier_probabilities[selected] = desired_carrier
+        field.carrier_root_tip_raw[selected] = 0.0
+        field.initial_carrier_root_tip[selected] = 0.0
+
+        selected_scores = root_score[selected]
+        selected_roots = roots[selected]
+        _write_coverage_seed_ply(
+            out_dir / "coverage_seed_roots.ply",
+            selected_roots,
+            selected_scores,
+            selected_strand_length,
+        )
+        report = {
+            "requested_count": requested_count,
+            "eligible_count": int(eligible.numel()),
+            "selected_count": int(selected.numel()),
+            "sample_count": sample_count,
+            "min_views": min_views,
+            "min_fraction": min_fraction,
+            "min_deficit": min_deficit,
+            "voxel_size_world": voxel_size,
+            "teacher_mask_deficit_mean": teacher_deficit_mean,
+            "visibility_cull": bool(cfg.fiber_coverage_seed_visibility_cull),
+            "visibility_bin_px": int(cfg.fiber_coverage_seed_visibility_bin_px),
+            "visibility_depth_scale": float(
+                cfg.fiber_coverage_seed_visibility_depth_scale
+            ),
+            "mean_visible_views": float(root_visible_count.mean().cpu()),
+            "selected_visible_views_mean": float(
+                root_visible_count[selected].mean().cpu()
+            ),
+            "selected_root_occupancy_mean": float(
+                root_occupancy_fraction[selected].mean().cpu()
+            ),
+            "selected_score_min": float(selected_scores.min().cpu()),
+            "selected_score_mean": float(selected_scores.mean().cpu()),
+            "selected_score_max": float(selected_scores.max().cpu()),
+            "selected_strand_length_min": float(selected_strand_length.min().cpu()),
+            "selected_strand_length_mean": float(selected_strand_length.mean().cpu()),
+            "selected_strand_length_max": float(selected_strand_length.max().cpu()),
+            "route_mass": [float(value) for value in desired_route.cpu()],
+            "structured_opacity": float(
+                cfg.fiber_coverage_seed_structured_opacity
+            ),
+            "geometry_gain": float(cfg.fiber_coverage_seed_geometry_gain),
+            "orientation_initialization": orientation_report,
+            "diagnostic_ply": str(out_dir / "coverage_seed_roots.ply"),
+        }
+        (out_dir / "coverage_seed_report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        return report, teacher_masks
+
+
 def _silhouette_band_loss(
     prediction: torch.Tensor,
     target_mask: torch.Tensor,
@@ -1498,6 +4299,126 @@ def _silhouette_band(mask: torch.Tensor, radius: int) -> torch.Tensor:
     dilated = F.max_pool2d(image, kernel, stride=1, padding=radius)[0, 0]
     eroded = -F.max_pool2d(-image, kernel, stride=1, padding=radius)[0, 0]
     return (dilated - eroded).clamp(0.0, 1.0)
+
+
+def _masked_rgb_gradient_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match foreground and silhouette image gradients to counter L1 blur."""
+
+    if prediction.shape != target.shape or prediction.ndim != 3:
+        raise ValueError("RGB gradient inputs must be aligned HxWxC tensors")
+    if tuple(target_mask.shape) != tuple(target.shape[:2]):
+        raise ValueError("RGB gradient mask must match the image height and width")
+    pred = prediction.permute(2, 0, 1)[None]
+    truth = target.permute(2, 0, 1)[None]
+    mask = target_mask.clamp(0.0, 1.0)[None, None]
+    pred_x = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    truth_x = truth[:, :, :, 1:] - truth[:, :, :, :-1]
+    pred_y = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    truth_y = truth[:, :, 1:, :] - truth[:, :, :-1, :]
+    weight_x = torch.maximum(mask[:, :, :, 1:], mask[:, :, :, :-1])
+    weight_y = torch.maximum(mask[:, :, 1:, :], mask[:, :, :-1, :])
+    loss_x = (torch.abs(pred_x - truth_x) * weight_x).sum() / (
+        weight_x.sum() * prediction.shape[-1]
+    ).clamp_min(1.0)
+    loss_y = (torch.abs(pred_y - truth_y) * weight_y).sum() / (
+        weight_y.sum() * prediction.shape[-1]
+    ).clamp_min(1.0)
+    return 0.5 * (loss_x + loss_y)
+
+
+def _structured_spill_loss(
+    prediction_mask: torch.Tensor,
+    teacher_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Charge only structured opacity added outside the teacher silhouette."""
+
+    if not (
+        prediction_mask.shape == teacher_mask.shape == target_mask.shape
+    ):
+        raise ValueError("Structured spill masks must have identical shapes")
+    background = 1.0 - target_mask.clamp(0.0, 1.0)
+    excess = F.relu(prediction_mask - teacher_mask.detach())
+    return (excess * background).sum() / background.sum().clamp_min(1.0)
+
+
+def _bidirectional_mask_losses(
+    prediction_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    *,
+    inside_alpha_target: float,
+    outside_margin_px: int = 0,
+    outside_reference_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return explicit mask-interior coverage and mask-exterior spill losses.
+
+    Both terms are normalized by foreground area.  This makes a missing hair
+    pixel and an equally opaque extra pixel comparable, instead of diluting
+    exterior spill over the much larger image background.  When a frozen
+    residual teacher is supplied, only opacity above that immutable baseline
+    is charged; route-only calls omit the reference and remain absolute.  A
+    small dilation may tolerate rasterization antialiasing at the boundary.
+    """
+
+    if prediction_mask.shape != target_mask.shape or prediction_mask.ndim != 2:
+        raise ValueError("Prediction and target masks must be aligned HxW tensors")
+    if not 0.0 <= float(inside_alpha_target) <= 1.0:
+        raise ValueError("inside_alpha_target must be in [0, 1]")
+    margin = int(outside_margin_px)
+    if margin < 0:
+        raise ValueError("outside_margin_px must be non-negative")
+    target = target_mask.to(
+        device=prediction_mask.device, dtype=prediction_mask.dtype
+    ).clamp(0.0, 1.0)
+    prediction = prediction_mask.clamp(0.0, 1.0)
+    reference = prediction.new_zeros(prediction.shape)
+    if outside_reference_mask is not None:
+        if outside_reference_mask.shape != prediction_mask.shape:
+            raise ValueError("Outside reference mask must match prediction")
+        reference = outside_reference_mask.to(
+            device=prediction.device, dtype=prediction.dtype
+        ).detach().clamp(0.0, 1.0)
+    foreground_area = target.sum().clamp_min(1.0)
+    desired_alpha = target * float(inside_alpha_target)
+    inside = (F.relu(desired_alpha - prediction) * target).sum()
+    inside = inside / foreground_area
+
+    allowed = target
+    if margin > 0:
+        kernel = 2 * margin + 1
+        allowed = F.max_pool2d(
+            target[None, None], kernel_size=kernel, stride=1, padding=margin
+        )[0, 0]
+    outside_excess = F.relu(prediction - reference)
+    outside = (outside_excess * (1.0 - allowed)).sum() / foreground_area
+    return inside, outside
+
+
+def _rendered_route_spill_loss(
+    route_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    *,
+    margin_px: int,
+) -> torch.Tensor:
+    """Penalize a route's rendered footprint outside a dilated hair mask."""
+
+    if route_mask.shape != target_mask.shape:
+        raise ValueError("Route and target masks must have identical shapes")
+    target = target_mask.to(dtype=route_mask.dtype).clamp(0.0, 1.0)
+    if margin_px > 0:
+        kernel = 2 * int(margin_px) + 1
+        target = F.max_pool2d(
+            target[None, None], kernel_size=kernel, stride=1, padding=margin_px
+        )[0, 0]
+    background = 1.0 - target
+    # Normalize by the route's total opacity as well as image area. A large
+    # background must not make a small but entirely invalid Fin cheap.
+    outside = (route_mask * background).sum()
+    return outside / route_mask.sum().clamp_min(1e-6)
 
 
 def _fin_point_support_loss(
@@ -1551,6 +4472,8 @@ def _strand_support_activation_loss(
     camera,
     target_mask: torch.Tensor,
     margin_px: int,
+    *,
+    strand_points: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Boot zero-opacity strands from projected foreground support.
 
@@ -1559,12 +4482,17 @@ def _strand_support_activation_loss(
     evidence still decide its direction, geometry, and retained route mass.
     """
 
-    strand_points = _strand_points_from_primitives(
-        primitives,
-        field.point_count,
-        int((primitives.route_id == ROUTE_NAMES.index("strand")).sum().item())
-        // field.point_count,
-    )
+    if strand_points is None:
+        strand_points = _strand_points_from_primitives(
+            primitives,
+            field.point_count,
+            int(
+                (primitives.route_id == ROUTE_NAMES.index("strand"))
+                .sum()
+                .item()
+            )
+            // field.point_count,
+        )
     support, valid = _sample_mask_at_world_points(
         strand_points,
         camera,
@@ -1603,7 +4531,19 @@ def _strand_points_from_primitives(
     return strand.reshape(point_count, strand_samples, 3)
 
 
-def _compute_visual_hull_gate(
+def _shell_points_from_primitives(
+    primitives, point_count: int, shell_samples: int
+) -> torch.Tensor:
+    shell = primitives.xyz[primitives.route_id == ROUTE_NAMES.index("shell")]
+    expected = int(point_count) * int(shell_samples)
+    if shell.shape[0] != expected:
+        raise RuntimeError(
+            f"Expected {expected} shell samples, found {shell.shape[0]}"
+        )
+    return shell.reshape(point_count, shell_samples, 3)
+
+
+def _compute_visual_hull_gates(
     field: UnifiedFiberField,
     surface_vertices: list[torch.Tensor],
     surface_faces: torch.Tensor,
@@ -1612,60 +4552,191 @@ def _compute_visual_hull_gate(
     cfg: PipelineConfig,
     temperature: float,
     geometry_blend: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Cull strand samples unsupported by calibrated multi-view hair masks.
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Cull shell and strand samples unsupported by multi-view hair masks.
 
     Prefix connectivity is enforced root-to-tip: after the first rejected
     sample, more distal samples are rejected as well.  This avoids isolated
-    floating tips even when a distal projection happens to re-enter a mask.
+    floating tips and Fin segments even if a distal projection re-enters a
+    mask. Shell gating is opt-in so legacy configurations remain unchanged.
     """
 
     if not surface_vertices or not (
         len(surface_vertices) == len(cameras) == len(ground_truth)
     ):
         raise ValueError("Visual-hull views, cameras, and masks must be aligned")
+    shell_samples = int(cfg.fiber_shell_samples)
     strand_samples = int(cfg.fiber_strand_samples)
-    supported = field.route_logits.new_zeros((field.point_count, strand_samples))
-    valid_count = torch.zeros_like(supported)
+    shell_supported = field.route_logits.new_zeros(
+        (field.point_count, shell_samples)
+    )
+    shell_valid_count = torch.zeros_like(shell_supported)
+    strand_supported = field.route_logits.new_zeros(
+        (field.point_count, strand_samples)
+    )
+    strand_valid_count = torch.zeros_like(strand_supported)
+    supervise_shell = float(cfg.fiber_shell_visual_hull_weight) > 0.0
+    occlusion_aware = bool(cfg.fiber_visual_hull_occlusion_aware)
+    visible_shell_samples = 0.0
+    visible_strand_samples = 0.0
+    total_shell_samples = 0.0
+    total_strand_samples = 0.0
+    depth_tolerance = float(field.scene_scale.detach().cpu()) * float(
+        cfg.fiber_visual_hull_occlusion_depth_scale
+    )
     with torch.no_grad():
         for vertices, camera, target in zip(surface_vertices, cameras, ground_truth):
-            primitives = field.primitives(
-                vertices,
-                surface_faces,
-                shell_samples=cfg.fiber_shell_samples,
-                strand_samples=strand_samples,
-                temperature=temperature,
-                hard_route=False,
-                geometry_blend=geometry_blend,
-                route_hardening=0.0,
-                fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
-                additive_teacher=cfg.fiber_additive_teacher_mode,
+            if bool(cfg.fiber_visual_hull_target_geometry):
+                shell_points = field.shell_target_geometry(
+                    vertices,
+                    surface_faces,
+                    shell_samples=shell_samples,
+                )
+                strand_points, _directions = field.strand_target_geometry(
+                    vertices,
+                    surface_faces,
+                    strand_samples=strand_samples,
+                )
+            else:
+                primitives = field.primitives(
+                    vertices,
+                    surface_faces,
+                    shell_samples=cfg.fiber_shell_samples,
+                    strand_samples=strand_samples,
+                    temperature=temperature,
+                    hard_route=False,
+                    geometry_blend=geometry_blend,
+                    route_hardening=0.0,
+                    fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                    additive_teacher=cfg.fiber_additive_teacher_mode,
+                    teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                )
+                shell_points = _shell_points_from_primitives(
+                    primitives, field.point_count, shell_samples
+                )
+                strand_points = _strand_points_from_primitives(
+                    primitives, field.point_count, strand_samples
+                )
+            shell_front_visible = torch.ones(
+                shell_points.shape[:-1], dtype=torch.bool, device=shell_points.device
             )
-            points = _strand_points_from_primitives(
-                primitives, field.point_count, strand_samples
+            strand_front_visible = torch.ones(
+                strand_points.shape[:-1], dtype=torch.bool, device=strand_points.device
             )
-            mask_support, valid = _sample_mask_at_world_points(
-                points,
+            if occlusion_aware:
+                shell_flat = shell_points.reshape(-1, 3)
+                strand_flat = strand_points.reshape(-1, 3)
+                combined = torch.cat(
+                    [vertices.detach().reshape(-1, 3), shell_flat, strand_flat],
+                    dim=0,
+                )
+                combined_visible = _front_surface_visibility(
+                    combined,
+                    camera,
+                    bin_px=int(cfg.fiber_visual_hull_occlusion_bin_px),
+                    depth_tolerance=depth_tolerance,
+                )
+                start = int(vertices.numel() // 3)
+                shell_count = int(shell_flat.shape[0])
+                shell_front_visible = combined_visible[
+                    start : start + shell_count
+                ].reshape(shell_points.shape[:-1])
+                strand_front_visible = combined_visible[
+                    start + shell_count :
+                ].reshape(strand_points.shape[:-1])
+            visible_shell_samples += float(shell_front_visible.sum().cpu())
+            visible_strand_samples += float(strand_front_visible.sum().cpu())
+            total_shell_samples += float(shell_front_visible.numel())
+            total_strand_samples += float(strand_front_visible.numel())
+            if supervise_shell:
+                shell_mask_support, shell_valid = _sample_mask_at_world_points(
+                    shell_points,
+                    camera,
+                    target["mask"],
+                    int(cfg.fiber_visual_hull_margin_px),
+                )
+                shell_valid = shell_valid & shell_front_visible
+                shell_valid_float = shell_valid.to(shell_supported.dtype)
+                shell_supported += (
+                    (shell_mask_support >= 0.5).to(shell_supported.dtype)
+                    * shell_valid_float
+                )
+                shell_valid_count += shell_valid_float
+            strand_mask_support, strand_valid = _sample_mask_at_world_points(
+                strand_points,
                 camera,
                 target["mask"],
                 int(cfg.fiber_visual_hull_margin_px),
             )
-            valid_float = valid.to(supported.dtype)
-            supported += (mask_support >= 0.5).to(supported.dtype) * valid_float
-            valid_count += valid_float
-        fraction = supported / valid_count.clamp_min(1.0)
-        gate = (
-            (supported >= max(int(cfg.fiber_visual_hull_min_views), 1))
-            & (fraction >= float(cfg.fiber_visual_hull_min_fraction))
-        ).to(supported.dtype)
-        gate = torch.cumprod(gate, dim=1)
+            strand_valid = strand_valid & strand_front_visible
+            strand_valid_float = strand_valid.to(strand_supported.dtype)
+            strand_supported += (
+                (strand_mask_support >= 0.5).to(strand_supported.dtype)
+                * strand_valid_float
+            )
+            strand_valid_count += strand_valid_float
+        strand_fraction = strand_supported / strand_valid_count.clamp_min(1.0)
+        minimum_views = max(int(cfg.fiber_visual_hull_min_views), 1)
+        strand_required_support = torch.full_like(
+            strand_supported, float(minimum_views)
+        )
+        if occlusion_aware:
+            # Occluded views are unknown.  Require agreement in every available
+            # view up to min-k, while still rejecting samples never observed.
+            strand_required_support = torch.minimum(
+                strand_required_support, strand_valid_count
+            ).clamp_min(1.0)
+        strand_gate = (
+            (strand_supported >= strand_required_support)
+            & (strand_fraction >= float(cfg.fiber_visual_hull_min_fraction))
+        ).to(strand_supported.dtype)
+        strand_gate = torch.cumprod(strand_gate, dim=1)
+        if supervise_shell:
+            shell_fraction = shell_supported / shell_valid_count.clamp_min(1.0)
+            shell_required_support = torch.full_like(
+                shell_supported, float(minimum_views)
+            )
+            if occlusion_aware:
+                shell_required_support = torch.minimum(
+                    shell_required_support, shell_valid_count
+                ).clamp_min(1.0)
+            shell_gate = (
+                (
+                    shell_supported
+                    >= shell_required_support
+                )
+                & (
+                    shell_fraction
+                    >= float(cfg.fiber_visual_hull_min_fraction)
+                )
+            ).to(shell_supported.dtype)
+            shell_gate = torch.cumprod(shell_gate, dim=1)
+        else:
+            shell_fraction = torch.ones_like(shell_supported)
+            shell_gate = torch.ones_like(shell_supported)
     report = {
-        "kept_fraction": float(gate.mean().cpu()),
-        "fully_kept_strands": float((gate[:, -1] > 0.5).float().mean().cpu()),
-        "mean_support_fraction": float(fraction.mean().cpu()),
+        "kept_fraction": float(strand_gate.mean().cpu()),
+        "fully_kept_strands": float(
+            (strand_gate[:, -1] > 0.5).float().mean().cpu()
+        ),
+        "mean_support_fraction": float(strand_fraction.mean().cpu()),
+        "shell_kept_fraction": float(shell_gate.mean().cpu()),
+        "fully_kept_shells": float(
+            (shell_gate[:, -1] > 0.5).float().mean().cpu()
+        ),
+        "shell_mean_support_fraction": float(shell_fraction.mean().cpu()),
+        "shell_supervised": float(supervise_shell),
         "views": float(len(cameras)),
+        "target_geometry": float(bool(cfg.fiber_visual_hull_target_geometry)),
+        "occlusion_aware": float(occlusion_aware),
+        "shell_front_visible_fraction": (
+            visible_shell_samples / max(total_shell_samples, 1.0)
+        ),
+        "strand_front_visible_fraction": (
+            visible_strand_samples / max(total_strand_samples, 1.0)
+        ),
     }
-    return gate, report
+    return shell_gate, strand_gate, report
 
 
 def _visual_hull_soft_loss(
@@ -1674,12 +4745,56 @@ def _visual_hull_soft_loss(
     camera,
     mask: torch.Tensor,
     margin_px: int,
+    *,
+    sample_gate: torch.Tensor | None = None,
+    visibility_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    support, _valid = _sample_mask_at_world_points(
-        strand_points, camera, mask, margin_px
+    return _route_visual_hull_soft_loss(
+        strand_points,
+        route_probabilities,
+        ROUTE_NAMES.index("strand"),
+        camera,
+        mask,
+        margin_px,
+        sample_gate=sample_gate,
+        visibility_gate=visibility_gate,
     )
-    route_mass = route_probabilities[:, ROUTE_NAMES.index("strand")][:, None]
-    weights = route_mass.expand_as(support)
+
+
+def _route_visual_hull_soft_loss(
+    points: torch.Tensor,
+    route_probabilities: torch.Tensor,
+    route_index: int,
+    camera,
+    mask: torch.Tensor,
+    margin_px: int,
+    *,
+    sample_gate: torch.Tensor | None = None,
+    visibility_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    support, valid = _sample_mask_at_world_points(
+        points, camera, mask, margin_px
+    )
+    route_mass = route_probabilities[:, int(route_index)][:, None]
+    weights = route_mass.expand_as(support) * valid.to(route_mass.dtype)
+    if visibility_gate is not None:
+        if tuple(visibility_gate.shape) != tuple(support.shape):
+            raise ValueError(
+                "visibility_gate must match projected route points, got "
+                f"{tuple(visibility_gate.shape)} != {tuple(support.shape)}"
+            )
+        weights = weights * visibility_gate.detach().to(weights.dtype)
+    if sample_gate is not None:
+        if tuple(sample_gate.shape) != tuple(support.shape):
+            raise ValueError(
+                "sample_gate must match projected route points, got "
+                f"{tuple(sample_gate.shape)} != {tuple(support.shape)}"
+            )
+        # The persistent gate already encodes the multi-view OR/min-k rule.
+        # Penalizing accepted samples in every individual camera silently
+        # changes that rule to an AND over all cameras and collapses strands
+        # that are merely back-facing or occluded in the current image.
+        weights = weights * (1.0 - sample_gate.detach().to(weights.dtype))
     return ((1.0 - support) * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
@@ -1724,6 +4839,7 @@ def _estimate_route_ablation_risk(
                 strand_visibility=strand_visibility,
                 fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                 additive_teacher=cfg.fiber_additive_teacher_mode,
+                teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
             )
             full_prediction = _render(primitives, camera, cfg, renderer_name)
             full_loss, _parts = differentiable_render_loss(
@@ -1837,6 +4953,32 @@ def _save_training_checkpoint(
                 "point_count": field.point_count,
                 "point_sampling_mode": cfg.fiber_point_sampling_mode,
                 "exact_vertex_binding": bool(cfg.fiber_exact_vertex_binding),
+                "binding_mode": str(cfg.fiber_binding_mode),
+                "source_mask_mode": (
+                    "foreground"
+                    if bool(cfg.fiber_split_fixed_base)
+                    else str(cfg.fiber_source_mask_mode)
+                ),
+                "split_fixed_base": bool(cfg.fiber_split_fixed_base),
+                "fixed_base_count": (
+                    field.fixed_base.point_count
+                    if field.fixed_base is not None
+                    else 0
+                ),
+                "fixed_base_max_scale_fraction": float(
+                    cfg.fiber_fixed_base_max_scale_fraction
+                ),
+                "source_mask_threshold": float(cfg.fiber_source_mask_threshold),
+                "source_min_opacity": float(cfg.fiber_source_min_opacity),
+                "residual_max_scale_fraction": float(
+                    cfg.fiber_residual_max_scale_fraction
+                ),
+                "semantic_mask_from_source": bool(
+                    cfg.fiber_semantic_mask_from_source
+                ),
+                "structured_foreground_only": bool(
+                    cfg.fiber_structured_foreground_only
+                ),
                 "frame_indices": list(frame_indices),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
@@ -1967,6 +5109,8 @@ def _save_field_npz(field: UnifiedFiberField, path: Path) -> None:
         bend_cubic_local=cpu(field.bend_cubic_local),
         structured_delta_gain=cpu(field.structured_delta_gain),
         structured_opacity_gain=cpu(field.structured_opacity_gain),
+        route_active_gate=cpu(field.route_active_gate),
+        shell_visibility_gate=cpu(field.shell_visibility_gate),
         strand_visibility_gate=cpu(field.strand_visibility_gate),
         height=cpu(field.height),
         shell_length=cpu(field.shell_length),
@@ -2027,6 +5171,7 @@ def _save_previews(
                         hard_route_policy=cfg.fiber_hard_route_policy,
                         fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                         additive_teacher=cfg.fiber_additive_teacher_mode,
+                        teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
                     )
                 prediction = _render(primitives, camera, cfg, renderer_name)
                 image = (
@@ -2092,6 +5237,96 @@ def _render(
     )
 
 
+def _measure_semantic_migration_render_equivalence(
+    field: UnifiedFiberField,
+    teacher_field: UnifiedFiberField,
+    surface_vertices: torch.Tensor,
+    surface_faces: torch.Tensor,
+    camera,
+    cfg: PipelineConfig,
+    renderer_name: str,
+) -> dict[str, object]:
+    """Render one camera before any update and verify teacher equivalence."""
+
+    with torch.no_grad():
+        teacher_primitives = teacher_field.residual_primitives(
+            surface_vertices, surface_faces
+        )
+        student_primitives = field.primitives(
+            surface_vertices,
+            surface_faces,
+            shell_samples=int(cfg.fiber_shell_samples),
+            strand_samples=int(cfg.fiber_strand_samples),
+            temperature=float(cfg.fiber_final_temperature),
+            route_blend=1.0,
+            geometry_blend=1.0,
+            route_hardening=(
+                1.0
+                if cfg.fiber_teacher_adaptive_migration_domain is not None
+                else 0.0
+            ),
+            hard_route_policy=str(cfg.fiber_hard_route_policy),
+            fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
+            additive_teacher=bool(cfg.fiber_additive_teacher_mode),
+            teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+        )
+        teacher_prediction = _render(
+            teacher_primitives, camera, cfg, renderer_name
+        )
+        student_prediction = _render(
+            student_primitives, camera, cfg, renderer_name
+        )
+        rgb_error = torch.abs(
+            student_prediction["rgb"] - teacher_prediction["rgb"]
+        )
+        mask_error = torch.abs(
+            student_prediction["mask"] - teacher_prediction["mask"]
+        )
+        physical_mask_error = torch.abs(
+            student_prediction.get("physical_mask", student_prediction["mask"])
+            - teacher_prediction.get("physical_mask", teacher_prediction["mask"])
+        )
+        report = {
+            "rgb_mean_absolute_error": float(rgb_error.mean().cpu()),
+            "rgb_max_absolute_error": float(rgb_error.max().cpu()),
+            "mask_mean_absolute_error": float(mask_error.mean().cpu()),
+            "mask_max_absolute_error": float(mask_error.max().cpu()),
+            "physical_mask_mean_absolute_error": float(
+                physical_mask_error.mean().cpu()
+            ),
+            "maximum_mean_absolute_error": float(
+                torch.stack(
+                    [
+                        rgb_error.mean(),
+                        mask_error.mean(),
+                        physical_mask_error.mean(),
+                    ]
+                ).max().cpu()
+            ),
+            "teacher_active_primitives": int(
+                (teacher_primitives.opacity > 1e-10).sum().cpu()
+            ),
+            "migrated_active_primitives": int(
+                (student_primitives.opacity > 1e-10).sum().cpu()
+            ),
+            "structured_delta_max": float(
+                field.structured_delta_gain.max().detach().cpu()
+            ),
+        }
+    if field.route_active_gate.shape[0] > 0:
+        capacity_per_source = (field.route_active_gate > 0.5).sum(dim=-1)
+        forward_per_source = (
+            student_primitives.route_probabilities > 0.5
+        ).sum(dim=-1)
+        report["single_active_route_per_source"] = bool(
+            torch.all(forward_per_source == 1).detach().cpu()
+        )
+        report["single_active_capacity_route_per_source"] = bool(
+            torch.all(capacity_per_source == 1).detach().cpu()
+        )
+    return report
+
+
 def _load_orientation_targets(
     frame_paths: list[Path],
     frame_indices: list[int],
@@ -2099,6 +5334,8 @@ def _load_orientation_targets(
     height: int,
     device: str,
     orientation_dir: str | None,
+    *,
+    distribution_radius: int = 0,
 ) -> list[dict[str, torch.Tensor] | None]:
     """Load HairGS-compatible Gabor angle maps for the selected train views."""
 
@@ -2139,13 +5376,80 @@ def _load_orientation_targets(
         confidence_tensor = F.interpolate(
             confidence_tensor, size=(height, width), mode="bilinear", align_corners=False
         )[0, 0]
+        vectors = F.normalize(vectors, dim=-1, eps=1e-8)
+        moment2, moment4, local_confidence = _local_axial_orientation_moments(
+            vectors,
+            confidence_tensor,
+            radius=int(distribution_radius),
+        )
         targets.append(
             {
-                "vectors": F.normalize(vectors, dim=-1, eps=1e-8).to(device),
+                "vectors": vectors.to(device),
                 "confidence": confidence_tensor.to(device),
+                "moment2": moment2.to(device),
+                "moment4": moment4.to(device),
+                "distribution_confidence": local_confidence.to(device),
             }
         )
     return targets
+
+
+def _local_axial_orientation_moments(
+    vectors: torch.Tensor,
+    confidence: torch.Tensor,
+    *,
+    radius: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build local second/fourth moments of a pi-periodic direction field.
+
+    The fourth moment stays strong for two orthogonal modes even when their
+    second moments cancel.  This gives curly/crossing regions an explicit
+    multi-modal target while coherent regions retain their original tangent.
+    """
+
+    if vectors.ndim != 3 or vectors.shape[-1] != 2:
+        raise ValueError("vectors must have shape [H, W, 2]")
+    if tuple(confidence.shape) != tuple(vectors.shape[:2]):
+        raise ValueError("confidence must match the orientation image")
+    window_radius = int(radius)
+    if window_radius < 0:
+        raise ValueError("radius must be non-negative")
+    moment2 = vectors
+    moment4 = torch.stack(
+        [
+            vectors[..., 0].square() - vectors[..., 1].square(),
+            2.0 * vectors[..., 0] * vectors[..., 1],
+        ],
+        dim=-1,
+    )
+    if window_radius == 0:
+        return moment2, moment4, confidence
+    kernel = 2 * window_radius + 1
+    weights = confidence.clamp_min(0.0)[None, None]
+
+    def weighted_pool(values: torch.Tensor) -> torch.Tensor:
+        channels = values.permute(2, 0, 1)[None]
+        numerator = F.avg_pool2d(
+            channels * weights,
+            kernel_size=kernel,
+            stride=1,
+            padding=window_radius,
+        )
+        denominator = F.avg_pool2d(
+            weights,
+            kernel_size=kernel,
+            stride=1,
+            padding=window_radius,
+        ).clamp_min(1e-8)
+        return (numerator / denominator).squeeze(0).permute(1, 2, 0)
+
+    local_confidence = F.avg_pool2d(
+        weights,
+        kernel_size=kernel,
+        stride=1,
+        padding=window_radius,
+    )[0, 0]
+    return weighted_pool(moment2), weighted_pool(moment4), local_confidence
 
 
 def _orientation_consistency_loss(
@@ -2159,3 +5463,33 @@ def _orientation_consistency_loss(
     agreement = (predicted_vectors * target["vectors"]).sum(dim=-1).clamp(-1.0, 1.0)
     weights = target["confidence"] * foreground_mask.to(target["confidence"].dtype)
     return (0.5 * (1.0 - agreement) * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
+def _orientation_distribution_loss(
+    predicted2: torch.Tensor,
+    predicted4: torch.Tensor,
+    target: dict[str, torch.Tensor],
+    foreground_mask: torch.Tensor,
+    physical_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match local axial distributions rather than one tangent per pixel."""
+
+    if "moment2" not in target or "moment4" not in target:
+        raise ValueError("Orientation target is missing axial distribution moments")
+    alpha = physical_mask.to(predicted2.dtype).clamp_min(1e-4)[..., None]
+    # Rasterized signed moment colors are premultiplied by opacity.  Dividing
+    # by the physical alpha approximates the transmittance-weighted mixture.
+    rendered2 = (predicted2[..., :2] / alpha).clamp(-1.0, 1.0)
+    rendered4 = (predicted4[..., :2] / alpha).clamp(-1.0, 1.0)
+    discrepancy = F.smooth_l1_loss(
+        rendered2, target["moment2"], reduction="none"
+    ).sum(dim=-1)
+    discrepancy = discrepancy + F.smooth_l1_loss(
+        rendered4, target["moment4"], reduction="none"
+    ).sum(dim=-1)
+    weights = (
+        target.get("distribution_confidence", target["confidence"])
+        * foreground_mask.to(target["confidence"].dtype)
+        * (physical_mask > 1e-4).to(target["confidence"].dtype)
+    )
+    return (discrepancy * weights).sum() / weights.sum().clamp_min(1e-8)

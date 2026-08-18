@@ -79,6 +79,33 @@ def _load_field(args, cfg, device):
         max_points=point_count,
         point_sampling_mode=point_sampling_mode,
         exact_vertex_binding=exact_vertex_binding,
+        binding_mode=str(metadata.get("binding_mode", cfg.fiber_binding_mode)),
+        source_mask_mode=str(
+            metadata.get("source_mask_mode", cfg.fiber_source_mask_mode)
+        ),
+        source_mask_threshold=float(
+            metadata.get("source_mask_threshold", cfg.fiber_source_mask_threshold)
+        ),
+        source_min_opacity=float(
+            metadata.get("source_min_opacity", cfg.fiber_source_min_opacity)
+        ),
+        residual_max_scale_fraction=float(
+            metadata.get(
+                "residual_max_scale_fraction",
+                cfg.fiber_residual_max_scale_fraction,
+            )
+        ),
+        semantic_mask_from_source=bool(
+            metadata.get(
+                "semantic_mask_from_source", cfg.fiber_semantic_mask_from_source
+            )
+        ),
+        structured_foreground_only=bool(
+            metadata.get(
+                "structured_foreground_only",
+                cfg.fiber_structured_foreground_only,
+            )
+        ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_faces,
         binding_cache=cfg.fiber_binding_cache,
@@ -95,6 +122,7 @@ def _load_field(args, cfg, device):
         "carrier_root_tip_raw",
         "initial_carrier_probabilities",
         "initial_carrier_root_tip",
+        "route_active_gate",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:
@@ -173,9 +201,10 @@ def main() -> None:
             temperature=cfg.fiber_final_temperature,
             hard_route=False,
             hard_route_policy=hard_policy,
-            fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
-            additive_teacher=cfg.fiber_additive_teacher_mode,
-        )
+                fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
+                additive_teacher=cfg.fiber_additive_teacher_mode,
+                teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+            )
         base = _render(primitives, camera, cfg, cfg.fiber_renderer)
         route = _render(
             replace(primitives, color=route_palette[primitives.route_id]),

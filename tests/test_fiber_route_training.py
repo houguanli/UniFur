@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 
 from dpd3dgs_animal.fiber_optimize import (
+    _local_axial_orientation_moments,
     _load_orientation_targets,
     _negative_contribution_penalty,
     _normalize_positive_risk,
@@ -13,6 +14,18 @@ from dpd3dgs_animal.fiber_optimize import (
     _silhouette_band_loss,
     _split_training_and_calibration_frames,
 )
+
+
+def test_fourth_axial_moment_preserves_orthogonal_crossing() -> None:
+    # In double-angle space, horizontal and vertical directions cancel.  Their
+    # fourth harmonics agree, preserving explicit evidence for two modes.
+    vectors = torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]])
+    confidence = torch.ones(1, 2)
+    moment2, moment4, _ = _local_axial_orientation_moments(
+        vectors, confidence, radius=1
+    )
+    assert float(moment2[0, 0].norm()) < 1e-6
+    torch.testing.assert_close(moment4[0, 0], torch.tensor([1.0, 0.0]))
 
 
 def test_orientation_loader_accepts_gaussian_haircut_variance(tmp_path) -> None:
@@ -34,10 +47,10 @@ def test_orientation_loader_accepts_gaussian_haircut_variance(tmp_path) -> None:
     )
 
 
-def test_calibration_frames_are_disjoint_tail_holdouts() -> None:
+def test_calibration_frames_are_disjoint_orbit_distributed_holdouts() -> None:
     train, calibration = _split_training_and_calibration_frames(list(range(10)), 3)
-    assert train == list(range(7))
-    assert calibration == [7, 8, 9]
+    assert train == [1, 2, 3, 5, 6, 7, 8]
+    assert calibration == [0, 4, 9]
     assert set(train).isdisjoint(calibration)
 
 

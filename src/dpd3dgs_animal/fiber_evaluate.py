@@ -9,7 +9,13 @@ import torch
 from PIL import Image, ImageDraw
 
 from .config import PipelineConfig
-from .fiber import HARD_ROUTE_POLICIES, ROUTE_NAMES, create_unified_fiber_field
+from .fiber import (
+    HARD_ROUTE_POLICIES,
+    ROUTE_NAMES,
+    attach_fixed_gaussian_base,
+    create_unified_fiber_field,
+    partition_binding_cache,
+)
 from .fiber_optimize import _render
 from .optimize import (
     DifferentiableSkeletonTetModel,
@@ -84,6 +90,7 @@ def evaluate_unified_fiber_stage2(
     route_mode: str = "hard",
     camera_manifest: str | Path | None = None,
     export_external_renders: bool = False,
+    fixed_base_gaussian_ply: str | Path | None = None,
 ) -> FiberEvaluationArtifacts:
     """Evaluate a trained fiber field on a disjoint sequence slice."""
 
@@ -115,6 +122,38 @@ def evaluate_unified_fiber_stage2(
     exact_vertex_binding = bool(
         metadata.get("exact_vertex_binding", cfg.fiber_exact_vertex_binding)
     )
+    binding_mode = str(metadata.get("binding_mode", cfg.fiber_binding_mode))
+    source_mask_mode = str(
+        metadata.get("source_mask_mode", cfg.fiber_source_mask_mode)
+    )
+    source_mask_threshold = float(
+        metadata.get("source_mask_threshold", cfg.fiber_source_mask_threshold)
+    )
+    source_min_opacity = float(
+        metadata.get("source_min_opacity", cfg.fiber_source_min_opacity)
+    )
+    split_fixed_base = bool(
+        metadata.get("split_fixed_base", cfg.fiber_split_fixed_base)
+    )
+    fixed_base_source = Path(
+        fixed_base_gaussian_ply
+        or metadata.get("fixed_base_gaussian_ply")
+        or gaussian_ply
+    )
+    # A positive evaluation setting is an intentional runtime audit override.
+    # Checkpoint metadata remains the default when no override is requested.
+    residual_max_scale_fraction = float(cfg.fiber_residual_max_scale_fraction)
+    if residual_max_scale_fraction <= 0.0:
+        residual_max_scale_fraction = float(
+            metadata.get("residual_max_scale_fraction", 0.0)
+        )
+    fixed_base_max_scale_fraction = float(
+        cfg.fiber_fixed_base_max_scale_fraction
+    )
+    if fixed_base_max_scale_fraction <= 0.0:
+        fixed_base_max_scale_fraction = float(
+            metadata.get("fixed_base_max_scale_fraction", 0.0)
+        )
     shell_samples = int(metadata.get("shell_samples", cfg.fiber_shell_samples))
     strand_samples = int(metadata.get("strand_samples", cfg.fiber_strand_samples))
     hard_route_policy = str(
@@ -140,11 +179,52 @@ def evaluate_unified_fiber_stage2(
         max_points=point_count,
         point_sampling_mode=point_sampling_mode,
         exact_vertex_binding=exact_vertex_binding,
+        binding_mode=binding_mode,
+        source_mask_mode=source_mask_mode,
+        source_mask_threshold=source_mask_threshold,
+        source_min_opacity=source_min_opacity,
+        residual_max_scale_fraction=residual_max_scale_fraction,
+        semantic_mask_from_source=bool(
+            metadata.get(
+                "semantic_mask_from_source", cfg.fiber_semantic_mask_from_source
+            )
+        ),
+        structured_foreground_only=bool(
+            metadata.get(
+                "structured_foreground_only",
+                cfg.fiber_structured_foreground_only,
+            )
+        ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_face_indices,
-        binding_cache=cfg.fiber_binding_cache,
+        binding_cache=(
+            partition_binding_cache(cfg.fiber_binding_cache, "foreground")
+            if split_fixed_base
+            else cfg.fiber_binding_cache
+        ),
     )
+    if split_fixed_base:
+        attach_fixed_gaussian_base(
+            field,
+            fixed_base_source,
+            motion.rest_surface_vertices.detach().cpu().numpy(),
+            motion.surface_faces.detach().cpu().numpy(),
+            device=device,
+            point_sampling_mode=point_sampling_mode,
+            exact_vertex_binding=exact_vertex_binding,
+            binding_mode=binding_mode,
+            source_mask_threshold=source_mask_threshold,
+            source_min_opacity=source_min_opacity,
+            residual_max_scale_fraction=fixed_base_max_scale_fraction,
+            scalp_face_indices=scalp_face_indices,
+            binding_cache=cfg.fiber_binding_cache,
+        )
     checkpoint_state = payload["state_dict"]
+    checkpoint_shell_gate = checkpoint_state.get("shell_visibility_gate")
+    if isinstance(checkpoint_shell_gate, torch.Tensor):
+        field.shell_visibility_gate = torch.empty_like(
+            checkpoint_shell_gate, device=field.route_logits.device
+        )
     checkpoint_gate = checkpoint_state.get("strand_visibility_gate")
     if isinstance(checkpoint_gate, torch.Tensor):
         field.strand_visibility_gate = torch.empty_like(
@@ -159,7 +239,9 @@ def evaluate_unified_fiber_stage2(
         "bend_cubic_local",
         "structured_delta_raw",
         "structured_opacity_raw",
+        "shell_visibility_gate",
         "strand_visibility_gate",
+        "route_active_gate",
         "carrier_logits",
         "carrier_root_tip_raw",
         "initial_carrier_probabilities",
@@ -254,6 +336,7 @@ def evaluate_unified_fiber_stage2(
                     hard_route_policy=hard_route_policy,
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
+                    teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
                 )
             prediction = _render(primitives, camera, cfg, renderer_name)
             ground_truth = _load_gt_frame_torch(
@@ -282,8 +365,16 @@ def evaluate_unified_fiber_stage2(
                     }
                 )
 
+            route_color = palette[primitives.route_id]
+            if primitives.semantic_foreground is not None:
+                # The immutable head/body base participates in depth
+                # compositing but has no learnable hair route.  Paint it
+                # neutral gray so diagnostics cannot misread it as residual.
+                fixed_base = primitives.semantic_foreground <= 0.0
+                neutral = torch.full_like(route_color, 0.32)
+                route_color = torch.where(fixed_base[:, None], neutral, route_color)
             route_prediction = _render(
-                replace(primitives, color=palette[primitives.route_id]),
+                replace(primitives, color=route_color),
                 camera,
                 cfg,
                 renderer_name,
@@ -361,6 +452,12 @@ def evaluate_unified_fiber_stage2(
         ),
         "hard_routes": hard_routes,
         "hard_route_policy": hard_route_policy,
+        "fixed_base_count": (
+            field.fixed_base.point_count if field.fixed_base is not None else 0
+        ),
+        "fixed_base_render_role": (
+            "immutable_depth_occluder" if field.fixed_base is not None else "none"
+        ),
         "per_frame": per_frame,
     }
     with open(report_json, "w", encoding="utf-8") as file:
@@ -454,18 +551,22 @@ def _preview_row(
     gt_mask = ground_truth["mask"][..., None]
     gt_rgb = ground_truth["rgb"] * gt_mask
     pred_rgb = prediction["rgb"]
+    semantic_mask = prediction["mask"].clamp(0.0, 1.0)[..., None]
+    hair_layer_rgb = pred_rgb * semantic_mask
     error = torch.abs(pred_rgb - ground_truth["rgb"]) * gt_mask
     images = [
         _tensor_image(gt_rgb),
+        _tensor_image(hair_layer_rgb),
         _tensor_image(pred_rgb),
         _tensor_image(error * 3.0),
         _tensor_image(route_prediction["rgb"]),
     ]
     labels = [
         f"frame {frame_index} GT",
-        f"prediction PSNR {float(metrics['foreground_psnr']):.2f}",
+        f"hair layer diagnostic PSNR {float(metrics['foreground_psnr']):.2f}",
+        "joint composite (fixed base is immutable)",
         "3x foreground error",
-        "route map: shell/strand/residual",
+        "route map: shell/strand/residual; gray=fixed base",
     ]
     label_height = 24
     row = Image.new("RGB", (sum(image.width for image in images), images[0].height + label_height), "black")

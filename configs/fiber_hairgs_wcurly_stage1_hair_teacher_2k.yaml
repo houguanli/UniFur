@@ -1,0 +1,35 @@
+device: cuda
+optimize_lr: 0.0000000001
+optimize_steps: 1
+color_loss_weight: 1.0
+mask_loss_weight: 2.0
+mask_balance_weight: 4.0
+mask_boundary_weight: 0.5
+mask_boundary_radius: 2
+
+# Complete Stage-I composite checkpoint adapter. The background head/body
+# remains physically present for RGB and occlusion but has zero semantic hair.
+fiber_representation: residual_only
+fiber_renderer: hairgs
+fiber_capacity_mode: fixed
+fiber_max_points: 130000
+fiber_point_sampling_mode: spatial_morton
+fiber_exact_vertex_binding: false
+fiber_binding_mode: nearest_vertex
+fiber_binding_cache: /mnt/f/fur_hair_unified_data/benchmarks/hairgs_wcurly_static_protocol/hairgs_stage1_all124k_binding_cache.npz
+fiber_source_mask_mode: all
+fiber_source_mask_threshold: 0.25
+fiber_source_min_opacity: 0.0
+fiber_semantic_mask_from_source: true
+fiber_structured_foreground_only: true
+fiber_max_frames: 12
+fiber_shell_samples: 2
+fiber_strand_samples: 9
+fiber_appearance_lr_scale: 0.25
+fiber_geometry_lr_scale: 0.05
+fiber_gradient_clip: 5.0
+fiber_log_every: 50
+fiber_checkpoint_every: 1
+fiber_ema_decay: 0.95
+fiber_residual_drift_weight: 0.02
+fiber_random_seed: 20260816

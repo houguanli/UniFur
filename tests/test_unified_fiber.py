@@ -1,17 +1,34 @@
+import copy
+
 import numpy as np
 import torch
 
 from dpd3dgs_animal.fiber_optimize import (
+    _apply_adaptive_topology_scores,
     _apply_route_mass_floor,
+    _bidirectional_mask_losses,
+    _front_surface_visibility,
+    _front_visible_sample_gate,
+    _initialize_multiview_coverage_seeds,
+    _initialize_render_preserving_adaptive_migration,
+    _initialize_render_preserving_semantic_migration,
     _load_residual_bootstrap_checkpoint,
+    _masked_rgb_gradient_loss,
+    _residual_footprint_probe_points,
+    _route_visual_hull_soft_loss,
     _resolve_fiber_point_budget,
+    _freeze_residual_teacher_scaffold,
+    _structured_spill_loss,
+    _topology_event_is_accepted,
 )
-from dpd3dgs_animal.config import PipelineConfig
+from dpd3dgs_animal.config import PipelineConfig, load_config
 
 from dpd3dgs_animal.fiber import (
     CARRIER_NAMES,
+    FixedGaussianBase,
     UnifiedFiberField,
     _bind_exact_surface_vertices,
+    _bind_nearest_surface_vertices,
     _quaternion_to_matrix_torch,
     _select_gaussian_indices,
     apply_fin_view_gate,
@@ -40,6 +57,260 @@ def test_pixel_adaptive_capacity_uses_resolution_and_hard_cap() -> None:
         )
         == 12_345
     )
+
+
+def test_semantic_migration_config_fields_are_loaded(tmp_path) -> None:
+    path = tmp_path / "semantic.yaml"
+    path.write_text(
+        "fiber_teacher_semantic_migration_mass: [0.25, 0.40, 0.35]\n"
+        "fiber_teacher_adaptive_migration_domain: hair\n"
+        "fiber_teacher_adaptive_migration_bias: 0.7\n"
+        "fiber_adaptive_migration_hard_router: false\n"
+        "fiber_teacher_semantic_migration_tolerance: 0.005\n"
+        "fiber_optimize_structured_base_appearance: true\n"
+        "fiber_teacher_nonregression_views_per_step: 2\n"
+        "fiber_teacher_nonregression_reduction: max\n"
+        "fiber_structure_deployment_weight: 0.12\n"
+        "fiber_structure_min_deployment_gain: 0.25\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.fiber_teacher_semantic_migration_mass == [0.25, 0.40, 0.35]
+    assert cfg.fiber_teacher_adaptive_migration_domain == "hair"
+    assert cfg.fiber_teacher_adaptive_migration_bias == 0.7
+    assert cfg.fiber_adaptive_migration_hard_router is False
+    assert cfg.fiber_teacher_semantic_migration_tolerance == 0.005
+    assert cfg.fiber_optimize_structured_base_appearance is True
+    assert cfg.fiber_teacher_nonregression_views_per_step == 2
+    assert cfg.fiber_teacher_nonregression_reduction == "max"
+    assert cfg.fiber_structure_deployment_weight == 0.12
+    assert cfg.fiber_structure_min_deployment_gain == 0.25
+
+
+def test_nearest_vertex_binding_preserves_a_valid_carrier_face() -> None:
+    vertices = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 2]], dtype=np.int64)
+    points = np.asarray([[0.02, 0.01, 0.4], [0.95, 0.02, -0.2]], dtype=np.float32)
+    binding = _bind_nearest_surface_vertices(points, vertices, faces)
+    assert binding.face_index.tolist() == [0, 0]
+    np.testing.assert_allclose(binding.barycentric.sum(axis=1), 1.0)
+
+
+def test_topology_event_rejects_single_view_regression_despite_better_mean() -> None:
+    accepted, deltas = _topology_event_is_accepted(
+        [1.0, 1.0, 1.0],
+        [0.8, 0.8, 1.05],
+        margin=0.01,
+    )
+    assert not accepted
+    assert deltas[-1] > 0.01
+    accepted, _ = _topology_event_is_accepted(
+        [1.0, 1.0, 1.0],
+        [0.99, 1.0, 0.98],
+        margin=0.01,
+    )
+    assert accepted
+
+
+def test_rgb_gradient_loss_penalizes_blur_and_matches_exact_image() -> None:
+    target = torch.zeros(8, 8, 3)
+    target[:, 4:] = 1.0
+    mask = torch.ones(8, 8)
+    exact = _masked_rgb_gradient_loss(target, target, mask)
+    blurred = torch.full_like(target, 0.5)
+    blur_loss = _masked_rgb_gradient_loss(blurred, target, mask)
+    torch.testing.assert_close(exact, torch.zeros_like(exact))
+    assert float(blur_loss) > 0.0
+
+
+def test_structured_spill_only_penalizes_excess_background_opacity() -> None:
+    target = torch.zeros(4, 4)
+    target[1:3, 1:3] = 1.0
+    teacher = torch.full((4, 4), 0.1)
+    no_excess = _structured_spill_loss(teacher, teacher, target)
+    prediction = teacher.clone()
+    prediction[0, 0] = 0.5
+    excess = _structured_spill_loss(prediction, teacher, target)
+    torch.testing.assert_close(no_excess, torch.zeros_like(no_excess))
+    assert float(excess) > 0.0
+
+
+def test_bidirectional_mask_losses_separate_holes_from_spill() -> None:
+    target = torch.zeros(6, 6)
+    target[2:4, 2:4] = 1.0
+    exact = target.clone()
+    inside, outside = _bidirectional_mask_losses(
+        exact, target, inside_alpha_target=1.0
+    )
+    torch.testing.assert_close(inside, torch.zeros_like(inside))
+    torch.testing.assert_close(outside, torch.zeros_like(outside))
+
+    missing = exact.clone()
+    missing[2, 2] = 0.0
+    inside, outside = _bidirectional_mask_losses(
+        missing, target, inside_alpha_target=1.0
+    )
+    assert float(inside) > 0.0
+    torch.testing.assert_close(outside, torch.zeros_like(outside))
+
+    spilling = exact.clone()
+    spilling[0, 0] = 0.5
+    inside, outside = _bidirectional_mask_losses(
+        spilling, target, inside_alpha_target=1.0
+    )
+    torch.testing.assert_close(inside, torch.zeros_like(inside))
+    assert float(outside) > 0.0
+
+    reference = spilling.clone()
+    inside, outside = _bidirectional_mask_losses(
+        spilling,
+        target,
+        inside_alpha_target=1.0,
+        outside_reference_mask=reference,
+    )
+    torch.testing.assert_close(inside, torch.zeros_like(inside))
+    torch.testing.assert_close(outside, torch.zeros_like(outside))
+
+
+def test_multiview_coverage_seed_activates_deficit_supported_root(tmp_path) -> None:
+    field, vertices, faces = _toy_field()
+    teacher = copy.deepcopy(field)
+    with torch.no_grad():
+        teacher.opacity_logits.fill_(-20.0)
+    camera = PinholeCamera(
+        width=32,
+        height=32,
+        fx=24.0,
+        fy=24.0,
+        cx=16.0,
+        cy=16.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    cfg = PipelineConfig(
+        fiber_renderer="torch",
+        fiber_coverage_seed_count=1,
+        fiber_coverage_seed_samples=3,
+        fiber_coverage_seed_min_views=1,
+        fiber_coverage_seed_min_fraction=0.5,
+        fiber_coverage_seed_min_deficit=0.01,
+        fiber_coverage_seed_voxel_scale=0.01,
+        fiber_coverage_seed_structured_opacity=0.4,
+        fiber_coverage_seed_geometry_gain=1.0,
+        fiber_coverage_seed_shell_length_scale=0.02,
+        fiber_coverage_seed_strand_length_scale=0.2,
+        fiber_coverage_seed_route_mass=[0.1, 0.8, 0.1],
+        fiber_visual_hull_margin_px=0,
+    )
+    report, teacher_masks = _initialize_multiview_coverage_seeds(
+        field,
+        teacher,
+        faces,
+        [vertices],
+        [camera],
+        [0],
+        [{"mask": torch.ones(32, 32)}],
+        None,
+        cfg,
+        "torch",
+        tmp_path,
+    )
+    assert report is not None
+    assert report["selected_count"] == 1
+    assert set(teacher_masks) == {0}
+    assert (tmp_path / "coverage_seed_roots.ply").is_file()
+    activated = field.structured_opacity_gain[:, 1] > 0.0
+    assert int(activated.sum()) == 1
+    selected = torch.nonzero(activated, as_tuple=False).reshape(-1)
+    assert torch.all(field.structured_delta_gain[selected] == 1.0)
+    assert torch.all(field.route_active_gate[selected, :2] == 1.0)
+    probabilities = field.route_probabilities(
+        temperature=cfg.fiber_final_temperature
+    )
+    torch.testing.assert_close(
+        probabilities[selected][0], torch.tensor([0.1, 0.8, 0.1])
+    )
+
+
+def test_front_surface_visibility_rejects_far_same_pixel_point() -> None:
+    camera = PinholeCamera(
+        width=32,
+        height=32,
+        fx=24.0,
+        fy=24.0,
+        cx=16.0,
+        cy=16.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    points = torch.tensor(
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.5, 0.0, 2.0]]
+    )
+    visible = _front_surface_visibility(
+        points, camera, bin_px=1, depth_tolerance=0.01
+    )
+    assert visible.tolist() == [True, False, True]
+
+
+def test_front_visible_sample_gate_uses_shared_occluder_geometry() -> None:
+    camera = PinholeCamera(
+        width=32,
+        height=32,
+        fx=24.0,
+        fy=24.0,
+        cx=16.0,
+        cy=16.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    samples = torch.tensor([[[0.0, 0.0, 2.0], [0.5, 0.0, 2.0]]])
+    occluders = torch.tensor([[0.0, 0.0, 1.0]])
+    visible = _front_visible_sample_gate(
+        samples,
+        occluders,
+        camera,
+        bin_px=1,
+        depth_tolerance=0.01,
+    )
+    assert visible.tolist() == [[False, True]]
+
+def test_soft_hull_does_not_repenalize_multiview_accepted_samples() -> None:
+    camera = PinholeCamera(
+        width=16,
+        height=16,
+        fx=12.0,
+        fy=12.0,
+        cx=8.0,
+        cy=8.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    points = torch.tensor([[[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]]])
+    probabilities = torch.tensor([[0.0, 1.0, 0.0]])
+    mask = torch.zeros(16, 16)
+    rejected = _route_visual_hull_soft_loss(
+        points,
+        probabilities,
+        1,
+        camera,
+        mask,
+        0,
+        sample_gate=torch.zeros(1, 2),
+    )
+    accepted = _route_visual_hull_soft_loss(
+        points,
+        probabilities,
+        1,
+        camera,
+        mask,
+        0,
+        sample_gate=torch.ones(1, 2),
+    )
+    assert float(rejected) > 0.0
+    torch.testing.assert_close(accepted, torch.zeros_like(accepted))
 
 
 def test_spatial_morton_sampling_is_deterministic_and_covers_extent() -> None:
@@ -129,6 +400,135 @@ def test_unified_routes_form_a_differentiable_partition() -> None:
     assert torch.isfinite(field.direction_local_raw.grad).all()
 
 
+def test_fixed_base_is_not_learnable_and_does_not_expand_hair_routes() -> None:
+    field, vertices, faces = _toy_field()
+    base_source = copy.deepcopy(field)
+    base = FixedGaussianBase(base_source)
+    assert list(base.parameters()) == []
+    field.semantic_mask_from_source = True
+    field.fixed_base = base
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3, temperature=0.8
+    )
+    hair_primitive_count = field.point_count * (2 + 3 + 1)
+    assert primitives.xyz.shape[0] == hair_primitive_count + base.point_count
+    assert primitives.route_probabilities.shape == (field.point_count, 3)
+    torch.testing.assert_close(
+        primitives.source_id[-base.point_count :],
+        torch.arange(base.point_count) + field.point_count,
+    )
+    torch.testing.assert_close(
+        primitives.semantic_foreground[-base.point_count :],
+        torch.zeros(base.point_count),
+    )
+    assert not any(key.startswith("fixed_base.") for key in field.state_dict())
+
+
+def test_residual_scale_safety_cap_is_scene_relative_and_optional() -> None:
+    field, _, _ = _toy_field()
+    original = field.residual_scaling.detach().clone()
+    torch.testing.assert_close(original, torch.full_like(original, 0.015))
+    field.residual_max_scale_fraction = 0.01
+    torch.testing.assert_close(
+        field.residual_scaling,
+        torch.full_like(field.residual_scaling, 0.01),
+    )
+
+
+def test_fixed_base_uses_the_same_scene_relative_scale_cap() -> None:
+    field, vertices, faces = _toy_field()
+    field.residual_max_scale_fraction = 0.01
+    base = FixedGaussianBase(field)
+    primitives = base.primitives(vertices, faces)
+    torch.testing.assert_close(
+        primitives.scaling,
+        torch.full_like(primitives.scaling, 0.01),
+    )
+
+
+def test_route_topology_gate_removes_and_activates_renderer_primitives() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.route_active_gate[:, :2] = 0.0
+        field.route_active_gate[:, 2] = 1.0
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3, temperature=0.8
+    )
+    shell = primitives.opacity[: field.point_count * 2]
+    strand = primitives.opacity[field.point_count * 2 : field.point_count * 5]
+    residual = primitives.opacity[-field.point_count :]
+    torch.testing.assert_close(shell, torch.zeros_like(shell))
+    torch.testing.assert_close(strand, torch.zeros_like(strand))
+    assert torch.all(residual > 0.0)
+    torch.testing.assert_close(
+        primitives.route_probabilities[:, 2], torch.ones(field.point_count)
+    )
+
+    with torch.no_grad():
+        field.route_active_gate[0, 2] = 0.0
+    residual_only = field.residual_primitives(vertices, faces)
+    assert float(residual_only.opacity[0]) == 0.0
+    assert float(residual_only.opacity[1]) > 0.0
+
+
+def test_adaptive_topology_scores_prune_outlier_and_grow_hole() -> None:
+    field, _vertices, _faces = _toy_field()
+    with torch.no_grad():
+        field.route_active_gate[:, :2] = 0.0
+        field.route_active_gate[:, 2] = 1.0
+    optimizer = torch.optim.Adam(field.parameters(), lr=1e-3)
+    cfg = PipelineConfig(
+        fiber_shell_samples=2,
+        fiber_strand_samples=3,
+        fiber_topology_prune_count=1,
+        fiber_topology_grow_count=1,
+        fiber_topology_densify_count=0,
+        fiber_topology_min_views=1,
+        fiber_topology_prune_max_support=0.1,
+        fiber_topology_grow_min_support=0.5,
+        fiber_topology_grow_min_deficit=0.1,
+        fiber_topology_max_residual_prune_fraction=0.5,
+        fiber_coverage_seed_route_mass=[0.15, 0.75, 0.10],
+    )
+    event = _apply_adaptive_topology_scores(
+        field,
+        optimizer,
+        cfg,
+        visible_views=torch.tensor([3.0, 3.0]),
+        residual_support=torch.tensor([0.0, 1.0]),
+        structured_support=torch.tensor([0.0, 1.0]),
+        deficit_score=torch.tensor([0.0, 0.5]),
+        boundary_score=torch.zeros(2),
+        step=100,
+    )
+    assert event["pruned_count"] == 1
+    assert event["grown_count"] == 1
+    assert float(field.route_active_gate[0, 2]) == 0.0
+    assert torch.all(field.route_active_gate[1, :2] == 1.0)
+    assert event["topology"]["active_gaussians"] == 6
+
+
+def test_residual_footprint_probes_cover_center_and_local_axes() -> None:
+    center = torch.tensor([[1.0, 2.0, 3.0]])
+    tangent = torch.tensor([[1.0, 0.0, 0.0]])
+    bitangent = torch.tensor([[0.0, 1.0, 0.0]])
+    normal = torch.tensor([[0.0, 0.0, 1.0]])
+    probes = _residual_footprint_probe_points(
+        center,
+        tangent,
+        bitangent,
+        normal,
+        torch.tensor([[0.20, 0.10, 0.05]]),
+        sigma=2.0,
+    )
+    assert probes.shape == (1, 7, 3)
+    torch.testing.assert_close(probes[0, 0], center[0])
+    torch.testing.assert_close(probes[0, 1], torch.tensor([1.4, 2.0, 3.0]))
+    torch.testing.assert_close(probes[0, 2], torch.tensor([0.6, 2.0, 3.0]))
+    torch.testing.assert_close(probes[0, 5], torch.tensor([1.0, 2.0, 3.4]))
+    torch.testing.assert_close(probes[0, 6], torch.tensor([1.0, 2.0, 2.6]))
+
+
 def test_expert_appearance_is_render_preserving_at_initialization() -> None:
     field, vertices, faces = _toy_field()
     primitives = field.primitives(
@@ -199,6 +599,85 @@ def test_structured_geometry_is_an_exact_zero_initialized_residual_increment() -
     torch.testing.assert_close(
         strand, residual[:, None, :].expand_as(strand)
     )
+
+
+def test_target_geometry_remains_visible_to_geometry_losses_at_zero_gain() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3
+    )
+    deployed = primitives.xyz[
+        field.point_count * 2 : field.point_count * 5
+    ].reshape(field.point_count, 3, 3)
+    target, target_direction = field.strand_target_geometry(
+        vertices, faces, strand_samples=3
+    )
+    assert not torch.allclose(target, deployed)
+    assert target.shape == deployed.shape
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(target_direction, dim=-1),
+        torch.ones(field.point_count, 3),
+    )
+
+
+def test_shell_visibility_gate_removes_unsupported_fin_samples() -> None:
+    field, vertices, faces = _toy_field()
+    shell_gate = torch.ones(field.point_count, 2)
+    shell_gate[:, 1] = 0.0
+    with torch.no_grad():
+        # Visual-hull culling is exact only for a deployed Fin.  At zero
+        # deployment the samples remain the render-preserving teacher copy.
+        field.structured_delta_raw[:, 0] = 1.0
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        shell_visibility=shell_gate,
+    )
+    shell_opacity = primitives.opacity[: field.point_count * 2].reshape(
+        field.point_count, 2
+    )
+    assert torch.all(shell_opacity[:, 0] > 0.0)
+    torch.testing.assert_close(shell_opacity[:, 1], torch.zeros_like(shell_opacity[:, 1]))
+
+
+def test_shell_target_geometry_is_fully_deployed_at_zero_gain() -> None:
+    field, vertices, faces = _toy_field()
+    primitives = field.primitives(
+        vertices, faces, shell_samples=2, strand_samples=3
+    )
+    rendered = primitives.xyz[: field.point_count * 2].reshape(
+        field.point_count, 2, 3
+    )
+    target = field.shell_target_geometry(vertices, faces, shell_samples=2)
+    assert target.shape == rendered.shape
+    assert not torch.allclose(target, rendered)
+
+
+def test_strand_deployment_and_shared_field_regularizers_have_gradients() -> None:
+    field, vertices, faces = _toy_field()
+    field.strand_visibility_gate = torch.ones(field.point_count, 3)
+    regularizers = field.regularizers(
+        vertices,
+        faces,
+        temperature=0.8,
+        strand_min_deployment_gain=0.4,
+        strand_min_deployed_length_scale=0.05,
+        strand_coverage_target=0.01,
+    )
+    objective = (
+        regularizers["strand_field"]
+        + regularizers["strand_deployability"]
+        + regularizers["strand_coverage_deficit"]
+    )
+    objective.backward()
+    assert float(regularizers["strand_deployability"]) > 0.0
+    assert float(regularizers["strand_coverage_deficit"]) > 0.0
+    assert field.structured_delta_raw.grad is not None
+    assert float(field.structured_delta_raw.grad[:, 1].abs().sum()) > 0.0
+    assert field.direction_local_raw.grad is not None
+    assert torch.isfinite(field.direction_local_raw.grad).all()
 
 
 def test_surface_anchor_moves_all_three_representations_with_the_animal() -> None:
@@ -400,6 +879,135 @@ def test_structured_geometry_starts_as_render_preserving_residual_copies() -> No
     torch.testing.assert_close(primitives.rotation[:shell_count], expected_rotation)
 
 
+def test_semantic_migration_is_a_hard_capacity_and_opacity_reparameterization() -> None:
+    field, vertices, faces = _toy_field()
+    report = _initialize_render_preserving_semantic_migration(
+        field, [0.5, 0.5, 0.0], temperature=0.35
+    )
+    assert report["capacity_counts"] == {"shell": 1, "strand": 1, "residual": 0}
+    torch.testing.assert_close(
+        field.route_active_gate.sum(dim=-1), torch.ones(field.point_count)
+    )
+    probabilities = field.route_probabilities(temperature=0.35)
+    torch.testing.assert_close(
+        probabilities, field.route_active_gate, rtol=0.0, atol=0.0
+    )
+
+    shell_samples, strand_samples = 2, 3
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=shell_samples,
+        strand_samples=strand_samples,
+        temperature=0.35,
+        geometry_blend=1.0,
+    )
+    n = field.point_count
+    shell_opacity = primitives.opacity[: n * shell_samples].reshape(
+        n, shell_samples
+    )
+    strand_opacity = primitives.opacity[
+        n * shell_samples : n * (shell_samples + strand_samples)
+    ].reshape(n, strand_samples)
+    residual_opacity = primitives.opacity[-n:]
+    combined_alpha = 1.0 - (
+        torch.prod(1.0 - shell_opacity, dim=-1)
+        * torch.prod(1.0 - strand_opacity, dim=-1)
+        * (1.0 - residual_opacity)
+    )
+    torch.testing.assert_close(combined_alpha, field.opacity)
+    assert int((primitives.opacity > 1e-10).sum()) == field.point_count
+    torch.testing.assert_close(
+        field.structured_delta_gain, torch.zeros_like(field.structured_delta_gain)
+    )
+
+
+def test_adaptive_migration_removes_residual_and_preserves_soft_transmittance() -> None:
+    field, vertices, faces = _toy_field()
+    report = _initialize_render_preserving_adaptive_migration(
+        field, "hair", domain_bias=0.65, temperature=0.35
+    )
+    assert report["fixed_global_quota"] is False
+    assert report["residual_source_capacity_ceiling"] == 0.0
+    assert report["initial_soft_mass"]["strand"] > report["initial_soft_mass"]["shell"]
+    torch.testing.assert_close(
+        field.route_active_gate[:, :2], torch.ones(field.point_count, 2)
+    )
+    torch.testing.assert_close(
+        field.route_active_gate[:, 2], torch.zeros(field.point_count)
+    )
+
+    shell_samples, strand_samples = 2, 3
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=shell_samples,
+        strand_samples=strand_samples,
+        temperature=0.35,
+        geometry_blend=1.0,
+    )
+    n = field.point_count
+    shell_opacity = primitives.opacity[: n * shell_samples].reshape(
+        n, shell_samples
+    )
+    strand_opacity = primitives.opacity[
+        n * shell_samples : n * (shell_samples + strand_samples)
+    ].reshape(n, strand_samples)
+    residual_opacity = primitives.opacity[-n:]
+    combined_alpha = 1.0 - (
+        torch.prod(1.0 - shell_opacity, dim=-1)
+        * torch.prod(1.0 - strand_opacity, dim=-1)
+        * (1.0 - residual_opacity)
+    )
+    torch.testing.assert_close(combined_alpha, field.opacity)
+    torch.testing.assert_close(residual_opacity, torch.zeros_like(residual_opacity))
+
+
+def test_structured_student_can_refit_appearance_without_moving_teacher_geometry() -> None:
+    field, _vertices, _faces = _toy_field()
+    _freeze_residual_teacher_scaffold(
+        field, optimize_structured_base_appearance=True
+    )
+    assert field.color_logits.requires_grad
+    assert field.opacity_logits.requires_grad
+    assert not field.residual_offset_local.requires_grad
+    assert not field.residual_log_scale_delta.requires_grad
+    assert not field.residual_rotation_raw.requires_grad
+
+
+def test_visual_hull_culling_fades_in_with_structured_deployment() -> None:
+    field, vertices, faces = _toy_field()
+    _initialize_render_preserving_semantic_migration(
+        field, [0.0, 1.0, 0.0], temperature=0.35
+    )
+    visibility = torch.zeros(field.point_count, 3)
+    collapsed = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        strand_visibility=visibility,
+        geometry_blend=1.0,
+    )
+    n = field.point_count
+    collapsed_strand = collapsed.opacity[n * 2 : n * 5].reshape(n, 3)
+    collapsed_alpha = 1.0 - torch.prod(1.0 - collapsed_strand, dim=-1)
+    torch.testing.assert_close(collapsed_alpha, field.opacity)
+
+    with torch.no_grad():
+        field.structured_delta_raw[:, 1] = 1.0
+    deployed = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        strand_visibility=visibility,
+        geometry_blend=1.0,
+    )
+    deployed_strand = deployed.opacity[n * 2 : n * 5]
+    torch.testing.assert_close(deployed_strand, torch.zeros_like(deployed_strand))
+
+
 def test_route_dropout_removes_one_expert_and_renormalizes_soft_mass() -> None:
     field, _vertices, _faces = _toy_field()
     probabilities = field.route_probabilities(
@@ -458,6 +1066,11 @@ def test_lightweight_fiber_renderer_backpropagates_to_geometry_and_routing() -> 
         "route_entropy",
         "route_prior",
         "route_neighbor",
+        "structure_deployment",
+        "strand_field",
+        "strand_deployability",
+        "strand_effective_coverage",
+        "strand_coverage_deficit",
         "shell_normal",
         "shell_length",
         "strand_thinness",
@@ -601,6 +1214,35 @@ def test_additive_teacher_is_exact_at_zero_and_structured_gain_is_trainable() ->
     assert field.structured_opacity_raw.grad is not None
     assert float(field.structured_opacity_raw.grad.abs().sum()) > 0.0
     assert torch.isfinite(field.structured_opacity_raw.grad).all()
+
+
+def test_teacher_opacity_transfer_replaces_residual_without_adding_structure() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.structured_opacity_raw.fill_(1.0)
+    additive = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        additive_teacher=True,
+        teacher_opacity_transfer=0.0,
+    )
+    transferred = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        additive_teacher=True,
+        teacher_opacity_transfer=0.5,
+    )
+    structured = additive.route_id != 2
+    residual = additive.route_id == 2
+    torch.testing.assert_close(
+        transferred.opacity[structured], additive.opacity[structured]
+    )
+    assert torch.all(transferred.opacity[residual] < additive.opacity[residual])
+    assert torch.all(transferred.opacity[residual] > 0.0)
 
 
 def test_downstream_length_and_wind_edits_preserve_residual_and_roots() -> None:

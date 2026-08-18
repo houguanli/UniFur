@@ -13,8 +13,38 @@ import argparse
 import json
 from pathlib import Path
 
-from data import eval_data_loading_callbacks
+import numpy as np
+
+from data import HairEvalData, eval_data_loading_callbacks
 from loss import compute_metrics
+
+
+def _load_hair_eval_npz(path: str) -> HairEvalData:
+    """Load the common HairGS metric representation from an NPZ bundle.
+
+    Unlike HairGS ground truth, an unstructured Gaussian baseline has no
+    strand IDs or edges. Keeping those fields optional prevents us from
+    inventing topology merely to obtain a strand-consistency score.
+    """
+
+    with np.load(path, allow_pickle=False) as data:
+        points = np.asarray(data["points"], dtype=np.float64)
+        directions = np.asarray(data["directions"], dtype=np.float64)
+        norm = np.linalg.norm(directions, axis=1, keepdims=True)
+        if np.any(norm <= 1e-12):
+            raise ValueError("Prediction contains zero-length directions")
+        directions = directions / norm
+        strand_ids = (
+            np.asarray(data["points_id_to_strand_id"], dtype=np.int64)
+            if "points_id_to_strand_id" in data.files
+            else None
+        )
+        edges = (
+            np.asarray(data["edges"], dtype=np.int64)
+            if "edges" in data.files
+            else None
+        )
+    return HairEvalData(points, directions, strand_ids, edges)
 
 
 def main() -> int:
@@ -27,15 +57,25 @@ def main() -> int:
 
     gt_path = Path(args.source_data_path) / "hair_eval_data.npz"
     gt = eval_data_loading_callbacks["gt"](str(gt_path))
-    pred = eval_data_loading_callbacks[args.pred_data_type](args.pred_data_path)
+    pred = (
+        _load_hair_eval_npz(args.pred_data_path)
+        if args.pred_data_type == "hair_eval_npz"
+        else eval_data_loading_callbacks[args.pred_data_type](args.pred_data_path)
+    )
     metrics, thresholds = compute_metrics(pred, gt, bidirectional=True)
+    serialized_metrics = {
+        name: [float(value) for value in values]
+        for name, values in metrics.items()
+        if len(values) == len(thresholds)
+    }
     payload = {
         "gt": str(gt_path),
         "prediction": args.pred_data_path,
         "prediction_type": args.pred_data_type,
         "bidirectional_orientation": True,
         "thresholds": thresholds,
-        "metrics": {name: [float(value) for value in values] for name, values in metrics.items()},
+        "metrics": serialized_metrics,
+        "strand_consistency_applicable": pred.points_id_to_strand_id is not None,
     }
     out = Path(args.out_json)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -55,4 +95,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

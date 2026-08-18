@@ -98,6 +98,37 @@ class PipelineConfig:
     # truncated, while ``uniform_index`` reproduces previous checkpoints.
     fiber_point_sampling_mode: str = "uniform_index"
     fiber_exact_vertex_binding: bool = False
+    # A trained Stage-I GS is not vertex-aligned. ``nearest_vertex`` keeps
+    # every learned world-space Gaussian exact through its local offset while
+    # assigning a stable carrier frame without an O(points x faces) search.
+    fiber_binding_mode: str = "closest_surface"
+    # HairGS stores a learned per-Gaussian foreground logit in ``mask``.
+    # Filtering before routing prevents head/body splats from entering the
+    # hair scaffold; the complementary background split remains the fixed
+    # non-hair base used by the final compositor.
+    fiber_source_mask_mode: str = "all"
+    fiber_source_mask_threshold: float = 0.25
+    fiber_source_min_opacity: float = 0.0
+    # Physically remove head/body rows from the learnable fiber field. Their
+    # filtered Stage-I GS remain an immutable depth/RGB compositor module and
+    # are appended only immediately before rasterization.
+    fiber_split_fixed_base: bool = False
+    # Optional safety cap for a Stage-I residual teacher.  HairGS can hide a
+    # few very large, opaque anisotropic splats in the fitted cameras; those
+    # become broad ellipses from held-out views.  Zero preserves the source
+    # covariance exactly.  Positive values cap every residual scale axis as a
+    # fraction of the rest-surface scene diagonal.
+    fiber_residual_max_scale_fraction: float = 0.0
+    # Independent cap for the immutable head/body compositor.  Keeping this
+    # separate avoids thinning valid hair splats merely to remove a few large
+    # Stage-I head/background covariance outliers.
+    fiber_fixed_base_max_scale_fraction: float = 0.0
+    # Preserve the complete opaque Stage-I head/body compositor but render a
+    # separate HairGS-style binary semantic alpha for hair supervision.
+    fiber_semantic_mask_from_source: bool = False
+    # Only semantic-foreground sources may enter shell/strand. Background
+    # head/body sources remain a fixed residual occlusion and color base.
+    fiber_structured_foreground_only: bool = False
     fiber_default_opacity: float = 0.5
     fiber_default_opacity_reference_points: int = 0
     fiber_binding_cache: str | None = None
@@ -115,6 +146,13 @@ class PipelineConfig:
     fiber_expert_appearance_weight: float = 0.0
     fiber_geometry_lr_scale: float = 0.5
     fiber_structure_activation_lr_scale: float = 1.0
+    # A render-preserving semantic migration starts every structured source as
+    # a co-located copy of its residual teacher.  This regularizer then asks
+    # the selected shell/strand routes to acquire a real geometric extent;
+    # otherwise a nominally structured checkpoint could remain a disguised
+    # collection of collapsed residual Gaussians.
+    fiber_structure_deployment_weight: float = 0.0
+    fiber_structure_min_deployment_gain: float = 0.0
     fiber_route_lr_scale: float = 1.0
     fiber_initial_residual_trust: float = 0.95
     # Optional geometry-only initialization for sparse neutral scalp/head
@@ -137,15 +175,143 @@ class PipelineConfig:
     fiber_fin_silhouette_weight: float = 0.0
     fiber_fin_silhouette_radius: int = 3
     fiber_strand_support_weight: float = 0.0
+    # Unlike the legacy Fin band loss, these terms supervise the complete
+    # shell expert. The visual-hull term persists a multi-view hard gate in
+    # the checkpoint, while render spill charges the actual Fin footprint.
+    fiber_shell_visual_hull_weight: float = 0.0
+    fiber_shell_render_spill_weight: float = 0.0
+    # Hair detail needs an image-gradient objective; RGB L1 alone prefers a
+    # smooth average.  In additive-teacher mode, structured opacity outside
+    # the foreground is also charged only for the excess over the frozen
+    # residual teacher, so shell/strand cannot worsen an existing halo.
+    fiber_rgb_gradient_weight: float = 0.0
+    fiber_structured_spill_weight: float = 0.0
+    # Explicit two-sided silhouette supervision on the fully deployed render.
+    # The ordinary image mask loss is dominated by the large background and
+    # can be satisfied by lowering structured opacity.  These terms normalize
+    # both missing foreground and excess background by the hair-mask area.
+    fiber_mask_inside_coverage_weight: float = 0.0
+    fiber_mask_outside_spill_weight: float = 0.0
+    fiber_mask_inside_alpha_target: float = 0.9
+    fiber_mask_outside_margin_px: int = 0
+    # Apply the same contract to shell+strand with residual removed.  A modest
+    # alpha floor forces useful structural ownership instead of allowing the
+    # residual teacher to hide empty explicit routes.
+    fiber_structured_mask_inside_coverage_weight: float = 0.0
+    fiber_structured_mask_outside_spill_weight: float = 0.0
+    fiber_structured_mask_inside_alpha_target: float = 0.0
+    # Geometry-level coverage initialization.  A frozen residual teacher is
+    # rendered in every calibrated view, candidate normal-grown segments are
+    # intersected with the multi-view hair masks, and only roots that explain
+    # teacher under-coverage are activated as shell/strand carriers.  A count
+    # of zero preserves the legacy zero-initialized structured field exactly.
+    fiber_coverage_seed_count: int = 0
+    fiber_coverage_seed_samples: int = 7
+    fiber_coverage_seed_min_views: int = 3
+    fiber_coverage_seed_min_fraction: float = 0.25
+    fiber_coverage_seed_min_deficit: float = 0.01
+    fiber_coverage_seed_voxel_scale: float = 0.01
+    fiber_coverage_seed_visibility_cull: bool = False
+    fiber_coverage_seed_visibility_bin_px: int = 2
+    fiber_coverage_seed_visibility_depth_scale: float = 0.01
+    fiber_coverage_seed_structured_opacity: float = 0.25
+    fiber_coverage_seed_geometry_gain: float = 1.0
+    fiber_coverage_seed_shell_length_scale: float = 0.012
+    fiber_coverage_seed_strand_length_scale: float = 0.08
+    fiber_coverage_seed_orientation_init: bool = False
+    fiber_coverage_seed_orientation_normal_bias: float = 0.15
+    fiber_coverage_seed_orientation_confidence_floor: float = 0.0
+    fiber_coverage_seed_route_mass: list[float] = field(
+        default_factory=lambda: [0.15, 0.75, 0.10]
+    )
+    # Route-aware adaptive density control.  The field preallocates a
+    # surface-bound candidate pool, while this controller changes the set of
+    # *active* renderer primitives.  Residual outliers are disabled, mask
+    # deficits activate new shell/strand groups, and silhouette detail
+    # activates narrower Fin groups.  Keeping tensor shapes fixed makes the
+    # topology updates safe for Adam and checkpoint loading; zero-gated
+    # primitives are culled before rasterization.
+    fiber_topology_update_every: int = 0
+    fiber_topology_start_step: int = 0
+    fiber_topology_stop_step: int = 0
+    fiber_topology_prune_count: int = 0
+    fiber_topology_grow_count: int = 0
+    fiber_topology_densify_count: int = 0
+    fiber_topology_min_views: int = 3
+    fiber_topology_prune_max_support: float = 0.10
+    fiber_topology_prune_footprint_sigma: float = 2.0
+    fiber_topology_grow_min_support: float = 0.50
+    fiber_topology_grow_min_deficit: float = 0.015
+    fiber_topology_boundary_radius: int = 2
+    fiber_topology_detail_radius_scale: float = 0.65
+    fiber_topology_max_residual_prune_fraction: float = 0.12
+    fiber_topology_initial_structured_off: bool = False
+    # Validate every discrete topology event independently on multiple views.
+    # An event is kept only when no view regresses beyond the margin and the
+    # mean validation loss does not increase.
+    fiber_topology_validate_events: bool = False
+    fiber_topology_validation_margin: float = 0.0
+    # Auxiliary supervision on the exact fully-deployed inference geometry.
+    # This closes the continuation-schedule gap where an early checkpoint is
+    # safe while partially blended during training but spills when evaluated
+    # with geometry_blend=1.
+    fiber_deployment_render_weight: float = 0.0
+    # Hair growth is optimized on the uncollapsed analytic target rather than
+    # the residual-blended render proxy.  This closes a loophole where a
+    # zero-gain strand trivially passes every visual-hull test.
+    fiber_visual_hull_target_geometry: bool = False
+    # A shared, scalp-local orientation field and deployment constraints turn
+    # independent short cubic splats into coherent, usable strand carriers.
+    # All length values are normalized by the calibrated scene scale.
+    fiber_strand_field_weight: float = 0.0
+    fiber_strand_deployability_weight: float = 0.0
+    fiber_strand_min_deployment_gain: float = 0.0
+    fiber_strand_min_deployed_length_scale: float = 0.0
+    fiber_strand_coverage_weight: float = 0.0
+    fiber_strand_coverage_target: float = 0.0
     # Optional image-derived, confidence-weighted 2D orientation supervision.
     # This accepts the same Gabor fields used by HairGS, never 3D strand GT.
     fiber_orientation_dir: str | None = None
     fiber_orientation_weight: float = 0.0
+    # Preserve crossing/curly hair evidence with local axial orientation
+    # moments.  The second harmonic represents the usual pi-periodic tangent;
+    # the fourth harmonic distinguishes a crossing distribution from an
+    # uncertain single direction without requiring strand ground truth.
+    fiber_orientation_distribution_weight: float = 0.0
+    fiber_orientation_distribution_radius: int = 3
     # Optional effective [shell, strand, residual] routing mass assigned when
     # a residual-only checkpoint bootstraps a unified field.  This explicitly
     # decouples a conservative residual photometric scaffold from the initial
     # structural routing prior.
     fiber_bootstrap_route_mass: list[float] | None = None
+    # Optional hard source allocation [shell, strand, residual].  The
+    # residual teacher is used only as a photometric target: source Gaussians
+    # are deterministically assigned to exactly one deployable family while
+    # shell/strand geometry remains a zero-initialized, render-equivalent copy.
+    # This makes the residual fraction a true capacity ceiling rather than a
+    # soft loss that calibration can silently violate.
+    fiber_teacher_semantic_migration_mass: list[float] | None = None
+    # Residual-free alternative for clean hair/fur scaffolds.  ``hair`` adds
+    # a strand prior, ``fur`` adds a shell prior, and ``auto`` uses only local
+    # Gaussian/surface evidence.  These are log-odds priors, not fixed global
+    # quotas: the learned per-source router remains free to choose either
+    # structural family and residual is unavailable at deployment.
+    fiber_teacher_adaptive_migration_domain: str | None = None
+    fiber_teacher_adaptive_migration_bias: float = 0.65
+    # Residual-free migration can either enforce one family per source with a
+    # straight-through hard router, or learn a continuous shell/strand source
+    # distribution.  In both modes every emitted primitive remains explicitly
+    # typed and residual capacity stays disabled.
+    fiber_adaptive_migration_hard_router: bool = True
+    # Abort before training when the initial semantic migration changes the
+    # teacher render by more than this mean absolute RGB/mask tolerance.  Zero
+    # disables the runtime check (unit-level primitive checks still apply).
+    fiber_teacher_semantic_migration_tolerance: float = 0.0
+    # Keep teacher position/covariance fixed as the calibration anchor while
+    # allowing the structured student to refine shared color/opacity.  Route-
+    # specific DC color deltas and analytic length/radius/orientation remain
+    # trainable as before.
+    fiber_optimize_structured_base_appearance: bool = False
     fiber_residual_trust_weight: float = 0.0
     fiber_gradient_clip: float = 10.0
     fiber_log_every: int = 10
@@ -183,9 +349,19 @@ class PipelineConfig:
     # zero-opacity structured increments.  This is the safe mode for Fin:
     # closing a view-conditioned fin never removes teacher opacity.
     fiber_additive_teacher_mode: bool = False
+    # Fraction of structured opacity that is taken from the co-located
+    # residual source instead of being added on top.  Zero preserves the
+    # historical fully-additive teacher; one conserves the source opacity
+    # budget and lets deployed shell/strand replace a blurred residual splat.
+    fiber_teacher_opacity_transfer: float = 0.0
     fiber_teacher_nonregression_weight: float = 0.0
     fiber_teacher_nonregression_margin: float = 0.0
     fiber_teacher_nonregression_every: int = 1
+    # Evaluate several withheld cameras in the same update and aggregate
+    # their non-regression violations.  ``max`` is a robust worst-view gate;
+    # the default one-view mean preserves the historical behavior.
+    fiber_teacher_nonregression_views_per_step: int = 1
+    fiber_teacher_nonregression_reduction: str = "mean"
     # LOO evidence is signed: positive ablation damage earns route mass;
     # negative contribution (ablation improves the held-out result) is
     # directly charged against that route's current aggregate mass.
@@ -198,6 +374,12 @@ class PipelineConfig:
     fiber_visual_hull_min_views: int = 2
     fiber_visual_hull_min_fraction: float = 0.15
     fiber_visual_hull_margin_px: int = 3
+    # Mask disagreement is evidence only for front-visible samples.  Hidden
+    # shell/strand samples are unknown, not negatives; a coarse point z-buffer
+    # prevents back-side geometry from being pruned through the foreground.
+    fiber_visual_hull_occlusion_aware: bool = False
+    fiber_visual_hull_occlusion_bin_px: int = 2
+    fiber_visual_hull_occlusion_depth_scale: float = 0.01
     fiber_random_seed: int = 20260809
     fiber_route_entropy_weight: float = 1e-3
     fiber_route_prior_weight: float = 2e-2
@@ -309,6 +491,15 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_target_pixels_per_point",
         "fiber_point_sampling_mode",
         "fiber_exact_vertex_binding",
+        "fiber_binding_mode",
+        "fiber_source_mask_mode",
+        "fiber_source_mask_threshold",
+        "fiber_source_min_opacity",
+        "fiber_split_fixed_base",
+        "fiber_residual_max_scale_fraction",
+        "fiber_fixed_base_max_scale_fraction",
+        "fiber_semantic_mask_from_source",
+        "fiber_structured_foreground_only",
         "fiber_default_opacity",
         "fiber_default_opacity_reference_points",
         "fiber_binding_cache",
@@ -324,6 +515,8 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_expert_appearance_weight",
         "fiber_geometry_lr_scale",
         "fiber_structure_activation_lr_scale",
+        "fiber_structure_deployment_weight",
+        "fiber_structure_min_deployment_gain",
         "fiber_route_lr_scale",
         "fiber_initial_residual_trust",
         "fiber_initial_shell_length_scale",
@@ -336,9 +529,70 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_fin_silhouette_weight",
         "fiber_fin_silhouette_radius",
         "fiber_strand_support_weight",
+        "fiber_shell_visual_hull_weight",
+        "fiber_shell_render_spill_weight",
+        "fiber_rgb_gradient_weight",
+        "fiber_structured_spill_weight",
+        "fiber_mask_inside_coverage_weight",
+        "fiber_mask_outside_spill_weight",
+        "fiber_mask_inside_alpha_target",
+        "fiber_mask_outside_margin_px",
+        "fiber_structured_mask_inside_coverage_weight",
+        "fiber_structured_mask_outside_spill_weight",
+        "fiber_structured_mask_inside_alpha_target",
+        "fiber_coverage_seed_count",
+        "fiber_coverage_seed_samples",
+        "fiber_coverage_seed_min_views",
+        "fiber_coverage_seed_min_fraction",
+        "fiber_coverage_seed_min_deficit",
+        "fiber_coverage_seed_voxel_scale",
+        "fiber_coverage_seed_visibility_cull",
+        "fiber_coverage_seed_visibility_bin_px",
+        "fiber_coverage_seed_visibility_depth_scale",
+        "fiber_coverage_seed_structured_opacity",
+        "fiber_coverage_seed_geometry_gain",
+        "fiber_coverage_seed_shell_length_scale",
+        "fiber_coverage_seed_strand_length_scale",
+        "fiber_coverage_seed_orientation_init",
+        "fiber_coverage_seed_orientation_normal_bias",
+        "fiber_coverage_seed_orientation_confidence_floor",
+        "fiber_coverage_seed_route_mass",
+        "fiber_topology_update_every",
+        "fiber_topology_start_step",
+        "fiber_topology_stop_step",
+        "fiber_topology_prune_count",
+        "fiber_topology_grow_count",
+        "fiber_topology_densify_count",
+        "fiber_topology_min_views",
+        "fiber_topology_prune_max_support",
+        "fiber_topology_prune_footprint_sigma",
+        "fiber_topology_grow_min_support",
+        "fiber_topology_grow_min_deficit",
+        "fiber_topology_boundary_radius",
+        "fiber_topology_detail_radius_scale",
+        "fiber_topology_max_residual_prune_fraction",
+        "fiber_topology_initial_structured_off",
+        "fiber_topology_validate_events",
+        "fiber_topology_validation_margin",
+        "fiber_deployment_render_weight",
+        "fiber_visual_hull_target_geometry",
+        "fiber_strand_field_weight",
+        "fiber_strand_deployability_weight",
+        "fiber_strand_min_deployment_gain",
+        "fiber_strand_min_deployed_length_scale",
+        "fiber_strand_coverage_weight",
+        "fiber_strand_coverage_target",
         "fiber_orientation_dir",
         "fiber_orientation_weight",
+        "fiber_orientation_distribution_weight",
+        "fiber_orientation_distribution_radius",
         "fiber_bootstrap_route_mass",
+        "fiber_teacher_semantic_migration_mass",
+        "fiber_teacher_adaptive_migration_domain",
+        "fiber_teacher_adaptive_migration_bias",
+        "fiber_adaptive_migration_hard_router",
+        "fiber_teacher_semantic_migration_tolerance",
+        "fiber_optimize_structured_base_appearance",
         "fiber_residual_trust_weight",
         "fiber_gradient_clip",
         "fiber_log_every",
@@ -363,15 +617,21 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         "fiber_risk_floor",
         "fiber_freeze_residual_teacher",
         "fiber_additive_teacher_mode",
+        "fiber_teacher_opacity_transfer",
         "fiber_teacher_nonregression_weight",
         "fiber_teacher_nonregression_margin",
         "fiber_teacher_nonregression_every",
+        "fiber_teacher_nonregression_views_per_step",
+        "fiber_teacher_nonregression_reduction",
         "fiber_negative_contribution_weight",
         "fiber_visual_hull_weight",
         "fiber_visual_hull_update_every",
         "fiber_visual_hull_min_views",
         "fiber_visual_hull_min_fraction",
         "fiber_visual_hull_margin_px",
+        "fiber_visual_hull_occlusion_aware",
+        "fiber_visual_hull_occlusion_bin_px",
+        "fiber_visual_hull_occlusion_depth_scale",
         "fiber_random_seed",
         "fiber_route_entropy_weight",
         "fiber_route_prior_weight",
