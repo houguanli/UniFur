@@ -264,6 +264,47 @@ class PipelineConfig:
     fiber_hard_route_policy: str = "argmax"
     fiber_route_neighbor_k: int = 0
     fiber_route_neighbor_weight: float = 0.0
+    # Complete sparse image observations into a surface-attached structural
+    # field before photometric optimization. Duplicate source anchors become
+    # candidate slots on visual-hull-supported faces; observed axial
+    # directions are then parallel-transported over the root graph. This is
+    # initialization/completion rather than a new residual rendering route.
+    fiber_surface_propagation_enabled: bool = False
+    fiber_surface_propagation_reassign_fraction: float = 0.0
+    fiber_surface_propagation_min_views: int = 3
+    fiber_surface_propagation_min_fraction: float = 0.5
+    fiber_surface_propagation_margin_px: int = 2
+    fiber_surface_propagation_neighbor_k: int = 8
+    fiber_surface_propagation_steps: int = 12
+    fiber_surface_propagation_observation_weight: float = 0.85
+    fiber_surface_propagation_normal_bias: float = 0.10
+    fiber_surface_propagation_confidence_floor: float = 0.05
+    # Shell and strand share root-flow evidence but consume it differently.
+    # 0 keeps shells surface-normal; 1 lets them follow the propagated flow.
+    # Strands always use the completed direction field.
+    fiber_shell_propagated_direction_weight: float = 1.0
+    # Roots remain on their owning surface triangle, but can refine their
+    # barycentric location after initialization. This exposes root placement
+    # to the renderer without allowing unconstrained 3D drift.
+    fiber_root_barycentric_lr_scale: float = 0.05
+    fiber_root_barycentric_max_delta: float = 0.20
+    fiber_root_barycentric_weight: float = 0.001
+    # Hair-only scalp occupancy is reconstructed on the surface from eroded,
+    # multi-view hair masks. It gates strand births; shell/Fur remains free to
+    # cover the complete body surface.
+    fiber_scalp_occupancy_enabled: bool = False
+    fiber_scalp_occupancy_erosion_px: int = 8
+    fiber_scalp_occupancy_min_views: int = 3
+    fiber_scalp_occupancy_min_fraction: float = 0.60
+    fiber_scalp_initial_strand_fraction: float = 0.70
+    # Higher-order view-dependent appearance is route-specific. The source
+    # SH stays the teacher prior and only a bounded delta is optimized.
+    fiber_expert_sh_lr_scale: float = 0.05
+    fiber_expert_sh_weight: float = 0.0001
+    fiber_expert_sh_max_delta: float = 0.50
+    # Minimum SH degree used by the route experts.  DC-only Stage-I PLYs are
+    # zero-padded so shell/strand can still learn view-dependent appearance.
+    fiber_expert_sh_degree: int = 0
     fiber_route_dropout_probability: float = 0.0
     # Keep expert-removal pressure early, then optionally anneal it away so
     # the final hard deployment receives uninterrupted joint refinement.

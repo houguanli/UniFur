@@ -14,6 +14,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _initialize_render_preserving_semantic_migration,
     _load_residual_bootstrap_checkpoint,
     _masked_rgb_gradient_loss,
+    _parallel_transport_surface_directions,
     _residual_footprint_probe_points,
     _route_visual_hull_soft_loss,
     _resolve_fiber_point_budget,
@@ -398,6 +399,36 @@ def test_unified_routes_form_a_differentiable_partition() -> None:
     assert torch.isfinite(field.residual_trust_logits.grad).all()
     assert field.direction_local_raw.grad is not None
     assert torch.isfinite(field.direction_local_raw.grad).all()
+
+
+def test_surface_direction_propagation_fills_an_unobserved_root() -> None:
+    local = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
+    )
+    frames = torch.eye(3).repeat(3, 1, 1)
+    neighbors = torch.tensor([[1], [0], [1]], dtype=torch.long)
+    confidence = torch.tensor([1.0, 0.0, 1.0])
+    propagated = _parallel_transport_surface_directions(
+        local,
+        frames,
+        neighbors,
+        confidence,
+        steps=4,
+        observation_weight=1.0,
+    )
+    assert float(propagated[1, 0]) > 0.99
+    torch.testing.assert_close(propagated[[0, 2]], local[[0, 2]])
+
+
+def test_shell_direction_can_be_decoupled_from_propagated_strand_flow() -> None:
+    field, vertices, faces = _toy_field()
+    field.shell_propagated_direction_weight = 0.0
+    roots, _tangent, _bitangent, normal = field.surface_frame(vertices, faces)
+    shell = field.shell_target_geometry(vertices, faces, shell_samples=1)[:, 0]
+    displacement = torch.nn.functional.normalize(
+        shell - roots - field.height[:, None] * normal, dim=-1
+    )
+    torch.testing.assert_close(displacement, normal, atol=1e-5, rtol=1e-5)
 
 
 def test_fixed_base_is_not_learnable_and_does_not_expand_hair_routes() -> None:
@@ -1081,6 +1112,8 @@ def test_lightweight_fiber_renderer_backpropagates_to_geometry_and_routing() -> 
                 "residual_drift",
             "residual_trust",
             "expert_appearance",
+            "expert_sh",
+            "root_barycentric",
             "carrier_entropy",
             "carrier_prior",
             "carrier_neighbor",

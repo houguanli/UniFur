@@ -149,6 +149,9 @@ class FiberPrimitives:
     # every preallocated shell/strand sample. ``source_id`` indexes both.
     source_sh_coefficients: torch.Tensor | None = None
     source_base_color: torch.Tensor | None = None
+    # Logical source ids stay stable for routing/topology.  Route-specific SH
+    # tables use a separate compact appearance index.
+    appearance_source_id: torch.Tensor | None = None
 
 
 class FixedGaussianBase(nn.Module):
@@ -282,6 +285,7 @@ class FixedGaussianBase(nn.Module):
             semantic_foreground=zeros,
             source_sh_coefficients=self.source_sh_coefficients,
             source_base_color=self.color,
+            appearance_source_id=source_id,
         )
 
 
@@ -295,10 +299,11 @@ def append_fixed_base_primitives(
     offset only for the renderer's shared SH table.
     """
 
-    hair_source_count = (
+    hair_source_count = int(hair.route_probabilities.shape[0])
+    hair_appearance_count = (
         int(hair.source_base_color.shape[0])
         if hair.source_base_color is not None
-        else int(hair.route_probabilities.shape[0])
+        else hair_source_count
     )
 
     def required(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -313,10 +318,26 @@ def append_fixed_base_primitives(
             raise ValueError(f"Split compositor requires both {name} tensors")
         return required(left, right)
 
-    shared_sh = optional(
-        hair.source_sh_coefficients,
-        base.source_sh_coefficients,
-        "source_sh_coefficients",
+    def shared_sh_table(
+        left: torch.Tensor | None, right: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if left is None and right is None:
+            return None
+        if left is None or right is None:
+            raise ValueError(
+                "Split compositor requires both source_sh_coefficients tensors"
+            )
+        coefficient_count = max(int(left.shape[1]), int(right.shape[1]))
+
+        def pad(value: torch.Tensor) -> torch.Tensor:
+            if int(value.shape[1]) == coefficient_count:
+                return value
+            return F.pad(value, (0, 0, 0, coefficient_count - value.shape[1]))
+
+        return required(pad(left), pad(right))
+
+    shared_sh = shared_sh_table(
+        hair.source_sh_coefficients, base.source_sh_coefficients
     )
     shared_color = optional(
         hair.source_base_color, base.source_base_color, "source_base_color"
@@ -354,6 +375,19 @@ def append_fixed_base_primitives(
         ),
         source_sh_coefficients=shared_sh,
         source_base_color=shared_color,
+        appearance_source_id=required(
+            (
+                hair.appearance_source_id
+                if hair.appearance_source_id is not None
+                else hair.source_id
+            ),
+            (
+                base.appearance_source_id
+                if base.appearance_source_id is not None
+                else base.source_id
+            )
+            + hair_appearance_count,
+        ),
     )
 
 
@@ -388,6 +422,9 @@ class UnifiedFiberField(nn.Module):
         carrier_root_tip: torch.Tensor | None = None,
         initial_residual_trust: float = 0.95,
         route_neighbor_index: torch.Tensor | None = None,
+        shell_propagated_direction_weight: float = 1.0,
+        root_barycentric_max_delta: float = 0.0,
+        expert_sh_max_delta: float = 0.5,
         source_foreground_probability: torch.Tensor | None = None,
         semantic_mask_from_source: bool = False,
         structured_foreground_only: bool = False,
@@ -400,6 +437,16 @@ class UnifiedFiberField(nn.Module):
         self.positive_eps = eps
         self.register_buffer("face_index", face_index.long())
         self.register_buffer("barycentric", barycentric.float())
+        if not 0.0 <= float(root_barycentric_max_delta) <= 1.0:
+            raise ValueError("root_barycentric_max_delta must be in [0, 1]")
+        self.root_barycentric_max_delta = float(root_barycentric_max_delta)
+        self.barycentric_offset_raw = nn.Parameter(
+            torch.zeros(
+                (barycentric.shape[0], 2),
+                dtype=torch.float32,
+                device=barycentric.device,
+            )
+        )
         self.register_buffer("original_scaling", original_scaling.float())
         self.register_buffer("original_rotation", _normalize_quaternion(original_rotation.float()))
         self.has_exact_original_xyz = original_xyz is not None
@@ -413,7 +460,7 @@ class UnifiedFiberField(nn.Module):
         # rest-world residual quaternion, while the frame is reconstructed
         # deterministically from the input surface on every load.
         self.register_buffer(
-            "rest_surface_frame", rest_surface_frame.float(), persistent=False
+            "rest_surface_frame", rest_surface_frame.float(), persistent=True
         )
         self.register_buffer("initial_residual_offset_local", residual_offset_local.float().clone())
         self.register_buffer("scene_scale", torch.tensor(float(scene_scale), dtype=torch.float32))
@@ -432,6 +479,17 @@ class UnifiedFiberField(nn.Module):
             "route_neighbor_index",
             route_neighbor_index.long(),
             persistent=False,
+        )
+        self.register_buffer(
+            "strand_root_occupancy",
+            torch.ones(
+                color.shape[0], dtype=torch.float32, device=color.device
+            ),
+        )
+        if not 0.0 <= float(shell_propagated_direction_weight) <= 1.0:
+            raise ValueError("shell_propagated_direction_weight must be in [0, 1]")
+        self.shell_propagated_direction_weight = float(
+            shell_propagated_direction_weight
         )
         self.register_buffer(
             "shell_visibility_gate",
@@ -503,6 +561,24 @@ class UnifiedFiberField(nn.Module):
             source_sh_coefficients,
             persistent=False,
         )
+        if float(expert_sh_max_delta) < 0.0:
+            raise ValueError("expert_sh_max_delta must be non-negative")
+        self.expert_sh_max_delta = float(expert_sh_max_delta)
+        if source_sh_coefficients is None or source_sh_coefficients.shape[1] <= 1:
+            self.register_parameter("expert_sh_delta_raw", None)
+        else:
+            self.expert_sh_delta_raw = nn.Parameter(
+                torch.zeros(
+                    (
+                        color.shape[0],
+                        len(ROUTE_NAMES),
+                        source_sh_coefficients.shape[1] - 1,
+                        3,
+                    ),
+                    dtype=torch.float32,
+                    device=color.device,
+                )
+            )
 
         color = color.clamp(1e-4, 1.0 - 1e-4)
         opacity = opacity.clamp(1e-4, 1.0 - 1e-4)
@@ -613,6 +689,48 @@ class UnifiedFiberField(nn.Module):
         return int(self.face_index.shape[0])
 
     @property
+    def current_barycentric(self) -> torch.Tensor:
+        """Surface-constrained learnable root coordinate on the owning face."""
+
+        if self.root_barycentric_max_delta <= 0.0:
+            return self.barycentric
+        uv_delta = self.root_barycentric_max_delta * torch.tanh(
+            self.barycentric_offset_raw
+        )
+        delta = torch.cat(
+            [uv_delta, -uv_delta.sum(dim=-1, keepdim=True)], dim=-1
+        )
+        barycentric = (self.barycentric + delta).clamp_min(0.0)
+        return barycentric / barycentric.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    @property
+    def expert_sh_delta(self) -> torch.Tensor | None:
+        if self.expert_sh_delta_raw is None:
+            return None
+        return self.expert_sh_max_delta * torch.tanh(self.expert_sh_delta_raw)
+
+    def route_source_appearance(
+        self,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Return route-major SH/base-color tables indexed by route*N+source."""
+
+        base_color = (
+            self.color[None, :, :]
+            .expand(len(ROUTE_NAMES), -1, -1)
+            .reshape(-1, 3)
+        )
+        if self.source_sh_coefficients is None:
+            return None, base_color
+        source = self.source_sh_coefficients[None, :, :, :].expand(
+            len(ROUTE_NAMES), -1, -1, -1
+        )
+        delta = self.expert_sh_delta
+        if delta is not None:
+            higher = source[:, :, 1:, :] + delta.permute(1, 0, 2, 3)
+            source = torch.cat([source[:, :, :1, :], higher], dim=2)
+        return source.reshape(-1, source.shape[2], 3), base_color
+
+    @property
     def color(self) -> torch.Tensor:
         return torch.sigmoid(self.color_logits)
 
@@ -643,6 +761,26 @@ class UnifiedFiberField(nn.Module):
     @property
     def direction_local(self) -> torch.Tensor:
         return F.normalize(self.direction_local_raw, dim=-1, eps=1e-8)
+
+    def shell_direction_world(
+        self,
+        tangent: torch.Tensor,
+        bitangent: torch.Tensor,
+        normal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend propagated root flow with the surface-normal shell prior."""
+
+        propagated = F.normalize(
+            _local_to_world(self.direction_local, tangent, bitangent, normal),
+            dim=-1,
+            eps=1e-8,
+        )
+        weight = self.shell_propagated_direction_weight
+        return F.normalize(
+            weight * propagated + (1.0 - weight) * normal,
+            dim=-1,
+            eps=1e-8,
+        )
 
     @property
     def residual_trust(self) -> torch.Tensor:
@@ -848,7 +986,7 @@ class UnifiedFiberField(nn.Module):
         surface_faces: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         triangles = surface_vertices[surface_faces[self.face_index]]
-        root = (self.barycentric[..., None] * triangles).sum(dim=1)
+        root = (self.current_barycentric[..., None] * triangles).sum(dim=1)
         edge0 = triangles[:, 1] - triangles[:, 0]
         edge1 = triangles[:, 2] - triangles[:, 0]
         tangent = F.normalize(edge0, dim=-1, eps=1e-8)
@@ -940,10 +1078,7 @@ class UnifiedFiberField(nn.Module):
         root, tangent, bitangent, normal = self.surface_frame(
             surface_vertices, surface_faces
         )
-        direction = _local_to_world(
-            self.direction_local, tangent, bitangent, normal
-        )
-        direction = F.normalize(direction, dim=-1, eps=1e-8)
+        direction = self.shell_direction_world(tangent, bitangent, normal)
         shell_t = (
             torch.arange(
                 shell_samples, device=root.device, dtype=root.dtype
@@ -985,8 +1120,9 @@ class UnifiedFiberField(nn.Module):
         if not 0.0 <= float(teacher_opacity_transfer) <= 1.0:
             raise ValueError("teacher_opacity_transfer must be in [0, 1]")
         root, tangent, bitangent, normal = self.surface_frame(surface_vertices, surface_faces)
-        direction = _local_to_world(self.direction_local, tangent, bitangent, normal)
-        direction = F.normalize(direction, dim=-1, eps=1e-8)
+        shell_root_direction = self.shell_direction_world(
+            tangent, bitangent, normal
+        )
         probabilities = self.route_probabilities(
             temperature=temperature,
             forced_route=forced_route,
@@ -1016,9 +1152,13 @@ class UnifiedFiberField(nn.Module):
         ) / float(shell_samples)
         shell_origin = root + self.height[:, None] * normal
         shell_xyz = shell_origin[:, None, :] + (
-            self.shell_length[:, None, None] * shell_t[None, :, None] * direction[:, None, :]
+            self.shell_length[:, None, None]
+            * shell_t[None, :, None]
+            * shell_root_direction[:, None, :]
         )
-        shell_direction = direction[:, None, :].expand(-1, shell_samples, -1)
+        shell_direction = shell_root_direction[:, None, :].expand(
+            -1, shell_samples, -1
+        )
         shell_axis_scale = self.shell_length[:, None] / (2.0 * shell_samples)
         fin_sqrt_aspect = math.sqrt(float(fin_aspect_ratio))
         shell_scaling = torch.stack(
@@ -1323,6 +1463,17 @@ class UnifiedFiberField(nn.Module):
             ],
             dim=0,
         )
+        appearance_source_id = torch.cat(
+            [
+                source_id[:, None].expand(-1, shell_samples).reshape(-1),
+                (source_id + self.point_count)[:, None]
+                .expand(-1, strand_samples)
+                .reshape(-1),
+                source_id + 2 * self.point_count,
+            ],
+            dim=0,
+        )
+        route_source_sh, route_source_base_color = self.route_source_appearance()
         surface_normal = torch.cat(
             [
                 normal[:, None, :].expand(-1, shell_samples, -1).reshape(-1, 3),
@@ -1430,8 +1581,9 @@ class UnifiedFiberField(nn.Module):
             carrier_probabilities=expanded_carrier_probabilities,
             carrier_root_tip=carrier_root_tip,
             semantic_foreground=semantic_foreground,
-            source_sh_coefficients=self.source_sh_coefficients,
-            source_base_color=self.color,
+            source_sh_coefficients=route_source_sh,
+            source_base_color=route_source_base_color,
+            appearance_source_id=appearance_source_id,
         )
         if self.fixed_base is not None:
             primitives = append_fixed_base_primitives(
@@ -1533,11 +1685,12 @@ class UnifiedFiberField(nn.Module):
     ) -> dict[str, torch.Tensor]:
         probabilities = self.route_probabilities(temperature)
         _root, tangent, bitangent, normal = self.surface_frame(surface_vertices, surface_faces)
-        direction = F.normalize(
+        strand_direction = F.normalize(
             _local_to_world(self.direction_local, tangent, bitangent, normal),
             dim=-1,
             eps=1e-8,
         )
+        shell_direction = self.shell_direction_world(tangent, bitangent, normal)
         scale = self.scene_scale.clamp_min(1e-8)
         entropy = -torch.sum(
             probabilities * torch.log(probabilities.clamp_min(1e-8)), dim=-1
@@ -1551,7 +1704,8 @@ class UnifiedFiberField(nn.Module):
             dim=-1,
         ).mean()
         shell_normal = (
-            probabilities[:, 0] * (1.0 - torch.abs(torch.sum(direction * normal, dim=-1)))
+            probabilities[:, 0]
+            * (1.0 - torch.abs(torch.sum(shell_direction * normal, dim=-1)))
         ).mean()
         shell_length = (
             probabilities[:, 0] * (self.shell_length / (0.02 * scale)).square()
@@ -1579,6 +1733,14 @@ class UnifiedFiberField(nn.Module):
                 / scale.square()
             )
         ).mean()
+        root_barycentric = (
+            self.current_barycentric - self.barycentric
+        ).square().sum(dim=-1).mean()
+        expert_sh = (
+            probabilities.new_zeros(())
+            if self.expert_sh_delta is None
+            else self.expert_sh_delta.square().mean()
+        )
         structure_mass = probabilities[:, :2]
         structure_gain_deficit = F.relu(
             float(structure_min_deployment_gain) - self.structured_delta_gain
@@ -1607,7 +1769,7 @@ class UnifiedFiberField(nn.Module):
             + self.bend_cubic_local[:, 1:] * bitangent
         )
         tip_direction = F.normalize(
-            direction + 2.0 * bend_world + 3.0 * bend_cubic_world,
+            strand_direction + 2.0 * bend_world + 3.0 * bend_cubic_world,
             dim=-1,
             eps=1e-8,
         )
@@ -1618,7 +1780,9 @@ class UnifiedFiberField(nn.Module):
                 strand_probability[:, None] * strand_probability[neighbor]
             )
             root_dot = torch.sum(
-                direction[:, None, :] * direction[neighbor], dim=-1
+                strand_direction[:, None, :]
+                * strand_direction[neighbor],
+                dim=-1,
             ).clamp(-1.0, 1.0)
             tip_dot = torch.sum(
                 tip_direction[:, None, :] * tip_direction[neighbor], dim=-1
@@ -1635,10 +1799,14 @@ class UnifiedFiberField(nn.Module):
         # without confusing a small endpoint displacement with a collapsed
         # curve.
         arc_t = torch.linspace(
-            0.0, 1.0, 5, device=direction.device, dtype=direction.dtype
+            0.0,
+            1.0,
+            5,
+            device=strand_direction.device,
+            dtype=strand_direction.dtype,
         )
         derivative = (
-            direction[:, None, :]
+            strand_direction[:, None, :]
             + 2.0 * arc_t[None, :, None] * bend_world[:, None, :]
             + 3.0
             * arc_t[None, :, None].square()
@@ -1727,10 +1895,10 @@ class UnifiedFiberField(nn.Module):
         )
         carrier_t = self.carrier_root_tip[:, None]
         shell_carrier_xyz = shell_origin + (
-            self.shell_length[:, None] * carrier_t * direction
+            self.shell_length[:, None] * carrier_t * shell_direction
         )
         strand_carrier_xyz = shell_origin + self.strand_length[:, None] * (
-            carrier_t * direction
+            carrier_t * strand_direction
             + carrier_t.square() * bend_world
             + carrier_t.pow(3) * bend_cubic_world
         )
@@ -1786,6 +1954,8 @@ class UnifiedFiberField(nn.Module):
             "residual_drift": residual_drift,
             "residual_trust": self.residual_trust.mean(),
             "expert_appearance": self.expert_color_delta.square().mean(),
+            "expert_sh": expert_sh,
+            "root_barycentric": root_barycentric,
             "carrier_entropy": carrier_entropy,
             "carrier_prior": carrier_prior,
             "carrier_neighbor": carrier_neighbor,
@@ -1860,6 +2030,10 @@ def create_unified_fiber_field(
     default_opacity: float = 0.5,
     default_opacity_reference_points: int = 0,
     neighbor_k: int = 0,
+    shell_propagated_direction_weight: float = 1.0,
+    root_barycentric_max_delta: float = 0.0,
+    expert_sh_max_delta: float = 0.5,
+    expert_sh_degree: int = 0,
     initial_residual_trust: float = 0.95,
     initial_shell_length_scale: float | None = None,
     initial_strand_length_scale: float | None = None,
@@ -1908,6 +2082,22 @@ def create_unified_fiber_field(
         if cloud.sh_coefficients is not None
         else None
     )
+    if not 0 <= int(expert_sh_degree) <= 3:
+        raise ValueError("expert_sh_degree must be in [0, 3]")
+    target_sh_coefficients = (int(expert_sh_degree) + 1) ** 2
+    if target_sh_coefficients > 1:
+        if sh_coefficients is None:
+            sh_coefficients = np.zeros(
+                (xyz.shape[0], target_sh_coefficients, 3), dtype=np.float32
+            )
+            # Convert the RGB initialization to the native 3DGS DC basis.
+            sh_coefficients[:, 0, :] = (color - 0.5) / 0.28209479177387814
+        elif sh_coefficients.shape[1] < target_sh_coefficients:
+            padded = np.zeros(
+                (xyz.shape[0], target_sh_coefficients, 3), dtype=np.float32
+            )
+            padded[:, : sh_coefficients.shape[1], :] = sh_coefficients
+            sh_coefficients = padded
     normalized_mask_mode = str(source_mask_mode).lower()
     if normalized_mask_mode not in {"all", "foreground", "background"}:
         raise ValueError(
@@ -2180,6 +2370,9 @@ def create_unified_fiber_field(
         route_neighbor_index=torch.as_tensor(
             route_neighbor_index, dtype=torch.long, device=device
         ),
+        shell_propagated_direction_weight=shell_propagated_direction_weight,
+        root_barycentric_max_delta=root_barycentric_max_delta,
+        expert_sh_max_delta=expert_sh_max_delta,
         source_foreground_probability=tensor(foreground_probability),
         semantic_mask_from_source=semantic_mask_from_source,
         structured_foreground_only=structured_foreground_only,

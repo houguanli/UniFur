@@ -106,6 +106,12 @@ def _load_field(args, cfg, device):
                 cfg.fiber_structured_foreground_only,
             )
         ),
+        shell_propagated_direction_weight=float(
+            metadata.get(
+                "shell_propagated_direction_weight",
+                cfg.fiber_shell_propagated_direction_weight,
+            )
+        ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_faces,
         binding_cache=cfg.fiber_binding_cache,

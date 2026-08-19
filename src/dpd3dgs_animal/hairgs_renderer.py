@@ -73,7 +73,12 @@ def render_fiber_primitives_hairgs(
     source_sh = None
     sh_degree = 0
     if primitives.source_sh_coefficients is not None:
-        source_id = primitives.source_id[active_indices]
+        appearance_source_id = (
+            primitives.appearance_source_id
+            if primitives.appearance_source_id is not None
+            else primitives.source_id
+        )
+        source_id = appearance_source_id[active_indices]
         source_sh = primitives.source_sh_coefficients[source_id].to(
             device=device, dtype=dtype
         )

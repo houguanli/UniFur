@@ -195,6 +195,21 @@ def evaluate_unified_fiber_stage2(
                 cfg.fiber_structured_foreground_only,
             )
         ),
+        shell_propagated_direction_weight=float(
+            cfg.fiber_shell_propagated_direction_weight
+        ),
+        root_barycentric_max_delta=float(
+            metadata.get(
+                "root_barycentric_max_delta",
+                cfg.fiber_root_barycentric_max_delta,
+            )
+        ),
+        expert_sh_max_delta=float(
+            metadata.get("expert_sh_max_delta", cfg.fiber_expert_sh_max_delta)
+        ),
+        expert_sh_degree=int(
+            metadata.get("expert_sh_degree", cfg.fiber_expert_sh_degree)
+        ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_face_indices,
         binding_cache=(
@@ -246,6 +261,10 @@ def evaluate_unified_fiber_stage2(
         "carrier_root_tip_raw",
         "initial_carrier_probabilities",
         "initial_carrier_root_tip",
+        "rest_surface_frame",
+        "barycentric_offset_raw",
+        "strand_root_occupancy",
+        "expert_sh_delta_raw",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:

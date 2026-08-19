@@ -77,6 +77,9 @@ def _load_field(args: argparse.Namespace, motion, device: str):
         structured_foreground_only=bool(
             metadata.get("structured_foreground_only", False)
         ),
+        shell_propagated_direction_weight=float(
+            metadata.get("shell_propagated_direction_weight", 1.0)
+        ),
         scalp_face_indices=scalp_face_indices,
     )
     state = payload["state_dict"]

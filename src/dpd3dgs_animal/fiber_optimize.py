@@ -23,6 +23,7 @@ from .fiber import (
     create_unified_fiber_field,
     partition_binding_cache,
     render_fiber_primitives,
+    _surface_knn_indices,
 )
 from .scaffold import (
     DifferentiableSurfaceScaffold,
@@ -636,6 +637,14 @@ def optimize_unified_fiber_stage2(
         neighbor_k=(
             int(cfg.fiber_route_neighbor_k) if representation == "unified" else 0
         ),
+        shell_propagated_direction_weight=float(
+            cfg.fiber_shell_propagated_direction_weight
+        ),
+        root_barycentric_max_delta=float(
+            cfg.fiber_root_barycentric_max_delta
+        ),
+        expert_sh_max_delta=float(cfg.fiber_expert_sh_max_delta),
+        expert_sh_degree=int(cfg.fiber_expert_sh_degree),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         initial_shell_length_scale=cfg.fiber_initial_shell_length_scale,
         initial_strand_length_scale=cfg.fiber_initial_strand_length_scale,
@@ -889,6 +898,7 @@ def optimize_unified_fiber_stage2(
         and (
             int(cfg.fiber_visual_hull_update_every) > 0
             or int(cfg.fiber_coverage_seed_count) > 0
+            or bool(cfg.fiber_surface_propagation_enabled)
         )
     ):
         with torch.no_grad():
@@ -899,6 +909,45 @@ def optimize_unified_fiber_stage2(
                 visual_hull_vertices.append(vertices)
 
     _validate_route_training_config(cfg)
+    surface_propagation_report: dict[str, object] | None = None
+    if representation == "unified" and bool(
+        cfg.fiber_surface_propagation_enabled
+    ):
+        surface_propagation_report = _initialize_intrinsic_surface_propagation(
+            field,
+            motion.surface_faces,
+            visual_hull_vertices[: len(frame_indices)],
+            cameras,
+            frame_indices,
+            ground_truth,
+            orientation_targets,
+            cfg,
+            out_dir,
+        )
+        if teacher_field is not None:
+            first_frame = frame_indices[0]
+            propagation_equivalence = (
+                _measure_semantic_migration_render_equivalence(
+                    field,
+                    teacher_field,
+                    visual_hull_vertices[0],
+                    motion.surface_faces,
+                    cameras[first_frame],
+                    cfg,
+                    renderer_name,
+                )
+            )
+            (out_dir / "surface_propagation_equivalence.json").write_text(
+                json.dumps(propagation_equivalence, indent=2), encoding="utf-8"
+            )
+            tolerance = float(cfg.fiber_teacher_semantic_migration_tolerance)
+            if tolerance > 0.0 and float(
+                propagation_equivalence["maximum_mean_absolute_error"]
+            ) > tolerance:
+                raise RuntimeError(
+                    "Surface propagation changed the render-preserving "
+                    "initialization beyond tolerance"
+                )
     coverage_seed_report: dict[str, object] | None = None
     coverage_seed_teacher_masks: dict[int, torch.Tensor] = {}
     if representation == "unified" and int(cfg.fiber_coverage_seed_count) > 0:
@@ -1731,6 +1780,9 @@ def optimize_unified_fiber_stage2(
                     + cfg.fiber_residual_trust_weight * regularizers["residual_trust"]
                     + cfg.fiber_expert_appearance_weight
                     * regularizers["expert_appearance"]
+                    + cfg.fiber_expert_sh_weight * regularizers["expert_sh"]
+                    + cfg.fiber_root_barycentric_weight
+                    * regularizers["root_barycentric"]
                     + cfg.fiber_carrier_entropy_weight
                     * regularizers["carrier_entropy"]
                     + cfg.fiber_carrier_prior_weight
@@ -2005,6 +2057,14 @@ def optimize_unified_fiber_stage2(
                 "scene_scale": float(field.scene_scale.detach().cpu()),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
+                "shell_propagated_direction_weight": float(
+                    cfg.fiber_shell_propagated_direction_weight
+                ),
+                "root_barycentric_max_delta": float(
+                    cfg.fiber_root_barycentric_max_delta
+                ),
+                "expert_sh_max_delta": float(cfg.fiber_expert_sh_max_delta),
+                "expert_sh_degree": int(cfg.fiber_expert_sh_degree),
                 "frame_indices": frame_indices,
                 "calibration_frame_indices": calibration_frame_indices,
                 "render_size": [width, height],
@@ -2020,6 +2080,7 @@ def optimize_unified_fiber_stage2(
                 "fixed_residual_teacher": bool(cfg.fiber_freeze_residual_teacher),
                 "visual_hull_update_count": visual_hull_update_count,
                 "coverage_seed_report": coverage_seed_report,
+                "surface_propagation_report": surface_propagation_report,
                 "semantic_migration_report": semantic_migration_report,
                 "semantic_migration_equivalence": (
                     semantic_migration_equivalence
@@ -2120,6 +2181,7 @@ def optimize_unified_fiber_stage2(
         "visual_hull_update_count": visual_hull_update_count,
         "final_visual_hull_report": latest_visual_hull_report,
         "coverage_seed_report": coverage_seed_report,
+        "surface_propagation_report": surface_propagation_report,
         "semantic_migration_report": semantic_migration_report,
         "semantic_migration_equivalence": semantic_migration_equivalence,
         "final_structure_deployment": (
@@ -2415,6 +2477,12 @@ def _optimizer_parameter_groups(
             )
 
     add_group("appearance", appearance_parameters, cfg.fiber_appearance_lr_scale)
+    if field.expert_sh_delta_raw is not None:
+        add_group(
+            "route_sh",
+            [field.expert_sh_delta_raw],
+            cfg.fiber_expert_sh_lr_scale,
+        )
     residual_geometry = [
         field.residual_offset_local,
         field.residual_log_scale_delta,
@@ -2437,6 +2505,11 @@ def _optimizer_parameter_groups(
             field.carrier_root_tip_raw,
         ],
         cfg.fiber_geometry_lr_scale,
+    )
+    add_group(
+        "surface_roots",
+        [field.barycentric_offset_raw],
+        cfg.fiber_root_barycentric_lr_scale,
     )
     add_group(
         "structure_activation",
@@ -2817,6 +2890,30 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError(
             "fiber_visual_hull_occlusion_depth_scale must be non-negative"
         )
+    for name in (
+        "fiber_root_barycentric_lr_scale",
+        "fiber_root_barycentric_weight",
+        "fiber_expert_sh_lr_scale",
+        "fiber_expert_sh_weight",
+        "fiber_expert_sh_max_delta",
+    ):
+        if float(getattr(cfg, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    if not 0 <= int(cfg.fiber_expert_sh_degree) <= 3:
+        raise ValueError("fiber_expert_sh_degree must be in [0, 3]")
+    if not 0.0 <= float(cfg.fiber_root_barycentric_max_delta) <= 1.0:
+        raise ValueError("fiber_root_barycentric_max_delta must be in [0, 1]")
+    if int(cfg.fiber_scalp_occupancy_erosion_px) < 0:
+        raise ValueError("fiber_scalp_occupancy_erosion_px must be non-negative")
+    if int(cfg.fiber_scalp_occupancy_min_views) <= 0:
+        raise ValueError("fiber_scalp_occupancy_min_views must be positive")
+    for name in (
+        "fiber_scalp_occupancy_min_fraction",
+        "fiber_scalp_initial_strand_fraction",
+    ):
+        value = float(getattr(cfg, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
     for name in (
         "fiber_carrier_entropy_weight",
         "fiber_carrier_prior_weight",
@@ -3266,6 +3363,11 @@ def _apply_adaptive_topology_scores(
     grow_eligible = (
         foreground_eligible
         & (active[:, strand_index] <= 0.5)
+        & (
+            (field.strand_root_occupancy > 0.5)
+            if bool(cfg.fiber_scalp_occupancy_enabled)
+            else torch.ones(field.point_count, dtype=torch.bool, device=device)
+        )
         & (visible_views >= min_views)
         & (structured_support >= float(cfg.fiber_topology_grow_min_support))
         & (deficit_score >= float(cfg.fiber_topology_grow_min_deficit))
@@ -3295,7 +3397,10 @@ def _apply_adaptive_topology_scores(
     with torch.no_grad():
         active[pruned, residual_index] = 0.0
         if grown.numel() > 0:
-            if cfg.fiber_teacher_semantic_migration_mass is not None:
+            if (
+                cfg.fiber_teacher_semantic_migration_mass is not None
+                or bool(cfg.fiber_scalp_occupancy_enabled)
+            ):
                 # A validated grow event transfers ownership instead of
                 # creating a residual escape hatch or double-owned source.
                 active[grown] = 0.0
@@ -3313,7 +3418,10 @@ def _apply_adaptive_topology_scores(
                 torch.as_tensor(
                     (
                         [0.0, 1.0, 0.0]
-                        if cfg.fiber_teacher_semantic_migration_mass is not None
+                        if (
+                            cfg.fiber_teacher_semantic_migration_mass is not None
+                            or bool(cfg.fiber_scalp_occupancy_enabled)
+                        )
                         else cfg.fiber_coverage_seed_route_mass
                     ),
                     device=device,
@@ -3745,6 +3853,447 @@ def _write_coverage_seed_ply(
             )
 
 
+def _parallel_transport_surface_directions(
+    local_direction: torch.Tensor,
+    surface_frame: torch.Tensor,
+    neighbor_index: torch.Tensor,
+    observation_confidence: torch.Tensor,
+    *,
+    steps: int,
+    observation_weight: float,
+) -> torch.Tensor:
+    """Diffuse an axial direction field using normal-aligned transport."""
+
+    if neighbor_index.numel() == 0 or int(steps) <= 0:
+        return F.normalize(local_direction, dim=-1, eps=1e-8)
+    direction = F.normalize(local_direction, dim=-1, eps=1e-8)
+    observed = direction.clone()
+    frame = surface_frame
+    normal = frame[:, :, 2]
+    confidence = observation_confidence.reshape(-1).clamp(0.0, 1.0)
+    anchor = (float(observation_weight) * confidence).clamp(0.0, 1.0)
+
+    for _ in range(int(steps)):
+        neighbor_frame = frame[neighbor_index]
+        neighbor_local = direction[neighbor_index]
+        neighbor_world = torch.einsum(
+            "nkij,nkj->nki", neighbor_frame, neighbor_local
+        )
+        source_normal = normal[neighbor_index]
+        target_normal = normal[:, None, :].expand_as(source_normal)
+        axis = torch.linalg.cross(source_normal, target_normal, dim=-1)
+        sin_angle = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
+        cos_angle = torch.sum(
+            source_normal * target_normal, dim=-1, keepdim=True
+        ).clamp(-1.0, 1.0)
+        axis_unit = axis / sin_angle.clamp_min(1e-8)
+        rotated = (
+            neighbor_world * cos_angle
+            + torch.linalg.cross(axis_unit, neighbor_world, dim=-1) * sin_angle
+            + axis_unit
+            * torch.sum(axis_unit * neighbor_world, dim=-1, keepdim=True)
+            * (1.0 - cos_angle)
+        )
+        transported_world = torch.where(
+            (sin_angle > 1e-6).expand_as(rotated), rotated, neighbor_world
+        )
+        transported_local = torch.einsum(
+            "nij,nki->nkj", frame, transported_world
+        )
+        sign = torch.sum(
+            transported_local * direction[:, None, :], dim=-1, keepdim=True
+        )
+        transported_local = torch.where(
+            sign < 0.0, -transported_local, transported_local
+        )
+        smooth = F.normalize(transported_local.mean(dim=1), dim=-1, eps=1e-8)
+        direction = F.normalize(
+            anchor[:, None] * observed + (1.0 - anchor[:, None]) * smooth,
+            dim=-1,
+            eps=1e-8,
+        )
+    return direction
+
+
+def _erode_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Differentiation-free binary/soft erosion preserving input rank."""
+
+    radius = max(int(radius), 0)
+    if radius == 0:
+        return mask
+    original_shape = mask.shape
+    image = mask
+    if image.ndim == 2:
+        image = image[None, None]
+    elif image.ndim == 3:
+        image = image[None]
+    elif image.ndim != 4:
+        raise ValueError("mask must be HxW, CxHxW or NxCxHxW")
+    eroded = -F.max_pool2d(
+        -image,
+        kernel_size=2 * radius + 1,
+        stride=1,
+        padding=radius,
+    )
+    return eroded.reshape(original_shape)
+
+
+def _initialize_intrinsic_surface_propagation(
+    field: UnifiedFiberField,
+    surface_faces: torch.Tensor,
+    surface_vertices_per_view: list[torch.Tensor],
+    cameras: list,
+    frame_indices: list[int],
+    targets: list[dict[str, torch.Tensor]],
+    orientation_targets: list[dict[str, torch.Tensor] | None],
+    cfg: PipelineConfig,
+    out_dir: Path,
+) -> dict[str, object]:
+    """Redistribute duplicate roots and complete their surface direction field."""
+
+    if not surface_vertices_per_view or not (
+        len(surface_vertices_per_view) == len(frame_indices) == len(targets)
+    ):
+        raise ValueError("Surface propagation views and targets must align")
+    fraction = float(cfg.fiber_surface_propagation_reassign_fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("surface propagation reassign fraction must be in [0, 1]")
+    if not 0.0 <= float(cfg.fiber_surface_propagation_min_fraction) <= 1.0:
+        raise ValueError("surface propagation min fraction must be in [0, 1]")
+
+    device = field.route_logits.device
+    dtype = field.route_logits.dtype
+    faces = surface_faces.to(device=device)
+    rest_vertices = surface_vertices_per_view[0].to(device=device)
+    with torch.no_grad():
+        old_root, old_tangent, old_bitangent, old_normal = field.surface_frame(
+            rest_vertices, faces
+        )
+        old_world = field.transported_residual_xyz(
+            old_root, old_tangent, old_bitangent, old_normal
+        ).detach()
+        anchor_quantized = torch.round(field.barycentric[:, :2] * 1023.0).long()
+        anchor_key = (
+            field.face_index * (1024 * 1024)
+            + anchor_quantized[:, 0] * 1024
+            + anchor_quantized[:, 1]
+        )
+        order = torch.argsort(anchor_key)
+        duplicate_sorted = torch.zeros_like(order, dtype=torch.bool)
+        duplicate_sorted[1:] = anchor_key[order[1:]] == anchor_key[order[:-1]]
+        duplicate_slots = order[duplicate_sorted]
+        requested = min(
+            int(round(fraction * field.point_count)), int(duplicate_slots.numel())
+        )
+
+        face_count = int(faces.shape[0])
+        valid_views = torch.zeros(face_count, device=device, dtype=dtype)
+        support_sum = torch.zeros_like(valid_views)
+        scalp_support_sum = torch.zeros_like(valid_views)
+        candidate_roots_rest = rest_vertices[faces].mean(dim=1)
+        for vertices, frame_index, target in zip(
+            surface_vertices_per_view, frame_indices, targets, strict=True
+        ):
+            candidate_roots = vertices.to(device=device)[faces].mean(dim=1)
+            support, valid = _sample_mask_at_world_points(
+                candidate_roots,
+                cameras[frame_index],
+                target["mask"].to(device=device, dtype=dtype),
+                margin_px=int(cfg.fiber_surface_propagation_margin_px),
+            )
+            visible = valid & _front_surface_visibility(
+                candidate_roots,
+                cameras[frame_index],
+                bin_px=max(int(cfg.fiber_coverage_seed_visibility_bin_px), 1),
+                depth_tolerance=float(field.scene_scale.cpu())
+                * float(cfg.fiber_coverage_seed_visibility_depth_scale),
+            )
+            visible_float = visible.to(dtype)
+            valid_views.add_(visible_float)
+            support_sum.add_(support * visible_float)
+            if bool(cfg.fiber_scalp_occupancy_enabled):
+                scalp_mask = _erode_mask(
+                    target["mask"].to(device=device, dtype=dtype),
+                    int(cfg.fiber_scalp_occupancy_erosion_px),
+                )
+                scalp_support, _ = _sample_mask_at_world_points(
+                    candidate_roots,
+                    cameras[frame_index],
+                    scalp_mask,
+                    margin_px=int(cfg.fiber_surface_propagation_margin_px),
+                )
+                scalp_support_sum.add_(scalp_support * visible_float)
+
+        support_fraction = support_sum / valid_views.clamp_min(1.0)
+        eligible_mask = (
+            valid_views >= float(cfg.fiber_surface_propagation_min_views)
+        ) & (
+            support_fraction
+            >= float(cfg.fiber_surface_propagation_min_fraction)
+        )
+        eligible = torch.nonzero(eligible_mask, as_tuple=False).reshape(-1)
+        scalp_support_fraction = scalp_support_sum / valid_views.clamp_min(1.0)
+        scalp_face_eligible = (
+            valid_views >= float(cfg.fiber_scalp_occupancy_min_views)
+        ) & (
+            scalp_support_fraction
+            >= float(cfg.fiber_scalp_occupancy_min_fraction)
+        )
+        selected_count = requested if int(eligible.numel()) > 0 else 0
+
+        selected_faces = torch.empty(0, device=device, dtype=torch.long)
+        selected_barycentric = torch.empty(
+            (0, 3), device=device, dtype=dtype
+        )
+        selected_slots = torch.empty(0, device=device, dtype=torch.long)
+        if selected_count > 0:
+            eligible_cpu = eligible.detach().cpu().numpy()
+            roots_cpu = candidate_roots_rest[eligible].detach().cpu().numpy()
+            scores_cpu = support_fraction[eligible].detach().cpu().numpy()
+            scene_min = roots_cpu.min(axis=0, keepdims=True)
+            scene_extent = np.maximum(
+                roots_cpu.max(axis=0, keepdims=True) - scene_min, 1e-8
+            )
+            bins = max(int(round((2 * selected_count) ** (1.0 / 3.0))), 1)
+            quantized = np.minimum(
+                ((roots_cpu - scene_min) / scene_extent * bins).astype(np.int64),
+                bins - 1,
+            )
+            voxel_code = (
+                quantized[:, 0]
+                + bins * quantized[:, 1]
+                + bins * bins * quantized[:, 2]
+            )
+            ranked = np.argsort(-scores_cpu, kind="stable")
+            face_order: list[int] = []
+            occupied: set[int] = set()
+            for local_index in ranked.tolist():
+                code = int(voxel_code[local_index])
+                if code in occupied:
+                    continue
+                occupied.add(code)
+                face_order.append(local_index)
+            if len(face_order) < len(ranked):
+                chosen_set = set(face_order)
+                face_order.extend(
+                    index
+                    for index in ranked.tolist()
+                    if index not in chosen_set
+                )
+            face_order_array = np.asarray(face_order, dtype=np.int64)
+            repeated_local = face_order_array[
+                np.arange(selected_count, dtype=np.int64)
+                % len(face_order_array)
+            ]
+            selected_faces = torch.as_tensor(
+                eligible_cpu[repeated_local],
+                device=device,
+                dtype=torch.long,
+            )
+            layer = torch.arange(selected_count, device=device) // max(
+                len(face_order_array), 1
+            )
+            face_phase = selected_faces.to(dtype)
+            u = torch.frac(
+                (layer.to(dtype) + 1.0) * 0.754877666
+                + face_phase * 0.000000119
+            )
+            v = torch.frac(
+                (layer.to(dtype) + 1.0) * 0.569840296
+                + face_phase * 0.000000173
+            )
+            sqrt_u = torch.sqrt(u.clamp(1e-4, 1.0 - 1e-4))
+            selected_barycentric = torch.stack(
+                [
+                    1.0 - sqrt_u,
+                    sqrt_u * (1.0 - v),
+                    sqrt_u * v,
+                ],
+                dim=-1,
+            )
+            # Keep roots away from exact triangle edges, where tiny camera or
+            # mesh perturbations can change the owning face discontinuously.
+            selected_barycentric = (
+                0.90 * selected_barycentric + 0.10 / 3.0
+            )
+            slot_order = torch.argsort(field.opacity[duplicate_slots])
+            selected_slots = duplicate_slots[slot_order[:selected_count]]
+            field.face_index[selected_slots] = selected_faces
+            field.barycentric[selected_slots] = selected_barycentric
+
+            new_root, tangent, bitangent, normal = field.surface_frame(
+                rest_vertices, faces
+            )
+            offset = old_world - new_root
+            new_local_offset = torch.stack(
+                [
+                    torch.sum(offset * tangent, dim=-1),
+                    torch.sum(offset * bitangent, dim=-1),
+                    torch.sum(offset * normal, dim=-1),
+                ],
+                dim=-1,
+            )
+            field.residual_offset_local[selected_slots] = new_local_offset[
+                selected_slots
+            ]
+            field.initial_residual_offset_local[selected_slots] = new_local_offset[
+                selected_slots
+            ]
+            new_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+            field.rest_surface_frame[selected_slots] = new_frame[selected_slots]
+        else:
+            new_root, tangent, bitangent, normal = field.surface_frame(
+                rest_vertices, faces
+            )
+            new_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+
+        neighbor_k = max(int(cfg.fiber_surface_propagation_neighbor_k), 0)
+        neighbor_numpy = _surface_knn_indices(
+            new_root.detach().cpu().numpy(), neighbor_k
+        )
+        field.route_neighbor_index = torch.as_tensor(
+            neighbor_numpy, device=device, dtype=torch.long
+        )
+
+        if orientation_targets and any(
+            target is not None for target in orientation_targets
+        ):
+            local_direction, _world_direction, confidence, orientation_report = (
+                _estimate_multiview_orientation_directions(
+                    new_root,
+                    tangent,
+                    bitangent,
+                    normal,
+                    cameras,
+                    frame_indices,
+                    targets,
+                    orientation_targets,
+                    min_views=int(cfg.fiber_surface_propagation_min_views),
+                    normal_bias=float(
+                        cfg.fiber_surface_propagation_normal_bias
+                    ),
+                    confidence_floor=float(
+                        cfg.fiber_surface_propagation_confidence_floor
+                    ),
+                )
+            )
+        else:
+            local_direction = field.direction_local.detach().clone()
+            confidence = torch.zeros(field.point_count, device=device, dtype=dtype)
+            orientation_report = {"source": "source_gaussian_axes"}
+        retained = torch.ones(field.point_count, device=device, dtype=torch.bool)
+        retained[selected_slots] = False
+        confidence[retained] = torch.maximum(
+            confidence[retained], torch.full_like(confidence[retained], 0.15)
+        )
+        propagated = _parallel_transport_surface_directions(
+            local_direction,
+            new_frame,
+            field.route_neighbor_index,
+            confidence,
+            steps=int(cfg.fiber_surface_propagation_steps),
+            observation_weight=float(
+                cfg.fiber_surface_propagation_observation_weight
+            ),
+        )
+        field.direction_local_raw.copy_(propagated)
+
+        scalp_source_count = 0
+        scalp_initial_strand_count = 0
+        if bool(cfg.fiber_scalp_occupancy_enabled):
+            source_scalp = scalp_face_eligible[field.face_index]
+            field.strand_root_occupancy.copy_(source_scalp.to(dtype))
+            scalp_sources = torch.nonzero(source_scalp, as_tuple=False).reshape(-1)
+            initial_fraction = float(cfg.fiber_scalp_initial_strand_fraction)
+            initial_count = min(
+                int(round(initial_fraction * int(scalp_sources.numel()))),
+                int(scalp_sources.numel()),
+            )
+            initial_strands = torch.empty(0, device=device, dtype=torch.long)
+            if initial_count > 0:
+                # Prefer confident, anisotropic and opaque sources for the
+                # initial strand set. Remaining scalp slots form a genuine
+                # growth reserve that topology can activate from deficits.
+                scale = torch.sort(field.original_scaling, dim=-1).values
+                anisotropy = torch.log(
+                    (scale[:, -1] / scale[:, 0].clamp_min(1e-12)).clamp_min(1.0)
+                )
+                score = (
+                    scalp_support_fraction[field.face_index]
+                    + 0.20 * _rank_unit_interval(anisotropy)
+                    + 0.10 * field.opacity.detach()
+                )
+                ranked = scalp_sources[
+                    torch.argsort(score[scalp_sources], descending=True)
+                ]
+                initial_strands = ranked[:initial_count]
+            shell_index = ROUTE_NAMES.index("shell")
+            strand_index = ROUTE_NAMES.index("strand")
+            residual_index = ROUTE_NAMES.index("residual")
+            residual_active = field.route_active_gate[:, residual_index].clone()
+            field.route_active_gate[:, shell_index] = 1.0
+            field.route_active_gate[:, strand_index] = 0.0
+            field.route_active_gate[initial_strands, shell_index] = 0.0
+            field.route_active_gate[initial_strands, strand_index] = 1.0
+            field.route_active_gate[:, residual_index] = residual_active
+            field.initial_route_probabilities.copy_(
+                field.route_probabilities(
+                    temperature=float(cfg.fiber_final_temperature)
+                ).clamp_min(1e-6)
+            )
+            scalp_source_count = int(scalp_sources.numel())
+            scalp_initial_strand_count = int(initial_strands.numel())
+
+        final_quantized = torch.round(field.barycentric[:, :2] * 1023.0).long()
+        unique_after = torch.unique(
+            field.face_index * (1024 * 1024)
+            + final_quantized[:, 0] * 1024
+            + final_quantized[:, 1]
+        ).numel()
+        selected_roots = new_root[selected_slots]
+        if selected_count > 0:
+            _write_coverage_seed_ply(
+                out_dir / "surface_propagation_roots.ply",
+                selected_roots,
+                support_fraction[selected_faces],
+                field.strand_length[selected_slots],
+            )
+        report: dict[str, object] = {
+            "requested_fraction": fraction,
+            "duplicate_slot_count": int(duplicate_slots.numel()),
+            "requested_count": requested,
+            "eligible_face_count": int(eligible.numel()),
+            "reassigned_count": selected_count,
+            "unique_anchor_count_before": int(torch.unique(anchor_key).numel()),
+            "unique_anchor_count_after": int(unique_after),
+            "mean_selected_support": float(
+                support_fraction[selected_faces].mean().cpu()
+            )
+            if selected_count > 0
+            else 0.0,
+            "direction_observed_fraction": float((confidence > 0.0).float().mean().cpu()),
+            "direction_confidence_mean": float(confidence.mean().cpu()),
+            "direction_steps": int(cfg.fiber_surface_propagation_steps),
+            "neighbor_k": neighbor_k,
+            "shell_propagated_direction_weight": float(
+                cfg.fiber_shell_propagated_direction_weight
+            ),
+            "scalp_occupancy_enabled": bool(
+                cfg.fiber_scalp_occupancy_enabled
+            ),
+            "scalp_face_count": int(scalp_face_eligible.sum().cpu()),
+            "scalp_source_count": scalp_source_count,
+            "scalp_initial_strand_count": scalp_initial_strand_count,
+            "scalp_erosion_px": int(cfg.fiber_scalp_occupancy_erosion_px),
+            "orientation": orientation_report,
+            "diagnostic_ply": str(out_dir / "surface_propagation_roots.ply"),
+        }
+        (out_dir / "surface_propagation_report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        return report
+
+
 def _estimate_multiview_orientation_directions(
     roots: torch.Tensor,
     tangent: torch.Tensor,
@@ -3758,7 +4307,7 @@ def _estimate_multiview_orientation_directions(
     min_views: int,
     normal_bias: float,
     confidence_floor: float,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     """Triangulate sign-invariant 3D hair directions from 2D orientations.
 
     For each calibrated view, the image orientation contributes one linear
@@ -3897,7 +4446,13 @@ def _estimate_multiview_orientation_directions(
         "normal_bias": float(normal_bias),
         "confidence_floor": float(confidence_floor),
     }
-    return local_direction, world_direction, report
+    confidence = torch.where(
+        reliable,
+        eigengap.clamp(0.0, 1.0)
+        * (weight_sum / max(len(frame_indices), 1)).clamp(0.0, 1.0),
+        torch.zeros_like(eigengap),
+    )
+    return local_direction, world_direction, confidence, report
 
 
 def _initialize_multiview_coverage_seeds(
@@ -3968,6 +4523,7 @@ def _initialize_multiview_coverage_seeds(
             (
                 candidate_local_direction,
                 candidate_world_direction,
+                _candidate_direction_confidence,
                 orientation_report,
             ) = _estimate_multiview_orientation_directions(
                 roots,
@@ -4982,6 +5538,14 @@ def _save_training_checkpoint(
                 "frame_indices": list(frame_indices),
                 "shell_samples": cfg.fiber_shell_samples,
                 "strand_samples": cfg.fiber_strand_samples,
+                "shell_propagated_direction_weight": float(
+                    cfg.fiber_shell_propagated_direction_weight
+                ),
+                "root_barycentric_max_delta": float(
+                    cfg.fiber_root_barycentric_max_delta
+                ),
+                "expert_sh_max_delta": float(cfg.fiber_expert_sh_max_delta),
+                "expert_sh_degree": int(cfg.fiber_expert_sh_degree),
                 "representation": cfg.fiber_representation,
                 "hard_route_policy": cfg.fiber_hard_route_policy,
             },
