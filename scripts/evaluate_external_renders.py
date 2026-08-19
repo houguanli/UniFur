@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from dpd3dgs_animal.fiber_evaluate import _ImageQualityMetrics, _frame_metrics
-from dpd3dgs_animal.optimize import _load_gt_frame_torch
+from dpd3dgs_animal.scaffold import _load_gt_frame_torch
 
 
 METRIC_KEYS = (

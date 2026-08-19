@@ -24,8 +24,8 @@ from dpd3dgs_animal.fiber import (
     simulation_asset_summary,
 )
 from dpd3dgs_animal.fiber_optimize import _render
-from dpd3dgs_animal.optimize import (
-    DifferentiableSkeletonTetModel,
+from dpd3dgs_animal.scaffold import (
+    DifferentiableSurfaceScaffold,
     _frame_paths,
     _resolve_device,
     _resolve_render_size,
@@ -63,7 +63,7 @@ def _load_field(args, cfg, device):
     exact_vertex_binding = bool(
         metadata.get("exact_vertex_binding", cfg.fiber_exact_vertex_binding)
     )
-    motion = DifferentiableSkeletonTetModel(args.stage1_npz, device=device)
+    motion = DifferentiableSurfaceScaffold(args.stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     with np.load(args.stage1_npz, allow_pickle=False) as stage1:
         scalp_faces = (

@@ -24,8 +24,8 @@ from .fiber import (
     partition_binding_cache,
     render_fiber_primitives,
 )
-from .optimize import (
-    DifferentiableSkeletonTetModel,
+from .scaffold import (
+    DifferentiableSurfaceScaffold,
     _frame_paths,
     _load_gt_frame_torch,
     _resolve_device,
@@ -600,7 +600,7 @@ def optimize_unified_fiber_stage2(
         (width, height),
         explicit_max_points=max_points,
     )
-    motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
+    motion = DifferentiableSurfaceScaffold(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     with np.load(stage1_npz, allow_pickle=False) as stage1_payload:
         scalp_face_indices = (
@@ -5132,7 +5132,7 @@ def _save_field_npz(field: UnifiedFiberField, path: Path) -> None:
 
 def _save_previews(
     field: UnifiedFiberField,
-    motion: DifferentiableSkeletonTetModel,
+    motion: DifferentiableSurfaceScaffold,
     cameras,
     motion_indices,
     out_dir: Path,

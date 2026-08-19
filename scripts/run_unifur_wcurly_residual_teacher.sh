@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODE="${1:-train}"
+MODE="${1:-all}"
 PROJECT_ROOT="${PROJECT_ROOT:-/home/aoki/Differentiable_Physical_Driven_3DGS_for_monocular_Animal_Motion_Reconstruction}"
 DATA_ROOT="${DATA_ROOT:-/mnt/f/fur_hair_unified_data}"
 CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
 PROTOCOL_ROOT="${DATA_ROOT}/benchmarks/hairgs_wcurly_static_protocol"
 RESULT_ROOT="${DATA_ROOT}/benchmarks/hairgs_wcurly_static_results"
 CLEAN_STAGE1_ROOT="${CLEAN_STAGE1_ROOT:-${RESULT_ROOT}/clean_hair_stage1_visualhull80k_mvcal_v11b_adaptivegamut_projection}"
-CLEAN_PLY="${CLEAN_PLY:-${CLEAN_STAGE1_ROOT}/point_cloud/iteration_1/point_cloud.ply}"
 FIXED_BASE_PLY="${FIXED_BASE_PLY:-${RESULT_ROOT}/hairgs_official_train12_30k30k/point_cloud/iteration_30000/point_cloud.ply}"
 STAGE1="${PROTOCOL_ROOT}/static_head_stage1.npz"
-CONFIG="${UNIFIED_CONFIG:-${PROJECT_ROOT}/configs/fiber_hairgs_wcurly_cleanhair_adaptive_v14_mvdistribution_6k.yaml}"
-RESIDUAL_CHECKPOINT="${RESIDUAL_CHECKPOINT:-${RESULT_ROOT}/cleanhair_v11_residual_teacher_4k_v1/unified_fiber_field.pt}"
-OUT="${UNIFIED_OUT:-${RESULT_ROOT}/cleanhair_v14_mvdistribution_occlusion_6k_v1}"
+CONFIG="${PROJECT_ROOT}/configs/fiber_hairgs_wcurly_cleanhair_residual_teacher_4k.yaml"
+OUT_DIR="${CLEAN_RESIDUAL_OUT:-${RESULT_ROOT}/cleanhair_v11_residual_teacher_4k_v1}"
 PROTOCOL_ID="hairgs-wcurly-static-train12-test4-v2-camera-fixed"
 
 run_cli() {
@@ -22,66 +20,61 @@ run_cli() {
     dpd3dgs_animal.cli --config "${CONFIG}" "$@"
 }
 
-validate_inputs() {
-  local path
-  for path in "${CLEAN_PLY}" "${FIXED_BASE_PLY}" "${STAGE1}" \
-    "${RESIDUAL_CHECKPOINT}" "${CONFIG}"; do
-    [[ -f "${path}" ]] || {
-      echo "Missing required input: ${path}" >&2
-      return 2
-    }
-  done
+resolve_clean_ply() {
+  [[ -f "${CLEAN_STAGE1_ROOT}/clean_stage1_metadata.json" ]] || {
+    echo "Clean Stage-1 is not complete: ${CLEAN_STAGE1_ROOT}" >&2
+    return 2
+  }
+  local point_cloud
+  point_cloud="$(find "${CLEAN_STAGE1_ROOT}/point_cloud" -mindepth 2 -maxdepth 2 \
+    -type f -name point_cloud.ply -print | sort -V | tail -1)"
+  [[ -f "${point_cloud}" ]] || {
+    echo "No calibrated clean Stage-1 PLY found" >&2
+    return 2
+  }
+  printf '%s\n' "${point_cloud}"
 }
 
-train() {
-  validate_inputs
-  [[ -f "${OUT}/unified_fiber_field.pt" ]] && return
+train_teacher() {
+  [[ -f "${OUT_DIR}/unified_fiber_field.pt" ]] && return
+  local clean_ply
+  clean_ply="$(resolve_clean_ply)"
   run_cli fiber-stage2 \
     --stage1-npz "${STAGE1}" \
-    --gaussian-ply "${CLEAN_PLY}" \
+    --gaussian-ply "${clean_ply}" \
     --fixed-base-gaussian-ply "${FIXED_BASE_PLY}" \
     --frame-dir "${PROTOCOL_ROOT}/train/images" \
     --camera-manifest "${PROTOCOL_ROOT}/train/camera_manifest.json" \
-    --out-dir "${OUT}" --renderer hairgs \
-    --residual-bootstrap-checkpoint "${RESIDUAL_CHECKPOINT}" \
+    --out-dir "${OUT_DIR}" --renderer hairgs \
     --render-width 1000 --render-height 1000
 }
 
 evaluate_split() {
-  local route="$1" split="$2"
-  local output="${RESULT_ROOT}/$(basename "${OUT}")_eval_${route}_${split}"
-  local ground_truth="${PROTOCOL_ROOT}/${split}/images"
+  local split="$1" clean_ply output ground_truth
+  clean_ply="$(resolve_clean_ply)"
+  output="${RESULT_ROOT}/$(basename "${OUT_DIR}")_eval_residual_${split}"
+  ground_truth="${PROTOCOL_ROOT}/${split}/images"
   [[ -f "${output}/external_evaluation/evaluation.json" ]] && return
   run_cli fiber-eval \
     --stage1-npz "${STAGE1}" \
-    --gaussian-ply "${CLEAN_PLY}" \
+    --gaussian-ply "${clean_ply}" \
     --fixed-base-gaussian-ply "${FIXED_BASE_PLY}" \
-    --checkpoint "${OUT}/unified_fiber_field.pt" \
+    --checkpoint "${OUT_DIR}/unified_fiber_field.pt" \
     --frame-dir "${ground_truth}" \
     --camera-manifest "${PROTOCOL_ROOT}/${split}/camera_manifest.json" \
-    --out-dir "${output}" --renderer hairgs --route-mode "${route}" \
+    --out-dir "${output}" --renderer hairgs --route-mode residual \
     --render-width 1000 --render-height 1000 --export-external-renders
   "${CONDA_BIN}" run --no-capture-output -n dpd3dgs-animal python \
     "${PROJECT_ROOT}/scripts/evaluate_external_renders.py" \
     --render-manifest "${output}/external_render_manifest.json" \
     --ground-truth-dir "${ground_truth}" \
     --output-dir "${output}/external_evaluation" \
-    --method "UniFur v14 multi-view distribution (${route})" \
+    --method "Residual-only clean-hair teacher" \
     --protocol-id "${PROTOCOL_ID}" --device cuda
 }
 
-evaluate() {
-  train
-  local split route
-  for split in train test; do
-    for route in hard soft; do
-      evaluate_split "${route}" "${split}"
-    done
-  done
-}
-
 case "${MODE}" in
-  train) train ;;
-  evaluate|all) evaluate ;;
+  train) train_teacher ;;
+  evaluate|all) train_teacher; evaluate_split train; evaluate_split test ;;
   *) echo "Usage: $0 [train|evaluate|all]" >&2; exit 2 ;;
 esac

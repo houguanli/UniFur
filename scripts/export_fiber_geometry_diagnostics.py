@@ -20,8 +20,8 @@ from PIL import Image, ImageDraw
 from dpd3dgs_animal.fiber import create_unified_fiber_field
 from dpd3dgs_animal.fiber_optimize import _sample_mask_at_world_points
 from dpd3dgs_animal.observations import resolve_observations
-from dpd3dgs_animal.optimize import (
-    DifferentiableSkeletonTetModel,
+from dpd3dgs_animal.scaffold import (
+    DifferentiableSurfaceScaffold,
     _frame_paths,
     _load_gt_frame_torch,
     _resolve_device,
@@ -257,7 +257,7 @@ def main() -> None:
     projections_dir = out_dir / "projections"
     projections_dir.mkdir(parents=True, exist_ok=True)
     device = _resolve_device(args.device)
-    motion = DifferentiableSkeletonTetModel(args.stage1_npz, device=device)
+    motion = DifferentiableSurfaceScaffold(args.stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     field, metadata = _load_field(args, motion, device)
     frame_paths = _frame_paths(args.frame_dir)

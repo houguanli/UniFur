@@ -1,6 +1,5 @@
-# Model checkpoints are stored locally and documented separately.
+# Model checkpoints are stored outside Git.
 checkpoints/*
-!checkpoints/README.md
 *.pt
 *.pth
 *.ckpt
@@ -9,10 +8,8 @@ checkpoints/*
 # Generated samples, renders, meshes, logs, and optimization states.
 output/
 
-# Local datasets and vendored upstream implementations are intentionally not
-# redistributed. Setup scripts document their separate installation.
+# Local datasets and upstream implementations are not redistributed.
 samples/*
-!samples/README.md
 third_party/*
 !third_party/README.md
 
@@ -28,7 +25,7 @@ __pycache__/
 .venv/
 venv/
 
-# Native and simulator build output
+# Native build output
 build/
 cmake-build-*/
 CMakeFiles/
@@ -45,7 +42,7 @@ CMakeCache.txt
 .DS_Store
 Thumbs.db
 
-# Temporary TetGen files
+# Temporary geometry/interchange files
 _skipped.*
 *.node
 *.face

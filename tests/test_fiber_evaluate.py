@@ -5,7 +5,7 @@ import torch
 
 from dpd3dgs_animal.fiber_evaluate import _frame_metrics, _select_frame_indices
 from dpd3dgs_animal.fiber_route_audit import _route_contribution
-from dpd3dgs_animal.optimize import differentiable_render_loss
+from dpd3dgs_animal.scaffold import differentiable_render_loss
 
 
 def test_select_frame_indices_honors_holdout_slice() -> None:

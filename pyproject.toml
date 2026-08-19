@@ -3,9 +3,10 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dpd3dgs-animal"
-version = "0.1.0"
-description = "Differentiable physical driven 3DGS integration for monocular animal motion reconstruction."
+name = "unifur"
+version = "0.4.0"
+description = "Unified shell/strand Gaussian reconstruction for fur and hair."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
@@ -20,15 +21,15 @@ dependencies = [
   "tqdm",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
-dpd3dgs-animal = "dpd3dgs_animal.cli:main"
+unifur = "dpd3dgs_animal.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-# External baseline runners may legitimately end in ``_test.py``.  They are
-# executable adapters, not unit-test modules, and often import dependencies
-# from the baseline's own environment.  Keep collection scoped to our tests.
 testpaths = ["tests"]
 python_files = ["test_*.py"]

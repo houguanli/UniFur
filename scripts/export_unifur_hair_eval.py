@@ -24,7 +24,7 @@ from dpd3dgs_animal.fiber import (
     _quaternion_to_matrix_torch,
     create_unified_fiber_field,
 )
-from dpd3dgs_animal.optimize import DifferentiableSkeletonTetModel
+from dpd3dgs_animal.scaffold import DifferentiableSurfaceScaffold
 
 
 def _arguments() -> argparse.Namespace:
@@ -58,7 +58,7 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_field(args: argparse.Namespace, motion: DifferentiableSkeletonTetModel):
+def _load_field(args: argparse.Namespace, motion: DifferentiableSurfaceScaffold):
     payload = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     metadata = payload.get("metadata", {})
     with np.load(args.stage1_npz, allow_pickle=False) as stage1:
@@ -222,7 +222,7 @@ def main() -> int:
         raise ValueError("Spacing must be positive and minimum length non-negative")
     if args.dense_samples < 2 or args.max_segments < 1:
         raise ValueError("Need at least two dense samples and one output segment")
-    motion = DifferentiableSkeletonTetModel(args.stage1_npz, device=args.device)
+    motion = DifferentiableSurfaceScaffold(args.stage1_npz, device=args.device)
     field, metadata = _load_field(args, motion)
     vertices = motion.rest_surface_vertices
     faces = motion.surface_faces

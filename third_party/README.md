@@ -1,40 +1,14 @@
-# Vendored Upstream Projects
+# Optional Upstream Repositories
 
-This directory contains local source snapshots used by the integrated
-pipeline.
+UniFur does not vendor external research code. Clone only the baseline or prior
+required by the experiment into this ignored directory:
 
-## SAM 3D Objects
+- HairGS
+- GaussianHaircut
+- NeuralFur
+- Im2Haircut
+- SAM 3D Objects (optional single-view initialization prior)
 
-- Directory: `sam3d_objects`
-- Upstream: `https://github.com/facebookresearch/sam-3d-objects`
-- Original license and README are preserved in the copied directory.
-- Includes the `sam3d_objects` package and notebook inference helpers.
-- Checkpoints are stored separately under `checkpoints/sam3d`.
-
-## MocapAnything
-
-- Directory: `mocap_anything`
-- Includes inference, preprocessing, model, dataset, utility, config, and
-  TripoSG source used by the inference-only package.
-- The RMBG source retains its original Bria attribution notice.
-- Checkpoints are stored separately under `checkpoints/mocap_anything`.
-- The Cat example is stored under `samples/mocap_anything/zoo`.
-
-## ElasticSimulator
-
-- Directory: `elastic_simulator`
-- Upstream: `https://github.com/Raining00/ElasticSimulator`
-- Includes source, Python helpers, and initialized `glm`, `glfw`, and `tetgen`
-  extern directories.
-- Generated build output is not copied.
-
-## Integration Changes
-
-The integrated package:
-
-- uses vendored source paths by default;
-- centralizes checkpoint paths;
-- calls ElasticSimulator tetrahedralization and boundary extraction;
-- adds a PyTorch differentiable skeleton-to-render path;
-- adds topology-local Gaussian surface displacement binding;
-- adds native-resolution rendering and RMBG-based video preprocessing.
+Keep each upstream repository's original license and install it in its own
+environment. See `EXTERNAL_BASELINES.md` and the corresponding setup script for
+the expected local path and protocol.

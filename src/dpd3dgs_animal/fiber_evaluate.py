@@ -17,8 +17,8 @@ from .fiber import (
     partition_binding_cache,
 )
 from .fiber_optimize import _render
-from .optimize import (
-    DifferentiableSkeletonTetModel,
+from .scaffold import (
+    DifferentiableSurfaceScaffold,
     _frame_paths,
     _load_gt_frame_torch,
     _resolve_device,
@@ -163,7 +163,7 @@ def evaluate_unified_fiber_stage2(
         raise ValueError(
             f"Unknown checkpoint hard-route policy {hard_route_policy!r}"
         )
-    motion = DifferentiableSkeletonTetModel(stage1_npz, device=device)
+    motion = DifferentiableSurfaceScaffold(stage1_npz, device=device)
     motion.joints.requires_grad_(False)
     with np.load(stage1_npz, allow_pickle=False) as stage1_payload:
         scalp_face_indices = (

@@ -1,49 +1,63 @@
-# External baseline execution protocol
+# External baselines and optional dependencies
 
-No internal method is ranked until an external row has a complete render
-manifest and has been passed through `scripts/evaluate_external_renders.py`.
-That evaluator calls the same `_frame_metrics`, `_ImageQualityMetrics`, and
-RGBA ground-truth loader as the internal pipeline.
+External repositories, model weights and datasets are installed outside this
+Git repository. Runner paths can be overridden with environment variables.
 
-## Dynamic same-case leaderboard
+## Maintained comparison methods
 
-Protocol: `DFA-Panda-Walk-32f-v1`.
+| Method | Task | Protocol in this repository | Runner |
+|---|---|---|---|
+| NeuralFur | static animal fur | Panda 28 fit / 8 held-out views, 480×270 | `scripts/run_neuralfur_static_benchmark.sh` |
+| HairGS | static multiview hair | WCurly 12 fit / 4 held-out views and person0 odd/even views | `scripts/evaluate_hairgs_wcurly_strict.sh`, `scripts/run_hairgs_person0_same_case.sh` |
+| GaussianHaircut | static multiview hair | person0 odd/even held-out protocol | `scripts/run_gaussian_haircut_person0.sh` |
+| Im2Haircut | single-image hair | separate person0 frontal-input protocol | `scripts/run_im2haircut_person0_structure.sh` |
 
-- Fit: `train_mono_t32`, view 1, frames 0--31, 32 RGBA observations.
-- Test: `test_novel_v8_t32`, views 0/5/10/15/20/25/30/35,
-  frames 0--31, 256 observations.
-- Evaluation resolution: 512 x 288.
-- Held-out RGB/alpha is read only by the common evaluator, never by a renderer.
+Single-image results are not mixed with multiview tables. Hair and fur are
+reported separately. Every numerical comparison must be generated from the
+same held-out images with `scripts/evaluate_external_renders.py`.
 
-| Method | Upstream core | DFA boundary | Command | Expected evaluation |
-| --- | --- | --- | --- | --- |
-| Vidu4D | Official Stage-2 (21 rounds) + Stage-3 GS (61 rounds) | Official Vidu preprocessing; relative held-out cameras transferred into learned monocular scale | `scripts/run_vidu4d_dfa_benchmark.sh all` | `.../baselines/vidu4d/dfa-panda-walk-mono/heldout_v8_t32_evaluation/evaluation.json` |
-| GART-DFA adapter | Official `GaussianTemplateModel`, optimizer, losses, densification, renderer | Public DFA mesh, 93-way weights and exact matrix LBS replace licensed D-SMAL/BITE assets | `scripts/run_gart_dfa_benchmark.sh all` | `.../baselines/gart/dfa-panda-walk-mono/heldout_v8_t32_evaluation/evaluation.json` |
-| 4D-Animal-DFA adapter | Official SMAL/free-offset/ARAP/chamfer/pose-MLP/Duplex-shell pipeline | DFA RGB/alpha/time/calibration loader; unavailable CSE, PartGLEE, BITE and BootsTAP terms disabled and reported | `scripts/run_fourdanimal_dfa_benchmark.sh all` | `.../baselines/4d-animal/dfa-panda-walk-mono/heldout_v8_t32_evaluation/evaluation.json` |
+## Local layout used by the runners
 
-GART is a template-conditioned row because the frozen internal DFA setting also
-uses the known DFA template/skeleton.  4D-Animal-DFA is an explicit adapter row,
-not a claim that the authors released a DFA configuration.
+```text
+/home/aoki/fur_hair_baselines/
+  hair-gs/
+  gaussian_haircut/
+  NeuralFur/
+  Im2Haircut/
 
-## Static NeuralFur-aligned leaderboard
+/mnt/f/fur_hair_unified_data/
+  benchmarks/
+  hair-gs_parsed_official16_1000/
+```
 
-NeuralFur is a static calibrated-multiview method and is not placed on the
-dynamic DFA numeric leaderboard.  Its Panda reconstruction is evaluated on the
-official 28-fit/8-held-out-camera split, using the same common metric code.
-The available 24 GB run uses 4k guide strands and is labeled
-`NeuralFur-4k memory-scaled`; the authors' downloadable 3.24 GB release contains
-strand/mesh exports but no renderable training checkpoint.
+The exact directory names can differ when the corresponding `*_ROOT` or
+`DATA_ROOT` variable is supplied.
 
-Command: `scripts/run_neuralfur_static_benchmark.sh all`.
+## HairGS renderer
 
-Expected evaluation:
-`.../neuralfur_4k_full20k_lrbody_r512/heldout_v8_evaluation_r512/evaluation.json`.
+UniFur supports a pure Torch diagnostic renderer and the native HairGS CUDA
+rasterizer. The reported WCurly and person0 runs use the HairGS environment:
 
-## Required completion gates
+```bash
+PYTHONPATH="$PWD/src" conda run -n hair-gs \
+  python -m dpd3dgs_animal.cli --config CONFIG fiber-stage2 ...
+```
 
-1. Training exits successfully and writes its checkpoint/training report.
-2. The renderer writes every expected float render and a manifest with
-   `status: complete` (256 dynamic observations or 8 static observations).
-3. The common evaluator writes `evaluation.json` and comparison previews.
-4. Only then may the row enter the aggregate table beside Unified and
-   Residual-only.
+## Optional SAM3D single-view prior
+
+The SAM3D alignment scripts are retained only as an experimental initialization
+path for single-view reconstruction. SAM3D is not required by the calibrated
+multiview WCurly or Panda protocols and is not part of the public UniFur CLI.
+
+Relevant scripts:
+
+- `scripts/run_sam3d_prior.py`
+- `scripts/align_sam3d_prior_to_manifest.py`
+- `scripts/export_sam3d_alignment_bundle.py`
+
+## Reproducibility rule
+
+An external run enters a comparison table only when its render manifest records
+the same dataset, held-out view/frame identifiers, image resolution and camera
+protocol as UniFur. Configuration adapters and capacity reductions must be
+named explicitly; they are not official upstream results.
