@@ -193,6 +193,16 @@ class PipelineConfig:
     # mean validation loss does not increase.
     fiber_topology_validate_events: bool = False
     fiber_topology_validation_margin: float = 0.0
+    # Incremental births admit a nearly render-equivalent strand capacity and
+    # let ordinary optimization unfold it afterwards.  This replaces the old
+    # full-length, full-opacity route switch that was rejected as one batch.
+    fiber_topology_incremental_birth: bool = False
+    fiber_topology_birth_strand_mass: float = 0.01
+    fiber_topology_birth_initial_delta: float = 0.0
+    # A deficit birth is a surface-anchored 3D proposal.  Require the same
+    # proposed strand volume to intersect missing foreground in several
+    # calibrated views rather than reacting to an isolated image-space hole.
+    fiber_topology_deficit_min_views: int = 2
     # Auxiliary supervision on the exact fully-deployed inference geometry.
     # This closes the continuation-schedule gap where an early checkpoint is
     # safe while partially blended during training but spills when evaluated
@@ -297,6 +307,15 @@ class PipelineConfig:
     fiber_scalp_occupancy_min_views: int = 3
     fiber_scalp_occupancy_min_fraction: float = 0.60
     fiber_scalp_initial_strand_fraction: float = 0.70
+    # Decouple Hair root placement from the lumpy Stage-I GS density by
+    # rebinding strand sources to an area-stratified supported scalp atlas.
+    fiber_scalp_atlas_enabled: bool = False
+    fiber_scalp_atlas_min_roots_per_face: int = 1
+    # Image orientation is axial: d and -d are observationally equivalent.
+    # Resolve polarity before curves are deployed or visual-hull culled.
+    fiber_strand_outward_sign_enabled: bool = False
+    fiber_strand_outward_anchor_threshold: float = 0.05
+    fiber_strand_sign_sync_steps: int = 8
     # Higher-order view-dependent appearance is route-specific. The source
     # SH stays the teacher prior and only a bounded delta is optimized.
     fiber_expert_sh_lr_scale: float = 0.05

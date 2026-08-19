@@ -2907,6 +2907,20 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_scalp_occupancy_erosion_px must be non-negative")
     if int(cfg.fiber_scalp_occupancy_min_views) <= 0:
         raise ValueError("fiber_scalp_occupancy_min_views must be positive")
+    if int(cfg.fiber_scalp_atlas_min_roots_per_face) < 0:
+        raise ValueError("fiber_scalp_atlas_min_roots_per_face must be non-negative")
+    if float(cfg.fiber_strand_outward_anchor_threshold) < 0.0:
+        raise ValueError(
+            "fiber_strand_outward_anchor_threshold must be non-negative"
+        )
+    if int(cfg.fiber_strand_sign_sync_steps) < 0:
+        raise ValueError("fiber_strand_sign_sync_steps must be non-negative")
+    if not 0.0 <= float(cfg.fiber_topology_birth_strand_mass) <= 1.0:
+        raise ValueError("fiber_topology_birth_strand_mass must be in [0, 1]")
+    if not 0.0 <= float(cfg.fiber_topology_birth_initial_delta) <= 1.0:
+        raise ValueError("fiber_topology_birth_initial_delta must be in [0, 1]")
+    if int(cfg.fiber_topology_deficit_min_views) <= 0:
+        raise ValueError("fiber_topology_deficit_min_views must be positive")
     for name in (
         "fiber_scalp_occupancy_min_fraction",
         "fiber_scalp_initial_strand_fraction",
@@ -3300,6 +3314,7 @@ def _apply_adaptive_topology_scores(
     deficit_score: torch.Tensor,
     boundary_score: torch.Tensor,
     step: int,
+    deficit_views: torch.Tensor | None = None,
     clear_optimizer_state: bool = True,
 ) -> dict[str, object]:
     """Apply explicit prune/grow/densify decisions from multi-view scores.
@@ -3320,6 +3335,10 @@ def _apply_adaptive_topology_scores(
     ):
         if tuple(value.shape) != (field.point_count,):
             raise ValueError(f"{name} must contain one value per source")
+    if deficit_views is None:
+        deficit_views = visible_views
+    if tuple(deficit_views.shape) != (field.point_count,):
+        raise ValueError("deficit_views must contain one value per source")
     active = field.route_active_gate
     shell_index = ROUTE_NAMES.index("shell")
     strand_index = ROUTE_NAMES.index("strand")
@@ -3369,6 +3388,7 @@ def _apply_adaptive_topology_scores(
             else torch.ones(field.point_count, dtype=torch.bool, device=device)
         )
         & (visible_views >= min_views)
+        & (deficit_views >= float(cfg.fiber_topology_deficit_min_views))
         & (structured_support >= float(cfg.fiber_topology_grow_min_support))
         & (deficit_score >= float(cfg.fiber_topology_grow_min_deficit))
     )
@@ -3397,7 +3417,14 @@ def _apply_adaptive_topology_scores(
     with torch.no_grad():
         active[pruned, residual_index] = 0.0
         if grown.numel() > 0:
-            if (
+            incremental_birth = bool(cfg.fiber_topology_incremental_birth)
+            if incremental_birth:
+                # Keep the existing shell and admit an almost-zero-mass
+                # strand at the atlas location.  Optical-thickness splitting
+                # makes this nearly render-equivalent; subsequent gradient
+                # steps decide whether the strand should unfold and gain mass.
+                active[grown, strand_index] = 1.0
+            elif (
                 cfg.fiber_teacher_semantic_migration_mass is not None
                 or bool(cfg.fiber_scalp_occupancy_enabled)
             ):
@@ -3408,15 +3435,28 @@ def _apply_adaptive_topology_scores(
             else:
                 active[grown, shell_index] = 1.0
                 active[grown, strand_index] = 1.0
-            field.structured_delta_raw[grown] = 1.0
-            field.structured_opacity_raw[grown] = max(
-                float(cfg.fiber_coverage_seed_structured_opacity), 0.25
-            )
+            if incremental_birth:
+                field.structured_delta_raw[grown, strand_index] = float(
+                    cfg.fiber_topology_birth_initial_delta
+                )
+                field.structured_opacity_raw[grown, strand_index] = 0.0
+            else:
+                field.structured_delta_raw[grown] = 1.0
+                field.structured_opacity_raw[grown] = max(
+                    float(cfg.fiber_coverage_seed_structured_opacity), 0.25
+                )
             _set_effective_route_mass(
                 field,
                 grown,
                 torch.as_tensor(
                     (
+                        [
+                            1.0 - float(cfg.fiber_topology_birth_strand_mass),
+                            float(cfg.fiber_topology_birth_strand_mass),
+                            0.0,
+                        ]
+                        if incremental_birth
+                        else
                         [0.0, 1.0, 0.0]
                         if (
                             cfg.fiber_teacher_semantic_migration_mass is not None
@@ -3513,6 +3553,7 @@ def _apply_adaptive_topology_scores(
         "densified_count": int(densified.numel()),
         "pruned_support": selected_stats(residual_support, pruned),
         "grown_deficit": selected_stats(deficit_score, grown),
+        "grown_deficit_views": selected_stats(deficit_views, grown),
         "densified_boundary": selected_stats(boundary_score, densified),
         "topology": topology,
     }
@@ -3550,14 +3591,22 @@ def _restore_topology_state(
 
 
 def _topology_event_is_accepted(
-    before: list[float], after: list[float], margin: float
+    before: list[float],
+    after: list[float],
+    margin: float,
+    *,
+    allow_neutral: bool = False,
 ) -> tuple[bool, list[float]]:
     """Require per-view non-regression, not merely a better mean loss."""
 
     if len(before) != len(after) or len(before) < 2:
         raise ValueError("Topology validation requires at least two aligned views")
     deltas = [float(post - pre) for pre, post in zip(before, after, strict=True)]
-    accepted = max(deltas) <= float(margin) and float(np.mean(deltas)) <= 0.0
+    mean_limit = 0.25 * float(margin) if allow_neutral else 0.0
+    accepted = (
+        max(deltas) <= float(margin)
+        and float(np.mean(deltas)) <= mean_limit
+    )
     return accepted, deltas
 
 
@@ -3636,6 +3685,7 @@ def _update_adaptive_topology(
     residual_support_sum = torch.zeros_like(visible_views)
     structured_support_sum = torch.zeros_like(visible_views)
     deficit_sum = torch.zeros_like(visible_views)
+    deficit_views = torch.zeros_like(visible_views)
     boundary_sum = torch.zeros_like(visible_views)
     structured_valid_views = torch.zeros_like(visible_views)
     scene_scale = float(field.scene_scale.detach().cpu())
@@ -3732,6 +3782,15 @@ def _update_adaptive_topology(
             structured_valid_views.add_(source_observed_float)
             structured_support_sum.add_(source_support * source_observed_float)
             deficit_sum.add_(source_deficit * source_observed_float)
+            deficit_views.add_(
+                (
+                    source_observed
+                    & (
+                        source_deficit
+                        >= float(cfg.fiber_topology_grow_min_deficit)
+                    )
+                ).to(dtype)
+            )
             boundary_sum.add_(source_boundary * source_observed_float)
 
     residual_support = residual_support_sum / visible_views.clamp_min(1.0)
@@ -3765,6 +3824,7 @@ def _update_adaptive_topology(
         deficit_score=deficit_score,
         boundary_score=boundary_score,
         step=step,
+        deficit_views=deficit_views,
         clear_optimizer_state=not validate_event,
     )
     if not validate_event:
@@ -3786,6 +3846,7 @@ def _update_adaptive_topology(
         before_losses,
         after_losses,
         float(cfg.fiber_topology_validation_margin),
+        allow_neutral=bool(cfg.fiber_topology_incremental_birth),
     )
     if accepted:
         _clear_adam_rows(
@@ -3913,6 +3974,129 @@ def _parallel_transport_surface_directions(
             eps=1e-8,
         )
     return direction
+
+
+def _area_stratified_surface_samples(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    eligible_faces: torch.Tensor,
+    count: int,
+    *,
+    min_roots_per_face: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int]]:
+    """Sample an area-balanced scalp atlas independently of source GS density."""
+
+    count = max(int(count), 0)
+    min_roots_per_face = max(int(min_roots_per_face), 0)
+    eligible_faces = eligible_faces.reshape(-1).long()
+    if count == 0 or eligible_faces.numel() == 0:
+        empty_faces = torch.empty(0, dtype=torch.long, device=faces.device)
+        empty_barycentric = torch.empty(
+            (0, 3), dtype=vertices.dtype, device=vertices.device
+        )
+        return empty_faces, empty_barycentric, {
+            "atlas_face_count": int(eligible_faces.numel()),
+            "atlas_root_count": 0,
+            "atlas_covered_face_count": 0,
+            "atlas_max_roots_per_face": 0,
+        }
+
+    triangles = vertices[faces[eligible_faces]]
+    areas = 0.5 * torch.linalg.vector_norm(
+        torch.linalg.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+            dim=-1,
+        ),
+        dim=-1,
+    )
+    areas = areas.clamp_min(torch.finfo(vertices.dtype).eps)
+    face_count = int(eligible_faces.numel())
+    guaranteed = min(count, face_count * min_roots_per_face)
+    if guaranteed > 0:
+        layers = torch.arange(guaranteed, device=faces.device) // face_count
+        base_local = torch.arange(guaranteed, device=faces.device) % face_count
+        # Rotate successive layers so neighboring faces do not receive the
+        # same low-discrepancy phase.
+        base_local = (base_local + layers * 2654435761) % face_count
+    else:
+        base_local = torch.empty(0, dtype=torch.long, device=faces.device)
+    remaining = count - guaranteed
+    if remaining > 0:
+        cdf = torch.cumsum(areas / areas.sum(), dim=0)
+        quantiles = (
+            torch.arange(remaining, device=faces.device, dtype=vertices.dtype)
+            + 0.5
+        ) / float(remaining)
+        extra_local = torch.searchsorted(cdf, quantiles).clamp_max(face_count - 1)
+        local = torch.cat([base_local.long(), extra_local.long()])
+    else:
+        local = base_local.long()
+    selected_faces = eligible_faces[local]
+
+    sample_index = torch.arange(count, device=faces.device, dtype=vertices.dtype)
+    face_phase = selected_faces.to(vertices.dtype)
+    u = torch.frac((sample_index + 1.0) * 0.754877666 + face_phase * 1.19e-7)
+    v = torch.frac((sample_index + 1.0) * 0.569840296 + face_phase * 1.73e-7)
+    sqrt_u = torch.sqrt(u.clamp(1e-4, 1.0 - 1e-4))
+    barycentric = torch.stack(
+        [1.0 - sqrt_u, sqrt_u * (1.0 - v), sqrt_u * v], dim=-1
+    )
+    barycentric = 0.90 * barycentric + 0.10 / 3.0
+    unique_faces, counts = torch.unique(selected_faces, return_counts=True)
+    report: dict[str, float | int] = {
+        "atlas_face_count": face_count,
+        "atlas_root_count": count,
+        "atlas_covered_face_count": int(unique_faces.numel()),
+        "atlas_max_roots_per_face": int(counts.max().item()),
+        "atlas_mean_roots_per_covered_face": float(counts.float().mean().item()),
+    }
+    return selected_faces, barycentric, report
+
+
+def _synchronize_outward_direction_signs(
+    local_direction: torch.Tensor,
+    surface_frame: torch.Tensor,
+    neighbor_index: torch.Tensor,
+    *,
+    anchor_threshold: float,
+    steps: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Resolve the axial d/-d ambiguity with outward anchors and continuity."""
+
+    direction = F.normalize(local_direction, dim=-1, eps=1e-8)
+    before_inward = float((direction[:, 2] < 0.0).float().mean().cpu())
+    original_normal = direction[:, 2].abs()
+    direction = torch.where(
+        (direction[:, 2] < 0.0)[:, None], -direction, direction
+    )
+    anchored = original_normal >= max(float(anchor_threshold), 0.0)
+    if neighbor_index.numel() > 0:
+        for _ in range(max(int(steps), 0)):
+            world = torch.einsum("nij,nj->ni", surface_frame, direction)
+            neighbor_world = world[neighbor_index]
+            consensus = F.normalize(neighbor_world.mean(dim=1), dim=-1, eps=1e-8)
+            flip = (torch.sum(world * consensus, dim=-1) < 0.0) & (~anchored)
+            direction = torch.where(flip[:, None], -direction, direction)
+    # Never allow the continuity solve to turn a root decisively inward.
+    direction = torch.where(
+        (direction[:, 2] < 0.0)[:, None], -direction, direction
+    )
+    direction = F.normalize(direction, dim=-1, eps=1e-8)
+    world = torch.einsum("nij,nj->ni", surface_frame, direction)
+    if neighbor_index.numel() > 0:
+        neighbor_dot = torch.sum(world[:, None] * world[neighbor_index], dim=-1)
+        disagreement = float((neighbor_dot < 0.0).float().mean().cpu())
+    else:
+        disagreement = 0.0
+    return direction, {
+        "inward_fraction_before": before_inward,
+        "inward_fraction_after": float(
+            (direction[:, 2] < 0.0).float().mean().cpu()
+        ),
+        "neighbor_sign_disagreement_after": disagreement,
+        "outward_anchor_fraction": float(anchored.float().mean().cpu()),
+    }
 
 
 def _erode_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -4200,6 +4384,8 @@ def _initialize_intrinsic_surface_propagation(
 
         scalp_source_count = 0
         scalp_initial_strand_count = 0
+        scalp_atlas_report: dict[str, float | int] = {}
+        strand_sign_report: dict[str, float] = {}
         if bool(cfg.fiber_scalp_occupancy_enabled):
             source_scalp = scalp_face_eligible[field.face_index]
             field.strand_root_occupancy.copy_(source_scalp.to(dtype))
@@ -4227,6 +4413,177 @@ def _initialize_intrinsic_surface_propagation(
                     torch.argsort(score[scalp_sources], descending=True)
                 ]
                 initial_strands = ranked[:initial_count]
+            if bool(cfg.fiber_scalp_atlas_enabled) and scalp_sources.numel() > 0:
+                atlas_old_world = field.transported_residual_xyz(
+                    new_root, tangent, bitangent, normal
+                ).detach()
+                old_direction_world = torch.einsum(
+                    "nij,nj->ni", new_frame, field.direction_local.detach()
+                )
+                scalp_faces = torch.nonzero(
+                    scalp_face_eligible, as_tuple=False
+                ).reshape(-1)
+                active_atlas_faces, active_atlas_barycentric, active_report = (
+                    _area_stratified_surface_samples(
+                        rest_vertices, faces, scalp_faces, initial_count,
+                        min_roots_per_face=int(
+                            cfg.fiber_scalp_atlas_min_roots_per_face
+                        ),
+                    )
+                )
+                reserve_count = int(scalp_sources.numel()) - initial_count
+                reserve_atlas_faces, reserve_atlas_barycentric, reserve_report = (
+                    _area_stratified_surface_samples(
+                        rest_vertices, faces, scalp_faces, reserve_count,
+                        min_roots_per_face=int(
+                            cfg.fiber_scalp_atlas_min_roots_per_face
+                        ),
+                    )
+                )
+                atlas_faces = torch.cat(
+                    [active_atlas_faces, reserve_atlas_faces], dim=0
+                )
+                atlas_barycentric = torch.cat(
+                    [active_atlas_barycentric, reserve_atlas_barycentric], dim=0
+                )
+                _, combined_counts = torch.unique(
+                    atlas_faces, return_counts=True
+                )
+                scalp_atlas_report = {
+                    "atlas_face_count": int(scalp_faces.numel()),
+                    "atlas_root_count": int(atlas_faces.numel()),
+                    "atlas_covered_face_count": int(
+                        torch.unique(atlas_faces).numel()
+                    ),
+                    "atlas_max_roots_per_face": int(combined_counts.max().item()),
+                    "atlas_mean_roots_per_covered_face": float(
+                        combined_counts.float().mean().item()
+                    ),
+                    "active_covered_face_count": int(
+                        active_report["atlas_covered_face_count"]
+                    ),
+                    "reserve_covered_face_count": int(
+                        reserve_report["atlas_covered_face_count"]
+                    ),
+                    "reserve_root_count": reserve_count,
+                }
+                initial_mask = torch.zeros(
+                    field.point_count, device=device, dtype=torch.bool
+                )
+                initial_mask[initial_strands] = True
+                atlas_sources = torch.cat(
+                    [initial_strands, scalp_sources[~initial_mask[scalp_sources]]]
+                )
+                # The atlas owns the complete scalp capacity, not just the
+                # currently active strands.  Inactive rows are genuine 3D
+                # deficit candidates distributed over the whole supported
+                # scalp instead of copies of teacher-GS clusters.
+                # Keep each source's pre-atlas route identity.  Active strands
+                # receive the first area-balanced block, then reserve sources
+                # receive the remainder; this makes rebinding render-equivalent
+                # while both subsets cover the supported scalp.
+                field.face_index[atlas_sources] = atlas_faces
+                field.barycentric[atlas_sources] = atlas_barycentric
+                new_root, tangent, bitangent, normal = field.surface_frame(
+                    rest_vertices, faces
+                )
+                new_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+                offset = atlas_old_world - new_root
+                new_local_offset = torch.stack(
+                    [
+                        torch.sum(offset * tangent, dim=-1),
+                        torch.sum(offset * bitangent, dim=-1),
+                        torch.sum(offset * normal, dim=-1),
+                    ],
+                    dim=-1,
+                )
+                field.residual_offset_local[atlas_sources] = new_local_offset[
+                    atlas_sources
+                ]
+                desired_exact_delta = atlas_old_world - field.original_xyz
+                desired_exact_delta_local = torch.stack(
+                    [
+                        torch.sum(desired_exact_delta * tangent, dim=-1),
+                        torch.sum(desired_exact_delta * bitangent, dim=-1),
+                        torch.sum(desired_exact_delta * normal, dim=-1),
+                    ],
+                    dim=-1,
+                )
+                field.initial_residual_offset_local[atlas_sources] = (
+                    new_local_offset[atlas_sources]
+                    - desired_exact_delta_local[atlas_sources]
+                )
+                field.rest_surface_frame[atlas_sources] = new_frame[
+                    atlas_sources
+                ]
+                # Preserve the already-estimated world axis across the rebind;
+                # a fresh multi-view estimate below then adapts it to the atlas.
+                rebound_local = torch.einsum(
+                    "nij,ni->nj", new_frame, old_direction_world
+                )
+                field.direction_local_raw.copy_(
+                    F.normalize(rebound_local, dim=-1, eps=1e-8)
+                )
+                neighbor_numpy = _surface_knn_indices(
+                    new_root.detach().cpu().numpy(), neighbor_k
+                )
+                field.route_neighbor_index = torch.as_tensor(
+                    neighbor_numpy, device=device, dtype=torch.long
+                )
+                if orientation_targets and any(
+                    target is not None for target in orientation_targets
+                ):
+                    atlas_direction, _world, atlas_confidence, atlas_orientation = (
+                        _estimate_multiview_orientation_directions(
+                            new_root,
+                            tangent,
+                            bitangent,
+                            normal,
+                            cameras,
+                            frame_indices,
+                            targets,
+                            orientation_targets,
+                            min_views=int(
+                                cfg.fiber_surface_propagation_min_views
+                            ),
+                            normal_bias=float(
+                                cfg.fiber_surface_propagation_normal_bias
+                            ),
+                            confidence_floor=float(
+                                cfg.fiber_surface_propagation_confidence_floor
+                            ),
+                        )
+                    )
+                    atlas_direction = _parallel_transport_surface_directions(
+                        atlas_direction,
+                        new_frame,
+                        field.route_neighbor_index,
+                        atlas_confidence,
+                        steps=int(cfg.fiber_surface_propagation_steps),
+                        observation_weight=float(
+                            cfg.fiber_surface_propagation_observation_weight
+                        ),
+                    )
+                    field.direction_local_raw.copy_(atlas_direction)
+                    orientation_report = {
+                        **orientation_report,
+                        "atlas_reestimate": atlas_orientation,
+                    }
+            if bool(cfg.fiber_strand_outward_sign_enabled):
+                signed_direction, strand_sign_report = (
+                    _synchronize_outward_direction_signs(
+                        field.direction_local.detach(),
+                        new_frame,
+                        field.route_neighbor_index,
+                        anchor_threshold=float(
+                            cfg.fiber_strand_outward_anchor_threshold
+                        ),
+                        steps=int(cfg.fiber_strand_sign_sync_steps),
+                    )
+                )
+                current_direction = field.direction_local.detach().clone()
+                current_direction[source_scalp] = signed_direction[source_scalp]
+                field.direction_local_raw.copy_(current_direction)
             shell_index = ROUTE_NAMES.index("shell")
             strand_index = ROUTE_NAMES.index("strand")
             residual_index = ROUTE_NAMES.index("residual")
@@ -4285,6 +4642,8 @@ def _initialize_intrinsic_surface_propagation(
             "scalp_source_count": scalp_source_count,
             "scalp_initial_strand_count": scalp_initial_strand_count,
             "scalp_erosion_px": int(cfg.fiber_scalp_occupancy_erosion_px),
+            "scalp_atlas": scalp_atlas_report,
+            "strand_direction_sign": strand_sign_report,
             "orientation": orientation_report,
             "diagnostic_ply": str(out_dir / "surface_propagation_roots.ply"),
         }
@@ -5850,6 +6209,33 @@ def _measure_semantic_migration_render_equivalence(
             student_prediction.get("physical_mask", student_prediction["mask"])
             - teacher_prediction.get("physical_mask", teacher_prediction["mask"])
         )
+        source_count = field.point_count
+        active_route = torch.argmax(field.route_active_gate, dim=-1)
+        source_index = torch.arange(source_count, device=active_route.device)
+        selected_index = torch.where(
+            active_route == ROUTE_NAMES.index("shell"),
+            source_index * int(cfg.fiber_shell_samples),
+            torch.where(
+                active_route == ROUTE_NAMES.index("strand"),
+                source_count * int(cfg.fiber_shell_samples)
+                + source_index * int(cfg.fiber_strand_samples),
+                source_count
+                * (int(cfg.fiber_shell_samples) + int(cfg.fiber_strand_samples))
+                + source_index,
+            ),
+        )
+        selected_xyz_error = torch.abs(
+            student_primitives.xyz[selected_index]
+            - teacher_primitives.xyz[:source_count]
+        )
+        selected_scale_error = torch.abs(
+            student_primitives.scaling[selected_index]
+            - teacher_primitives.scaling[:source_count]
+        )
+        selected_opacity_error = torch.abs(
+            student_primitives.opacity[selected_index]
+            - teacher_primitives.opacity[:source_count]
+        )
         report = {
             "rgb_mean_absolute_error": float(rgb_error.mean().cpu()),
             "rgb_max_absolute_error": float(rgb_error.max().cpu()),
@@ -5876,6 +6262,10 @@ def _measure_semantic_migration_render_equivalence(
             "structured_delta_max": float(
                 field.structured_delta_gain.max().detach().cpu()
             ),
+            "selected_xyz_max_error": float(selected_xyz_error.max().cpu()),
+            "selected_xyz_mean_error": float(selected_xyz_error.mean().cpu()),
+            "selected_scale_max_error": float(selected_scale_error.max().cpu()),
+            "selected_opacity_max_error": float(selected_opacity_error.max().cpu()),
         }
     if field.route_active_gate.shape[0] > 0:
         capacity_per_source = (field.route_active_gate > 0.5).sum(dim=-1)

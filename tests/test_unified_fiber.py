@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from dpd3dgs_animal.fiber_optimize import (
+    _area_stratified_surface_samples,
     _apply_adaptive_topology_scores,
     _apply_route_mass_floor,
     _bidirectional_mask_losses,
@@ -20,6 +21,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _resolve_fiber_point_budget,
     _freeze_residual_teacher_scaffold,
     _structured_spill_loss,
+    _synchronize_outward_direction_signs,
     _topology_event_is_accepted,
 )
 from dpd3dgs_animal.config import PipelineConfig, load_config
@@ -114,6 +116,38 @@ def test_topology_event_rejects_single_view_regression_despite_better_mean() -> 
         margin=0.01,
     )
     assert accepted
+
+
+def test_area_stratified_scalp_atlas_covers_faces_with_interior_roots() -> None:
+    vertices = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+         [1.0, 1.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0]]
+    )
+    faces = torch.tensor([[0, 1, 2], [1, 3, 2], [1, 4, 3], [4, 5, 3]])
+    selected, barycentric, report = _area_stratified_surface_samples(
+        vertices, faces, torch.arange(4), 12, min_roots_per_face=1
+    )
+    assert torch.unique(selected).numel() == 4
+    assert report["atlas_covered_face_count"] == 4
+    assert report["atlas_max_roots_per_face"] <= 4
+    torch.testing.assert_close(barycentric.sum(dim=-1), torch.ones(12))
+    assert torch.all(barycentric > 0.0)
+
+
+def test_signed_direction_field_flips_inward_and_reduces_axis_disagreement() -> None:
+    direction = torch.tensor(
+        [[1.0, 0.0, 0.01], [-1.0, 0.0, -0.01],
+         [0.9, 0.1, 0.02], [-0.9, -0.1, -0.02]]
+    )
+    frame = torch.eye(3).repeat(4, 1, 1)
+    neighbors = torch.tensor([[1, 2], [0, 3], [0, 3], [1, 2]])
+    signed, report = _synchronize_outward_direction_signs(
+        direction, frame, neighbors, anchor_threshold=0.05, steps=4
+    )
+    assert report["inward_fraction_before"] == 0.5
+    assert report["inward_fraction_after"] == 0.0
+    assert report["neighbor_sign_disagreement_after"] == 0.0
+    assert torch.all(signed[:, 2] >= 0.0)
 
 
 def test_rgb_gradient_loss_penalizes_blur_and_matches_exact_image() -> None:
@@ -520,6 +554,7 @@ def test_adaptive_topology_scores_prune_outlier_and_grow_hole() -> None:
         fiber_topology_grow_min_deficit=0.1,
         fiber_topology_max_residual_prune_fraction=0.5,
         fiber_coverage_seed_route_mass=[0.15, 0.75, 0.10],
+        fiber_topology_deficit_min_views=2,
     )
     event = _apply_adaptive_topology_scores(
         field,
@@ -531,12 +566,50 @@ def test_adaptive_topology_scores_prune_outlier_and_grow_hole() -> None:
         deficit_score=torch.tensor([0.0, 0.5]),
         boundary_score=torch.zeros(2),
         step=100,
+        deficit_views=torch.tensor([0.0, 3.0]),
     )
     assert event["pruned_count"] == 1
     assert event["grown_count"] == 1
     assert float(field.route_active_gate[0, 2]) == 0.0
     assert torch.all(field.route_active_gate[1, :2] == 1.0)
     assert event["topology"]["active_gaussians"] == 6
+
+
+def test_incremental_3d_deficit_birth_keeps_shell_and_starts_nearly_zero() -> None:
+    field, _vertices, _faces = _toy_field()
+    with torch.no_grad():
+        field.route_active_gate.zero_()
+        field.route_active_gate[:, 0] = 1.0
+    optimizer = torch.optim.Adam(field.parameters(), lr=1e-3)
+    cfg = PipelineConfig(
+        fiber_topology_incremental_birth=True,
+        fiber_topology_birth_strand_mass=0.01,
+        fiber_topology_birth_initial_delta=0.0,
+        fiber_topology_deficit_min_views=2,
+        fiber_topology_grow_count=1,
+        fiber_topology_densify_count=0,
+        fiber_topology_prune_count=0,
+        fiber_topology_min_views=2,
+        fiber_topology_grow_min_support=0.5,
+        fiber_topology_grow_min_deficit=0.1,
+    )
+    event = _apply_adaptive_topology_scores(
+        field,
+        optimizer,
+        cfg,
+        visible_views=torch.tensor([3.0, 3.0]),
+        residual_support=torch.zeros(2),
+        structured_support=torch.ones(2),
+        deficit_score=torch.tensor([0.8, 0.1]),
+        boundary_score=torch.zeros(2),
+        deficit_views=torch.tensor([3.0, 1.0]),
+        step=100,
+    )
+    assert event["grown_count"] == 1
+    assert torch.all(field.route_active_gate[0, :2] == 1.0)
+    assert float(field.structured_delta_raw[0, 1]) == 0.0
+    probabilities = field.route_probabilities(cfg.fiber_final_temperature)
+    assert 0.005 < float(probabilities[0, 1]) < 0.02
 
 
 def test_residual_footprint_probes_cover_center_and_local_axes() -> None:
