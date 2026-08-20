@@ -2080,6 +2080,10 @@ def optimize_unified_fiber_stage2(
                 "shell_propagated_direction_weight": float(
                     cfg.fiber_shell_propagated_direction_weight
                 ),
+                "route_neighbor_k": int(cfg.fiber_route_neighbor_k),
+                "surface_propagation_neighbor_k": int(
+                    cfg.fiber_surface_propagation_neighbor_k
+                ),
                 "root_barycentric_max_delta": float(
                     cfg.fiber_root_barycentric_max_delta
                 ),
@@ -6358,6 +6362,10 @@ def _save_training_checkpoint(
                 "strand_samples": cfg.fiber_strand_samples,
                 "shell_propagated_direction_weight": float(
                     cfg.fiber_shell_propagated_direction_weight
+                ),
+                "route_neighbor_k": int(cfg.fiber_route_neighbor_k),
+                "surface_propagation_neighbor_k": int(
+                    cfg.fiber_surface_propagation_neighbor_k
                 ),
                 "root_barycentric_max_delta": float(
                     cfg.fiber_root_barycentric_max_delta

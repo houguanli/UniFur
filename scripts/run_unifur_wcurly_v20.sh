@@ -15,6 +15,7 @@ CONFIG="${UNIFIED_CONFIG:-${PROJECT_ROOT}/configs/fiber_hairgs_wcurly_multiray_l
 RESIDUAL_CHECKPOINT="${RESIDUAL_CHECKPOINT:-${RESULT_ROOT}/cleanhair_v11_residual_teacher_4k_v1/unified_fiber_field.pt}"
 OUT="${UNIFIED_OUT:-${RESULT_ROOT}/cleanhair_v20_multiray_localbirth_holeaux_8k_v1}"
 PROTOCOL_ID="hairgs-wcurly-static-train12-test4-v2-camera-fixed"
+GEOMETRY_AUDIT_OUT="${GEOMETRY_AUDIT_OUT:-${OUT}/geometry_audit}"
 
 run_cli() {
   PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -35,15 +36,36 @@ validate_inputs() {
 
 train() {
   validate_inputs
-  [[ -f "${OUT}/unified_fiber_field.pt" ]] && return
-  run_cli fiber-stage2 \
+  if [[ ! -f "${OUT}/unified_fiber_field.pt" ]]; then
+    run_cli fiber-stage2 \
+      --stage1-npz "${STAGE1}" \
+      --gaussian-ply "${CLEAN_PLY}" \
+      --fixed-base-gaussian-ply "${FIXED_BASE_PLY}" \
+      --frame-dir "${PROTOCOL_ROOT}/train/images" \
+      --camera-manifest "${PROTOCOL_ROOT}/train/camera_manifest.json" \
+      --out-dir "${OUT}" --renderer hairgs \
+      --residual-bootstrap-checkpoint "${RESIDUAL_CHECKPOINT}" \
+      --render-width 1000 --render-height 1000
+  fi
+  audit_geometry
+}
+
+audit_geometry() {
+  [[ -f "${OUT}/unified_fiber_field.pt" ]] || {
+    echo "Missing trained checkpoint: ${OUT}/unified_fiber_field.pt" >&2
+    return 2
+  }
+  [[ -f "${GEOMETRY_AUDIT_OUT}/geometry_audit.json" ]] && return
+  PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${CONDA_BIN}" run --no-capture-output -n dpd3dgs-animal python \
+    "${PROJECT_ROOT}/scripts/export_fiber_geometry_diagnostics.py" \
     --stage1-npz "${STAGE1}" \
     --gaussian-ply "${CLEAN_PLY}" \
-    --fixed-base-gaussian-ply "${FIXED_BASE_PLY}" \
+    --checkpoint "${OUT}/unified_fiber_field.pt" \
     --frame-dir "${PROTOCOL_ROOT}/train/images" \
     --camera-manifest "${PROTOCOL_ROOT}/train/camera_manifest.json" \
-    --out-dir "${OUT}" --renderer hairgs \
-    --residual-bootstrap-checkpoint "${RESIDUAL_CHECKPOINT}" \
+    --out-dir "${GEOMETRY_AUDIT_OUT}" --device cuda \
+    --max-views 12 --max-arrows 2400 \
     --render-width 1000 --render-height 1000
 }
 
@@ -82,6 +104,7 @@ evaluate() {
 
 case "${MODE}" in
   train) train ;;
+  audit) audit_geometry ;;
   evaluate|all) evaluate ;;
-  *) echo "Usage: $0 [train|evaluate|all]" >&2; exit 2 ;;
+  *) echo "Usage: $0 [train|audit|evaluate|all]" >&2; exit 2 ;;
 esac
