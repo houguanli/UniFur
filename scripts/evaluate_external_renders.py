@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
+from scipy import ndimage
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -32,7 +33,43 @@ METRIC_KEYS = (
     "mask_iou",
     "mask_f1",
     "background_opacity_mean",
+    "false_negative_fraction",
+    "false_positive_fraction",
+    "largest_false_negative_component_fraction",
+    "largest_false_positive_component_fraction",
 )
+
+
+def _connected_mask_errors(
+    prediction_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Measure exact 8-connected missing/excess regions for diagnostics."""
+
+    prediction = prediction_mask.detach().cpu().numpy() >= 0.5
+    target = target_mask.detach().cpu().numpy() >= 0.5
+    false_negative = target & (~prediction)
+    false_positive = (~target) & prediction
+    foreground_area = max(int(target.sum()), 1)
+    structure = np.ones((3, 3), dtype=np.uint8)
+
+    def largest_fraction(binary: np.ndarray) -> float:
+        labels, count = ndimage.label(binary, structure=structure)
+        if count == 0:
+            return 0.0
+        areas = np.bincount(labels.reshape(-1))[1:]
+        return float(areas.max(initial=0) / foreground_area)
+
+    return {
+        "false_negative_fraction": float(false_negative.sum() / foreground_area),
+        "false_positive_fraction": float(false_positive.sum() / foreground_area),
+        "largest_false_negative_component_fraction": largest_fraction(
+            false_negative
+        ),
+        "largest_false_positive_component_fraction": largest_fraction(
+            false_positive
+        ),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +132,9 @@ def main() -> None:
             )
         prediction = {"rgb": rgb.clamp(0.0, 1.0), "mask": mask.clamp(0.0, 1.0)}
         metrics = _frame_metrics(prediction, ground_truth, quality)
+        metrics.update(
+            _connected_mask_errors(prediction["mask"], ground_truth["mask"])
+        )
         row = {
             "image": observation["image"],
             "frame_index": int(observation["frame_index"]),
@@ -120,6 +160,16 @@ def main() -> None:
         "render_size": [width, height],
         "image_count": len(per_frame),
         "aggregate": aggregate,
+        "worst_case": {
+            "largest_false_negative_component_fraction": max(
+                float(item["largest_false_negative_component_fraction"])
+                for item in per_frame
+            ),
+            "largest_false_positive_component_fraction": max(
+                float(item["largest_false_positive_component_fraction"])
+                for item in per_frame
+            ),
+        },
         "per_frame": per_frame,
     }
     report_path = output / "evaluation.json"

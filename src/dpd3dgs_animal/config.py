@@ -136,6 +136,12 @@ class PipelineConfig:
     fiber_mask_outside_spill_weight: float = 0.0
     fiber_mask_inside_alpha_target: float = 0.9
     fiber_mask_outside_margin_px: int = 0
+    # Added to (never substituted for) mean bidirectional mask supervision.
+    # Locally average missing foreground and optimize the worst coherent
+    # regions as a differentiable largest-connected-hole surrogate.
+    fiber_max_hole_weight: float = 0.0
+    fiber_max_hole_kernel: int = 31
+    fiber_max_hole_topk_fraction: float = 0.002
     # Apply the same contract to shell+strand with residual removed.  A modest
     # alpha floor forces useful structural ownership instead of allowing the
     # residual teacher to hide empty explicit routes.
@@ -203,6 +209,18 @@ class PipelineConfig:
     # proposed strand volume to intersect missing foreground in several
     # calibrated views rather than reacting to an isolated image-space hole.
     fiber_topology_deficit_min_views: int = 2
+    # Surface-anchored 3D ray marching through all calibrated silhouettes
+    # initializes a new strand's tip depth instead of inheriting reserve length.
+    fiber_topology_ray_steps: int = 12
+    fiber_topology_ray_min_length_scale: float = 0.01
+    fiber_topology_ray_max_length_scale: float = 0.18
+    fiber_topology_ray_neighbor_blend: float = 0.25
+    fiber_topology_bend_neighbor_scale: float = 0.20
+    # Each event is one spatial cluster. Only this cluster and its immediate
+    # neighbors receive a short adaptation before per-view accept/revert.
+    fiber_topology_local_warmup_steps: int = 4
+    fiber_topology_local_warmup_lr: float = 0.0005
+    fiber_topology_local_warmup_views: int = 4
     # Auxiliary supervision on the exact fully-deployed inference geometry.
     # This closes the continuation-schedule gap where an early checkpoint is
     # safe while partially blended during training but spills when evaluated

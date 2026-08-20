@@ -1297,6 +1297,7 @@ def optimize_unified_fiber_stage2(
                 )
             mask_inside_coverage_loss = render_loss.new_zeros(())
             mask_outside_spill_loss = render_loss.new_zeros(())
+            maximum_hole_loss = render_loss.new_zeros(())
             structured_mask_inside_coverage_loss = render_loss.new_zeros(())
             structured_mask_outside_spill_loss = render_loss.new_zeros(())
             if (
@@ -1335,6 +1336,24 @@ def optimize_unified_fiber_stage2(
                     * mask_inside_coverage_loss
                     + float(cfg.fiber_mask_outside_spill_weight)
                     * mask_outside_spill_loss
+                )
+            if (
+                representation == "unified"
+                and phase != "gaussian_scaffold"
+                and float(cfg.fiber_max_hole_weight) > 0.0
+            ):
+                if deployment_prediction is None:
+                    raise RuntimeError(
+                        "Maximum-hole supervision requires deployed primitives"
+                    )
+                maximum_hole_loss = _maximum_hole_soft_loss(
+                    deployment_prediction["mask"],
+                    ground_truth[local_frame_index]["mask"],
+                    kernel_size=int(cfg.fiber_max_hole_kernel),
+                    topk_fraction=float(cfg.fiber_max_hole_topk_fraction),
+                )
+                render_loss = render_loss + (
+                    float(cfg.fiber_max_hole_weight) * maximum_hole_loss
                 )
             if (
                 representation == "unified"
@@ -1896,6 +1915,7 @@ def optimize_unified_fiber_stage2(
                 "mask_outside_spill": float(
                     mask_outside_spill_loss.detach().cpu()
                 ),
+                "maximum_hole": float(maximum_hole_loss.detach().cpu()),
                 "structured_mask_inside_coverage": float(
                     structured_mask_inside_coverage_loss.detach().cpu()
                 ),
@@ -2706,6 +2726,7 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         "fiber_mask_outside_spill_weight",
         "fiber_structured_mask_inside_coverage_weight",
         "fiber_structured_mask_outside_spill_weight",
+        "fiber_max_hole_weight",
     ):
         if float(getattr(cfg, name)) < 0.0:
             raise ValueError(f"{name} must be non-negative")
@@ -2718,6 +2739,11 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
             raise ValueError(f"{name} must be in [0, 1]")
     if int(cfg.fiber_mask_outside_margin_px) < 0:
         raise ValueError("fiber_mask_outside_margin_px must be non-negative")
+    if int(cfg.fiber_max_hole_kernel) <= 0:
+        raise ValueError("fiber_max_hole_kernel must be positive")
+    max_hole_topk = float(cfg.fiber_max_hole_topk_fraction)
+    if not 0.0 < max_hole_topk <= 1.0:
+        raise ValueError("fiber_max_hole_topk_fraction must be in (0, 1]")
     if int(cfg.fiber_coverage_seed_count) < 0:
         raise ValueError("fiber_coverage_seed_count must be non-negative")
     if int(cfg.fiber_coverage_seed_samples) <= 0:
@@ -2921,6 +2947,27 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_topology_birth_initial_delta must be in [0, 1]")
     if int(cfg.fiber_topology_deficit_min_views) <= 0:
         raise ValueError("fiber_topology_deficit_min_views must be positive")
+    if int(cfg.fiber_topology_ray_steps) < 2:
+        raise ValueError("fiber_topology_ray_steps must be at least two")
+    ray_min = float(cfg.fiber_topology_ray_min_length_scale)
+    ray_max = float(cfg.fiber_topology_ray_max_length_scale)
+    if not math.isfinite(ray_min) or ray_min <= 0.0:
+        raise ValueError("fiber_topology_ray_min_length_scale must be positive")
+    if not math.isfinite(ray_max) or ray_max <= ray_min:
+        raise ValueError(
+            "fiber_topology_ray_max_length_scale must exceed the minimum"
+        )
+    ray_neighbor_blend = float(cfg.fiber_topology_ray_neighbor_blend)
+    if not 0.0 <= ray_neighbor_blend <= 1.0:
+        raise ValueError("fiber_topology_ray_neighbor_blend must be in [0, 1]")
+    if float(cfg.fiber_topology_bend_neighbor_scale) < 0.0:
+        raise ValueError("fiber_topology_bend_neighbor_scale must be non-negative")
+    if int(cfg.fiber_topology_local_warmup_steps) < 0:
+        raise ValueError("fiber_topology_local_warmup_steps must be non-negative")
+    if float(cfg.fiber_topology_local_warmup_lr) < 0.0:
+        raise ValueError("fiber_topology_local_warmup_lr must be non-negative")
+    if int(cfg.fiber_topology_local_warmup_views) <= 0:
+        raise ValueError("fiber_topology_local_warmup_views must be positive")
     for name in (
         "fiber_scalp_occupancy_min_fraction",
         "fiber_scalp_initial_strand_fraction",
@@ -3240,6 +3287,41 @@ def _topk_masked(
     return indices[order[:limit]]
 
 
+def _local_cluster_masked(
+    score: torch.Tensor,
+    eligible: torch.Tensor,
+    count: int,
+    neighbor_index: torch.Tensor,
+) -> torch.Tensor:
+    """Select one connected high-deficit cluster around the best seed."""
+
+    candidates = torch.nonzero(eligible, as_tuple=False).flatten()
+    limit = min(max(int(count), 0), int(candidates.numel()))
+    if limit == 0:
+        return torch.empty((0,), dtype=torch.long, device=score.device)
+    seed = candidates[torch.argmax(score[candidates])]
+    selected = torch.zeros_like(eligible)
+    frontier = seed.reshape(1)
+    selected[seed] = True
+    while int(selected.sum()) < limit and frontier.numel() > 0:
+        neighbors = neighbor_index[frontier].reshape(-1)
+        valid = eligible[neighbors] & (~selected[neighbors])
+        frontier = torch.unique(neighbors[valid])
+        if frontier.numel() == 0:
+            break
+        remaining = limit - int(selected.sum())
+        order = torch.argsort(score[frontier], descending=True)
+        frontier = frontier[order[:remaining]]
+        selected[frontier] = True
+    if int(selected.sum()) < limit:
+        remaining_mask = eligible & (~selected)
+        fallback = _topk_masked(
+            score, remaining_mask, limit - int(selected.sum())
+        )
+        selected[fallback] = True
+    return torch.nonzero(selected, as_tuple=False).flatten()
+
+
 def _set_effective_route_mass(
     field: UnifiedFiberField,
     indices: torch.Tensor,
@@ -3315,6 +3397,9 @@ def _apply_adaptive_topology_scores(
     boundary_score: torch.Tensor,
     step: int,
     deficit_views: torch.Tensor | None = None,
+    proposed_strand_length: torch.Tensor | None = None,
+    proposed_direction_local: torch.Tensor | None = None,
+    proposed_bend_local: torch.Tensor | None = None,
     clear_optimizer_state: bool = True,
 ) -> dict[str, object]:
     """Apply explicit prune/grow/densify decisions from multi-view scores.
@@ -3339,6 +3424,13 @@ def _apply_adaptive_topology_scores(
         deficit_views = visible_views
     if tuple(deficit_views.shape) != (field.point_count,):
         raise ValueError("deficit_views must contain one value per source")
+    for name, value, shape in (
+        ("proposed_strand_length", proposed_strand_length, (field.point_count,)),
+        ("proposed_direction_local", proposed_direction_local, (field.point_count, 3)),
+        ("proposed_bend_local", proposed_bend_local, (field.point_count, 2)),
+    ):
+        if value is not None and tuple(value.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}")
     active = field.route_active_gate
     shell_index = ROUTE_NAMES.index("shell")
     strand_index = ROUTE_NAMES.index("strand")
@@ -3392,10 +3484,11 @@ def _apply_adaptive_topology_scores(
         & (structured_support >= float(cfg.fiber_topology_grow_min_support))
         & (deficit_score >= float(cfg.fiber_topology_grow_min_deficit))
     )
-    grown = _topk_masked(
+    grown = _local_cluster_masked(
         deficit_score * structured_support,
         grow_eligible,
         int(cfg.fiber_topology_grow_count),
+        field.route_neighbor_index,
     )
     grow_mask = torch.zeros(field.point_count, dtype=torch.bool, device=device)
     grow_mask[grown] = True
@@ -3478,6 +3571,16 @@ def _apply_adaptive_topology_scores(
                 desired_carrier
             )
             field.carrier_root_tip_raw[grown] = 0.0
+            if proposed_strand_length is not None:
+                field.strand_length_raw[grown, 0] = _positive_parameter_raw(
+                    proposed_strand_length[grown], eps=field.positive_eps
+                )
+            if proposed_direction_local is not None:
+                field.direction_local_raw[grown] = F.normalize(
+                    proposed_direction_local[grown], dim=-1, eps=1e-8
+                )
+            if proposed_bend_local is not None:
+                field.bend_local[grown] = proposed_bend_local[grown]
         if densified.numel() > 0:
             if cfg.fiber_teacher_semantic_migration_mass is not None:
                 active[densified] = 0.0
@@ -3528,6 +3631,10 @@ def _apply_adaptive_topology_scores(
                 field.radius_raw,
                 field.carrier_logits,
                 field.carrier_root_tip_raw,
+                field.strand_length_raw,
+                field.direction_local_raw,
+                field.bend_local,
+                field.bend_cubic_local,
             ],
             changed,
         )
@@ -3554,6 +3661,14 @@ def _apply_adaptive_topology_scores(
         "pruned_support": selected_stats(residual_support, pruned),
         "grown_deficit": selected_stats(deficit_score, grown),
         "grown_deficit_views": selected_stats(deficit_views, grown),
+        "grown_ray_length": selected_stats(
+            (
+                proposed_strand_length
+                if proposed_strand_length is not None
+                else field.strand_length.detach()
+            ),
+            grown,
+        ),
         "densified_boundary": selected_stats(boundary_score, densified),
         "topology": topology,
     }
@@ -3572,6 +3687,10 @@ _TOPOLOGY_MUTABLE_FIELD_NAMES = (
     "carrier_logits",
     "carrier_root_tip_raw",
     "initial_route_probabilities",
+    "strand_length_raw",
+    "direction_local_raw",
+    "bend_local",
+    "bend_cubic_local",
 )
 
 
@@ -3654,8 +3773,143 @@ def _topology_validation_losses(
                 cfg.mask_boundary_radius,
                 cfg.mask_balance_weight,
             )
+            if float(cfg.fiber_max_hole_weight) > 0.0:
+                loss = loss + float(cfg.fiber_max_hole_weight) * (
+                    _maximum_hole_soft_loss(
+                        prediction["mask"],
+                        target["mask"],
+                        kernel_size=int(cfg.fiber_max_hole_kernel),
+                        topk_fraction=float(cfg.fiber_max_hole_topk_fraction),
+                    )
+                )
             losses.append(float(loss.detach().cpu()))
     return losses
+
+
+def _topology_local_warmup(
+    field: UnifiedFiberField,
+    surface_vertices_per_view: list[torch.Tensor],
+    surface_faces: torch.Tensor,
+    cameras: list,
+    targets: list[dict[str, torch.Tensor]],
+    cfg: PipelineConfig,
+    renderer_name: str,
+    changed: torch.Tensor,
+) -> dict[str, object]:
+    """Optimize only a newly born spatial cluster before held-out admission.
+
+    The birth proposal is fitted on a small set of training views.  Parameter
+    rows outside the cluster and its one-ring atlas neighborhood are never
+    updated, so this cannot silently turn into another global fitting stage.
+    The subsequent per-view calibration remains the accept/reject authority.
+    """
+
+    steps = int(cfg.fiber_topology_local_warmup_steps)
+    learning_rate = float(cfg.fiber_topology_local_warmup_lr)
+    if changed.numel() == 0 or steps <= 0 or learning_rate <= 0.0:
+        return {"steps": 0, "view_count": 0, "rows": int(changed.numel()), "loss": []}
+    view_count = min(
+        int(cfg.fiber_topology_local_warmup_views),
+        len(surface_vertices_per_view),
+    )
+    if view_count <= 0:
+        return {"steps": 0, "view_count": 0, "rows": int(changed.numel()), "loss": []}
+
+    local_mask = torch.zeros(
+        field.point_count, dtype=torch.bool, device=field.route_logits.device
+    )
+    local_mask[changed] = True
+    if field.route_neighbor_index.numel() > 0:
+        local_mask[field.route_neighbor_index[changed].reshape(-1)] = True
+    local_rows = torch.nonzero(local_mask, as_tuple=False)[:, 0]
+    parameters = [
+        field.route_logits,
+        field.residual_trust_logits,
+        field.structured_delta_raw,
+        field.structured_opacity_raw,
+        field.radius_raw,
+        field.carrier_logits,
+        field.carrier_root_tip_raw,
+        field.strand_length_raw,
+        field.direction_local_raw,
+        field.bend_local,
+        field.bend_cubic_local,
+    ]
+    losses: list[float] = []
+    gradient_norms: list[float] = []
+    for warmup_step in range(steps):
+        view_index = warmup_step % view_count
+        vertices = surface_vertices_per_view[view_index].to(
+            device=field.route_logits.device
+        )
+        target = targets[view_index]
+        primitives = field.primitives(
+            vertices,
+            surface_faces,
+            shell_samples=int(cfg.fiber_shell_samples),
+            strand_samples=int(cfg.fiber_strand_samples),
+            temperature=float(cfg.fiber_final_temperature),
+            hard_route=False,
+            route_blend=1.0,
+            geometry_blend=1.0,
+            route_hardening=0.0,
+            hard_route_policy=cfg.fiber_hard_route_policy,
+            fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
+            additive_teacher=bool(cfg.fiber_additive_teacher_mode),
+            teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+        )
+        prediction = _render(primitives, cameras[view_index], cfg, renderer_name)
+        loss, _parts = differentiable_render_loss(
+            prediction,
+            target["rgb"],
+            target["mask"],
+            cfg.color_loss_weight,
+            cfg.mask_loss_weight,
+            cfg.mask_boundary_weight,
+            cfg.mask_boundary_radius,
+            cfg.mask_balance_weight,
+        )
+        inside_loss, outside_loss = _bidirectional_mask_losses(
+            prediction["mask"],
+            target["mask"],
+            inside_alpha_target=float(cfg.fiber_mask_inside_alpha_target),
+            outside_margin_px=int(cfg.fiber_mask_outside_margin_px),
+        )
+        loss = loss + (
+            float(cfg.fiber_mask_inside_coverage_weight) * inside_loss
+            + float(cfg.fiber_mask_outside_spill_weight) * outside_loss
+        )
+        if float(cfg.fiber_max_hole_weight) > 0.0:
+            loss = loss + float(cfg.fiber_max_hole_weight) * (
+                _maximum_hole_soft_loss(
+                    prediction["mask"],
+                    target["mask"],
+                    kernel_size=int(cfg.fiber_max_hole_kernel),
+                    topk_fraction=float(cfg.fiber_max_hole_topk_fraction),
+                )
+            )
+        gradients = torch.autograd.grad(
+            loss, parameters, allow_unused=True, retain_graph=False
+        )
+        squared_gradient_norm = loss.new_zeros(())
+        with torch.no_grad():
+            for parameter, gradient in zip(parameters, gradients, strict=True):
+                if gradient is not None:
+                    squared_gradient_norm.add_(
+                        gradient[local_rows].square().sum()
+                    )
+                    parameter[local_rows].add_(
+                        gradient[local_rows], alpha=-learning_rate
+                    )
+        losses.append(float(loss.detach().cpu()))
+        gradient_norms.append(float(squared_gradient_norm.sqrt().cpu()))
+    return {
+        "steps": steps,
+        "view_count": view_count,
+        "rows": int(local_rows.numel()),
+        "loss": losses,
+        "gradient_norm": gradient_norms,
+    }
 
 
 def _update_adaptive_topology(
@@ -3689,6 +3943,84 @@ def _update_adaptive_topology(
     boundary_sum = torch.zeros_like(visible_views)
     structured_valid_views = torch.zeros_like(visible_views)
     scene_scale = float(field.scene_scale.detach().cpu())
+    ray_steps = max(int(cfg.fiber_topology_ray_steps), 2)
+    ray_lengths = torch.linspace(
+        scene_scale * float(cfg.fiber_topology_ray_min_length_scale),
+        scene_scale * float(cfg.fiber_topology_ray_max_length_scale),
+        ray_steps,
+        device=device,
+        dtype=dtype,
+    )
+    ray_support_views = torch.zeros(
+        (field.point_count, ray_steps), device=device, dtype=dtype
+    )
+    ray_support_sum = torch.zeros_like(ray_support_views)
+    ray_deficit_sum = torch.zeros_like(ray_support_views)
+    ray_observed_views = torch.zeros_like(ray_support_views)
+
+    # Transport neighboring axes/bends through world space before averaging;
+    # local tangent coordinates from different scalp triangles are not directly
+    # comparable.
+    reference_vertices = surface_vertices_per_view[0].to(device=device)
+    ref_root, ref_tangent, ref_bitangent, ref_normal = field.surface_frame(
+        reference_vertices, surface_faces
+    )
+    ref_frame = torch.stack(
+        [ref_tangent, ref_bitangent, ref_normal], dim=-1
+    )
+    base_local_direction = field.direction_local.detach()
+    base_world_direction = torch.einsum(
+        "nij,nj->ni", ref_frame, base_local_direction
+    )
+    if field.route_neighbor_index.numel() > 0:
+        neighbor_world = base_world_direction[field.route_neighbor_index]
+        sign = torch.sign(
+            torch.sum(
+                neighbor_world * base_world_direction[:, None], dim=-1,
+                keepdim=True,
+            )
+        )
+        neighbor_world = torch.where(sign < 0.0, -neighbor_world, neighbor_world)
+        neighbor_mean_world = F.normalize(
+            neighbor_world.mean(dim=1), dim=-1, eps=1e-8
+        )
+        proposed_direction_local = F.normalize(
+            torch.einsum("nij,ni->nj", ref_frame, neighbor_mean_world),
+            dim=-1,
+            eps=1e-8,
+        )
+        neighbor_bend = field.bend_local.detach()[field.route_neighbor_index]
+        neighbor_tangent = ref_tangent[field.route_neighbor_index]
+        neighbor_bitangent = ref_bitangent[field.route_neighbor_index]
+        neighbor_bend_world = (
+            neighbor_bend[..., :1] * neighbor_tangent
+            + neighbor_bend[..., 1:] * neighbor_bitangent
+        ).mean(dim=1)
+        neighbor_bend_local = torch.stack(
+            [
+                torch.sum(neighbor_bend_world * ref_tangent, dim=-1),
+                torch.sum(neighbor_bend_world * ref_bitangent, dim=-1),
+            ],
+            dim=-1,
+        )
+        direction_delta_world = neighbor_mean_world - base_world_direction
+        curvature_local = torch.stack(
+            [
+                torch.sum(direction_delta_world * ref_tangent, dim=-1),
+                torch.sum(direction_delta_world * ref_bitangent, dim=-1),
+            ],
+            dim=-1,
+        )
+        proposed_bend_local = neighbor_bend_local + float(
+            cfg.fiber_topology_bend_neighbor_scale
+        ) * curvature_local
+        neighbor_length = field.strand_length.detach()[
+            field.route_neighbor_index
+        ].mean(dim=1)
+    else:
+        proposed_direction_local = base_local_direction
+        proposed_bend_local = field.bend_local.detach().clone()
+        neighbor_length = field.strand_length.detach().clone()
 
     with torch.no_grad():
         for vertices, camera, target in zip(
@@ -3729,6 +4061,35 @@ def _update_adaptive_topology(
                     * float(cfg.fiber_coverage_seed_visibility_depth_scale)
                 ),
             )
+            view_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+            ray_direction_world = F.normalize(
+                torch.einsum(
+                    "nij,nj->ni", view_frame, proposed_direction_local
+                ),
+                dim=-1,
+                eps=1e-8,
+            )
+            ray_origin = roots + field.height[:, None] * normal
+            ray_points = (
+                ray_origin[:, None, :]
+                + ray_lengths[None, :, None] * ray_direction_world[:, None, :]
+            )
+            ray_support, ray_valid = _sample_mask_at_world_points(
+                ray_points,
+                camera,
+                target_mask,
+                margin_px=max(int(cfg.fiber_visual_hull_margin_px), 0),
+            )
+            ray_deficit, _ = _sample_mask_at_world_points(
+                ray_points, camera, deficit_image
+            )
+            ray_observed = root_visible[:, None] & ray_valid
+            ray_support_views.add_(
+                (ray_observed & (ray_support >= 0.5)).to(dtype)
+            )
+            ray_support_sum.add_(ray_support * ray_observed.to(dtype))
+            ray_deficit_sum.add_(ray_deficit * ray_observed.to(dtype))
+            ray_observed_views.add_(ray_observed.to(dtype))
             residual_xyz = roots + (
                 field.residual_offset_local[:, :1] * tangent
                 + field.residual_offset_local[:, 1:2] * bitangent
@@ -3797,6 +4158,41 @@ def _update_adaptive_topology(
     structured_support = structured_support_sum / structured_valid_views.clamp_min(1.0)
     deficit_score = deficit_sum / structured_valid_views.clamp_min(1.0)
     boundary_score = boundary_sum / structured_valid_views.clamp_min(1.0)
+    supported_ray = ray_support_views >= float(
+        cfg.fiber_topology_deficit_min_views
+    )
+    ray_rank = torch.arange(ray_steps, device=device)[None, :].expand(
+        field.point_count, -1
+    )
+    farthest_index = torch.where(
+        supported_ray, ray_rank, torch.full_like(ray_rank, -1)
+    ).amax(dim=1)
+    has_ray = farthest_index >= 0
+    safe_ray_index = farthest_index.clamp_min(0)
+    ray_length_proposal = ray_lengths[safe_ray_index]
+    blend = float(cfg.fiber_topology_ray_neighbor_blend)
+    ray_length_proposal = torch.where(
+        has_ray,
+        (1.0 - blend) * ray_length_proposal + blend * neighbor_length,
+        neighbor_length,
+    )
+    selected_ray_views = ray_support_views.gather(
+        1, safe_ray_index[:, None]
+    )[:, 0]
+    ray_mean_support = (
+        ray_support_sum / ray_observed_views.clamp_min(1.0)
+    ).mean(dim=1)
+    selected_ray_deficit = (
+        ray_deficit_sum / ray_observed_views.clamp_min(1.0)
+    ).gather(1, safe_ray_index[:, None])[:, 0]
+    # The candidate's geometry is now a real 3D root-to-tip ray proposal.
+    # Use its multi-view evidence for growth instead of the arbitrary dormant
+    # strand length that happened to be stored in the reserve row.
+    deficit_score = torch.where(has_ray, selected_ray_deficit, deficit_score)
+    deficit_views = torch.where(has_ray, selected_ray_views, deficit_views)
+    structured_support = torch.where(
+        has_ray, ray_mean_support, structured_support
+    )
     validate_event = bool(cfg.fiber_topology_validate_events)
     validation_surface_vertices = validation_surface_vertices or []
     validation_cameras = validation_cameras or []
@@ -3825,14 +4221,46 @@ def _update_adaptive_topology(
         boundary_score=boundary_score,
         step=step,
         deficit_views=deficit_views,
-        clear_optimizer_state=not validate_event,
+        proposed_strand_length=ray_length_proposal,
+        proposed_direction_local=proposed_direction_local,
+        proposed_bend_local=proposed_bend_local,
+        clear_optimizer_state=False,
     )
-    if not validate_event:
-        return report
-
     changed = report.pop("_changed_indices")
     if not isinstance(changed, torch.Tensor):
-        raise RuntimeError("Validated topology event did not report changed indices")
+        raise RuntimeError("Topology event did not report changed indices")
+    report["local_warmup"] = _topology_local_warmup(
+        field,
+        surface_vertices_per_view,
+        surface_faces,
+        cameras,
+        targets,
+        cfg,
+        renderer_name,
+        changed,
+    )
+    optimizer_rows = [
+        field.route_logits,
+        field.residual_trust_logits,
+        field.structured_delta_raw,
+        field.structured_opacity_raw,
+        field.radius_raw,
+        field.carrier_logits,
+        field.carrier_root_tip_raw,
+        field.strand_length_raw,
+        field.direction_local_raw,
+        field.bend_local,
+        field.bend_cubic_local,
+    ]
+    optimizer_changed = changed
+    if changed.numel() > 0 and field.route_neighbor_index.numel() > 0:
+        optimizer_changed = torch.unique(
+            torch.cat([changed, field.route_neighbor_index[changed].reshape(-1)])
+        )
+    if not validate_event:
+        _clear_adam_rows(optimizer, optimizer_rows, optimizer_changed)
+        return report
+
     after_losses = _topology_validation_losses(
         field,
         validation_surface_vertices,
@@ -3849,19 +4277,7 @@ def _update_adaptive_topology(
         allow_neutral=bool(cfg.fiber_topology_incremental_birth),
     )
     if accepted:
-        _clear_adam_rows(
-            optimizer,
-            [
-                field.route_logits,
-                field.residual_trust_logits,
-                field.structured_delta_raw,
-                field.structured_opacity_raw,
-                field.radius_raw,
-                field.carrier_logits,
-                field.carrier_root_tip_raw,
-            ],
-            changed,
-        )
+        _clear_adam_rows(optimizer, optimizer_rows, optimizer_changed)
     else:
         if snapshot is None:
             raise RuntimeError("Missing topology snapshot for rejected event")
@@ -5311,6 +5727,49 @@ def _bidirectional_mask_losses(
     outside_excess = F.relu(prediction - reference)
     outside = (outside_excess * (1.0 - allowed)).sum() / foreground_area
     return inside, outside
+
+
+def _maximum_hole_soft_loss(
+    prediction_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    *,
+    kernel_size: int,
+    topk_fraction: float,
+) -> torch.Tensor:
+    """Differentiable surrogate for the largest connected missing region.
+
+    Exact connected-component labelling is discrete and cannot supervise the
+    renderer.  Averaging the foreground deficit over a large sliding window
+    suppresses isolated antialiasing errors and produces a high response only
+    inside a spatially coherent hole.  The top-k pooled responses approximate
+    the worst connected component while retaining gradients over an area,
+    rather than through a single max pixel.  This term is always additive to
+    the ordinary mean inside/outside mask objectives.
+    """
+
+    if prediction_mask.shape != target_mask.shape or prediction_mask.ndim != 2:
+        raise ValueError("Prediction and target masks must be aligned HxW tensors")
+    kernel = int(kernel_size)
+    if kernel <= 0:
+        raise ValueError("kernel_size must be positive")
+    if kernel % 2 == 0:
+        kernel += 1
+    fraction = float(topk_fraction)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("topk_fraction must be in (0, 1]")
+    target = target_mask.to(
+        device=prediction_mask.device, dtype=prediction_mask.dtype
+    ).clamp(0.0, 1.0)
+    deficit = F.relu(target - prediction_mask.clamp(0.0, 1.0)) * target
+    coherent = F.avg_pool2d(
+        deficit[None, None], kernel, stride=1, padding=kernel // 2
+    )[0, 0]
+    foreground = target > 0.05
+    values = coherent[foreground]
+    if values.numel() == 0:
+        return coherent.new_zeros(())
+    count = max(int(math.ceil(fraction * int(values.numel()))), 1)
+    return torch.topk(values, min(count, int(values.numel()))).values.mean()
 
 
 def _rendered_route_spill_loss(

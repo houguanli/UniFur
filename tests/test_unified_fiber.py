@@ -14,7 +14,9 @@ from dpd3dgs_animal.fiber_optimize import (
     _initialize_render_preserving_adaptive_migration,
     _initialize_render_preserving_semantic_migration,
     _load_residual_bootstrap_checkpoint,
+    _local_cluster_masked,
     _masked_rgb_gradient_loss,
+    _maximum_hole_soft_loss,
     _parallel_transport_surface_directions,
     _residual_footprint_probe_points,
     _route_visual_hull_soft_loss,
@@ -23,6 +25,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _structured_spill_loss,
     _synchronize_outward_direction_signs,
     _topology_event_is_accepted,
+    _topology_local_warmup,
 )
 from dpd3dgs_animal.config import PipelineConfig, load_config
 
@@ -208,6 +211,36 @@ def test_bidirectional_mask_losses_separate_holes_from_spill() -> None:
     )
     torch.testing.assert_close(inside, torch.zeros_like(inside))
     torch.testing.assert_close(outside, torch.zeros_like(outside))
+
+
+def test_maximum_hole_auxiliary_prefers_coherent_missing_regions() -> None:
+    target = torch.ones(32, 32)
+    exact = target.clone()
+    coherent = target.clone()
+    coherent[12:16, 12:16] = 0.0
+    scattered = target.clone()
+    scattered[::8, ::8] = 0.0
+    exact_loss = _maximum_hole_soft_loss(
+        exact, target, kernel_size=7, topk_fraction=0.02
+    )
+    coherent_loss = _maximum_hole_soft_loss(
+        coherent, target, kernel_size=7, topk_fraction=0.02
+    )
+    scattered_loss = _maximum_hole_soft_loss(
+        scattered, target, kernel_size=7, topk_fraction=0.02
+    )
+    torch.testing.assert_close(exact_loss, torch.zeros_like(exact_loss))
+    assert float(coherent_loss) > float(scattered_loss)
+
+
+def test_local_cluster_selection_keeps_births_spatially_connected() -> None:
+    scores = torch.tensor([0.9, 0.8, 0.7, 0.99, 0.2])
+    eligible = torch.ones(5, dtype=torch.bool)
+    neighbors = torch.tensor(
+        [[1, 1], [0, 2], [1, 1], [4, 4], [3, 3]], dtype=torch.long
+    )
+    selected = _local_cluster_masked(scores, eligible, 2, neighbors)
+    assert set(selected.tolist()) == {3, 4}
 
 
 def test_multiview_coverage_seed_activates_deficit_supported_root(tmp_path) -> None:
@@ -593,6 +626,9 @@ def test_incremental_3d_deficit_birth_keeps_shell_and_starts_nearly_zero() -> No
         fiber_topology_grow_min_support=0.5,
         fiber_topology_grow_min_deficit=0.1,
     )
+    proposed_length = torch.tensor([0.37, 0.11])
+    proposed_direction = torch.tensor([[0.6, 0.0, 0.8], [0.0, 1.0, 0.0]])
+    proposed_bend = torch.tensor([[0.12, -0.04], [0.0, 0.0]])
     event = _apply_adaptive_topology_scores(
         field,
         optimizer,
@@ -603,6 +639,9 @@ def test_incremental_3d_deficit_birth_keeps_shell_and_starts_nearly_zero() -> No
         deficit_score=torch.tensor([0.8, 0.1]),
         boundary_score=torch.zeros(2),
         deficit_views=torch.tensor([3.0, 1.0]),
+        proposed_strand_length=proposed_length,
+        proposed_direction_local=proposed_direction,
+        proposed_bend_local=proposed_bend,
         step=100,
     )
     assert event["grown_count"] == 1
@@ -610,6 +649,54 @@ def test_incremental_3d_deficit_birth_keeps_shell_and_starts_nearly_zero() -> No
     assert float(field.structured_delta_raw[0, 1]) == 0.0
     probabilities = field.route_probabilities(cfg.fiber_final_temperature)
     assert 0.005 < float(probabilities[0, 1]) < 0.02
+    torch.testing.assert_close(field.strand_length[0], proposed_length[0])
+    torch.testing.assert_close(
+        field.direction_local[0], proposed_direction[0], atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(field.bend_local[0], proposed_bend[0])
+
+
+def test_topology_birth_local_warmup_updates_only_cluster_rows() -> None:
+    field, vertices, faces = _toy_field()
+    camera = PinholeCamera(
+        width=32,
+        height=32,
+        fx=24.0,
+        fy=24.0,
+        cx=16.0,
+        cy=16.0,
+        world_to_camera=np.eye(4, dtype=np.float32),
+        image_y_down=True,
+    )
+    cfg = PipelineConfig(
+        fiber_renderer="torch",
+        fiber_shell_samples=1,
+        fiber_strand_samples=2,
+        fiber_topology_local_warmup_steps=2,
+        fiber_topology_local_warmup_lr=1.0,
+        fiber_topology_local_warmup_views=1,
+        fiber_max_hole_weight=0.2,
+        fiber_max_hole_kernel=5,
+        fiber_max_hole_topk_fraction=0.05,
+    )
+    target_mask = torch.zeros(32, 32)
+    target_mask[:, 16:] = 1.0
+    report = _topology_local_warmup(
+        field,
+        [vertices],
+        faces,
+        [camera],
+        [{"rgb": torch.zeros(32, 32, 3), "mask": target_mask}],
+        cfg,
+        "torch",
+        torch.tensor([0]),
+    )
+    assert report["steps"] == 2
+    assert len(report["loss"]) == 2
+    # The one-ring contains both toy roots, so both are the explicit local set.
+    assert report["rows"] == 2
+    assert max(report["gradient_norm"]) > 0.0
+    assert all(np.isfinite(report["loss"]))
 
 
 def test_residual_footprint_probes_cover_center_and_local_axes() -> None:
