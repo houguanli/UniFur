@@ -7,6 +7,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _area_stratified_surface_samples,
     _apply_adaptive_topology_scores,
     _apply_route_mass_floor,
+    _apply_strand_length_feasibility,
     _bidirectional_mask_losses,
     _front_surface_visibility,
     _front_visible_sample_gate,
@@ -1481,6 +1482,70 @@ def test_teacher_opacity_transfer_replaces_residual_without_adding_structure() -
     )
     assert torch.all(transferred.opacity[residual] < additive.opacity[residual])
     assert torch.all(transferred.opacity[residual] > 0.0)
+
+
+def test_visibility_clipped_strand_mass_transfers_to_shell_conservatively() -> None:
+    field, vertices, faces = _toy_field()
+    with torch.no_grad():
+        field.structured_delta_raw.fill_(1.0)
+    strand_gate = torch.tensor(
+        [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32
+    )
+    primitives = field.primitives(
+        vertices,
+        faces,
+        shell_samples=2,
+        strand_samples=3,
+        forced_route="strand",
+        geometry_blend=1.0,
+        strand_visibility=strand_gate,
+        visibility_mass_transfer_to_shell=True,
+    )
+    for source_index in range(field.point_count):
+        source = primitives.source_id == source_index
+        reconstructed_alpha = 1.0 - torch.prod(
+            1.0 - primitives.opacity[source]
+        )
+        torch.testing.assert_close(
+            reconstructed_alpha, field.opacity[source_index], atol=1e-6, rtol=1e-6
+        )
+    strand = primitives.route_id == 1
+    assert torch.count_nonzero(primitives.opacity[strand] == 0.0) >= 3
+    assert torch.count_nonzero(primitives.opacity[primitives.route_id == 0] > 0.0) > 0
+
+
+def test_visual_hull_prefix_projects_strand_length_in_3d() -> None:
+    field, _vertices, _faces = _toy_field()
+    before = field.strand_length.detach().clone()
+    gate = torch.tensor(
+        [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32
+    )
+    report = _apply_strand_length_feasibility(
+        field,
+        gate,
+        PipelineConfig(
+            fiber_strand_samples=3,
+            fiber_strand_length_cap_min_fraction=0.2,
+            fiber_strand_length_cap_relaxation=1.0,
+            fiber_strand_max_gaussian_aspect_ratio=0.0,
+        ),
+    )
+    expected = before * torch.tensor([2.0 / 3.0, 1.0 / 3.0])
+    torch.testing.assert_close(field.strand_length, expected, atol=1e-6, rtol=1e-6)
+    assert report["length_feasibility_changed_fraction"] == 1.0
+    # Reapplying an unchanged feasible prefix must be idempotent rather than
+    # multiplying the already-shortened length a second time.
+    _apply_strand_length_feasibility(
+        field,
+        gate,
+        PipelineConfig(
+            fiber_strand_samples=3,
+            fiber_strand_length_cap_min_fraction=0.2,
+            fiber_strand_length_cap_relaxation=1.0,
+            fiber_strand_max_gaussian_aspect_ratio=0.0,
+        ),
+    )
+    torch.testing.assert_close(field.strand_length, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_downstream_length_and_wind_edits_preserve_residual_and_roots() -> None:

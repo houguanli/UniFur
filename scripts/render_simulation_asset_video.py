@@ -211,6 +211,7 @@ def main() -> None:
                 fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                 additive_teacher=cfg.fiber_additive_teacher_mode,
                 teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
             )
         base = _render(primitives, camera, cfg, cfg.fiber_renderer)
         route = _render(
