@@ -1192,9 +1192,27 @@ def optimize_unified_fiber_stage2(
                 )
             )
             if needs_deployment_prediction:
-                # Match fiber-eval exactly: checkpoints are rendered with the
-                # analytic shell/strand geometry fully deployed, irrespective
-                # of the continuation blend at the step that saved them.
+                force_target_geometry = bool(
+                    cfg.fiber_deployment_force_target_geometry
+                )
+                deployment_shell_visibility = shell_visibility
+                deployment_strand_visibility = strand_visibility
+                deployment_delta_override = None
+                if force_target_geometry:
+                    supported_target = _structured_support_mask(
+                        field,
+                        float(
+                            cfg.fiber_structure_detach_min_support_fraction
+                        ),
+                    )
+                    deployment_delta_override = torch.where(
+                        supported_target,
+                        torch.ones_like(field.structured_delta_gain),
+                        field.structured_delta_gain.detach(),
+                    )
+                # The optional target render is deliberately stricter than
+                # fiber-eval: it exposes the analytic geometry even while the
+                # learned main branch remains collapsed near its teacher.
                 deployment_primitives = field.primitives(
                     surface_vertices,
                     motion.surface_faces,
@@ -1206,11 +1224,12 @@ def optimize_unified_fiber_stage2(
                     geometry_blend=1.0,
                     route_hardening=(1.0 if adaptive_hard_router else 0.0),
                     hard_route_policy=cfg.fiber_hard_route_policy,
-                    shell_visibility=shell_visibility,
-                    strand_visibility=strand_visibility,
+                    shell_visibility=deployment_shell_visibility,
+                    strand_visibility=deployment_strand_visibility,
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
                     teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                    structured_delta_override=deployment_delta_override,
                 )
                 deployment_prediction = _render(
                     deployment_primitives, camera, cfg, renderer_name
@@ -1841,11 +1860,49 @@ def optimize_unified_fiber_stage2(
             torch.nn.utils.clip_grad_norm_(field.parameters(), cfg.fiber_gradient_clip)
             optimizer.step()
 
+            completed_step = step + 1
+            forced_deployment_floor = _scheduled_structure_detach_floor(
+                completed_step, total_steps, cfg
+            )
+            _enforce_structured_deployment_floor(
+                field,
+                forced_deployment_floor,
+                min_support_fraction=float(
+                    cfg.fiber_structure_detach_min_support_fraction
+                ),
+            )
+            sign_projection_report: dict[str, float] | None = None
+            sign_projection_every = int(cfg.fiber_strand_sign_projection_every)
+            if (
+                representation == "unified"
+                and sign_projection_every > 0
+                and completed_step % sign_projection_every == 0
+            ):
+                with torch.no_grad():
+                    root, tangent, bitangent, normal = field.surface_frame(
+                        motion.rest_surface_vertices, motion.surface_faces
+                    )
+                    del root
+                    rest_frame = torch.stack([tangent, bitangent, normal], dim=-1)
+                    strand_active = field.route_active_gate[:, 1] > 0.5
+                    signed, sign_projection_report = (
+                        _synchronize_outward_direction_signs(
+                            field.direction_local.detach(),
+                            rest_frame,
+                            field.route_neighbor_index,
+                            anchor_threshold=float(
+                                cfg.fiber_strand_outward_anchor_threshold
+                            ),
+                            steps=int(cfg.fiber_strand_sign_projection_steps),
+                            active_mask=strand_active,
+                        )
+                    )
+                    field.direction_local_raw[strand_active] = signed[strand_active]
+
             topology_event: dict[str, object] | None = None
             topology_every = int(cfg.fiber_topology_update_every)
             topology_start = max(int(cfg.fiber_topology_start_step), warmup_steps)
             topology_stop = int(cfg.fiber_topology_stop_step)
-            completed_step = step + 1
             should_update_topology = (
                 representation == "unified"
                 and phase != "gaussian_scaffold"
@@ -1969,6 +2026,8 @@ def optimize_unified_fiber_stage2(
                     "temperature": float(temperature),
                     "route_blend": route_blend,
                     "geometry_blend": geometry_blend,
+                    "forced_deployment_floor": forced_deployment_floor,
+                    "sign_projection": sign_projection_report,
                     "route_hardening": route_hardening,
                     "dropped_route": dropped_route,
                     "route_dropout_probability": (
@@ -2276,6 +2335,18 @@ def optimize_unified_fiber_stage2(
             ),
             "structure_min_deployment_gain": float(
                 cfg.fiber_structure_min_deployment_gain
+            ),
+            "structure_detach_start_fraction": float(
+                cfg.fiber_structure_detach_start_fraction
+            ),
+            "structure_detach_end_fraction": float(
+                cfg.fiber_structure_detach_end_fraction
+            ),
+            "structure_detach_final_gain": float(
+                cfg.fiber_structure_detach_final_gain
+            ),
+            "structure_detach_min_support_fraction": float(
+                cfg.fiber_structure_detach_min_support_fraction
             ),
             "residual_trust_weight": float(cfg.fiber_residual_trust_weight),
             "route_dropout_probability": float(
@@ -2867,6 +2938,21 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
     deployment_gain = float(cfg.fiber_strand_min_deployment_gain)
     if not 0.0 <= deployment_gain <= 1.0:
         raise ValueError("fiber_strand_min_deployment_gain must be in [0, 1]")
+    detach_start = float(cfg.fiber_structure_detach_start_fraction)
+    detach_end = float(cfg.fiber_structure_detach_end_fraction)
+    detach_gain = float(cfg.fiber_structure_detach_final_gain)
+    if not 0.0 <= detach_start <= 1.0:
+        raise ValueError("fiber_structure_detach_start_fraction must be in [0, 1]")
+    if not detach_start <= detach_end <= 1.0:
+        raise ValueError(
+            "fiber_structure_detach_end_fraction must be in [start, 1]"
+        )
+    if not 0.0 <= detach_gain <= 1.0:
+        raise ValueError("fiber_structure_detach_final_gain must be in [0, 1]")
+    if not 0.0 <= float(cfg.fiber_structure_detach_min_support_fraction) <= 1.0:
+        raise ValueError(
+            "fiber_structure_detach_min_support_fraction must be in [0, 1]"
+        )
     if int(cfg.fiber_risk_calibration_every) < 0:
         raise ValueError("fiber_risk_calibration_every must be non-negative")
     calibration_start_blend = float(
@@ -2972,6 +3058,21 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_topology_local_warmup_lr must be non-negative")
     if int(cfg.fiber_topology_local_warmup_views) <= 0:
         raise ValueError("fiber_topology_local_warmup_views must be positive")
+    for name in (
+        "fiber_topology_min_mean_improvement",
+        "fiber_topology_min_birth_deployment",
+        "fiber_topology_min_birth_effective_mass",
+    ):
+        if float(getattr(cfg, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    if float(cfg.fiber_topology_min_birth_deployment) > 1.0:
+        raise ValueError("fiber_topology_min_birth_deployment must be at most one")
+    if float(cfg.fiber_topology_min_birth_effective_mass) > 1.0:
+        raise ValueError("fiber_topology_min_birth_effective_mass must be at most one")
+    if int(cfg.fiber_strand_sign_projection_every) < 0:
+        raise ValueError("fiber_strand_sign_projection_every must be non-negative")
+    if int(cfg.fiber_strand_sign_projection_steps) < 0:
+        raise ValueError("fiber_strand_sign_projection_steps must be non-negative")
     for name in (
         "fiber_scalp_occupancy_min_fraction",
         "fiber_scalp_initial_strand_fraction",
@@ -3719,13 +3820,18 @@ def _topology_event_is_accepted(
     margin: float,
     *,
     allow_neutral: bool = False,
+    min_mean_improvement: float = 0.0,
 ) -> tuple[bool, list[float]]:
     """Require per-view non-regression, not merely a better mean loss."""
 
     if len(before) != len(after) or len(before) < 2:
         raise ValueError("Topology validation requires at least two aligned views")
     deltas = [float(post - pre) for pre, post in zip(before, after, strict=True)]
-    mean_limit = 0.25 * float(margin) if allow_neutral else 0.0
+    mean_limit = (
+        0.25 * float(margin)
+        if allow_neutral and float(min_mean_improvement) <= 0.0
+        else -max(float(min_mean_improvement), 0.0)
+    )
     accepted = (
         max(deltas) <= float(margin)
         and float(np.mean(deltas)) <= mean_limit
@@ -4278,8 +4384,39 @@ def _update_adaptive_topology(
         before_losses,
         after_losses,
         float(cfg.fiber_topology_validation_margin),
-        allow_neutral=bool(cfg.fiber_topology_incremental_birth),
+        allow_neutral=False,
+        min_mean_improvement=float(cfg.fiber_topology_min_mean_improvement),
     )
+    birth_rows = changed[field.route_active_gate[changed, 1] > 0.5]
+    if birth_rows.numel() > 0:
+        birth_delta = field.structured_delta_gain[birth_rows, 1]
+        birth_opacity = field.structured_opacity_gain[birth_rows, 1]
+        birth_route_mass = field.route_probabilities(
+            temperature=float(cfg.fiber_final_temperature)
+        )[birth_rows, 1]
+        birth_deployment = float(birth_delta.mean().detach().cpu())
+        # In non-additive teacher migration, structured opacity is deliberately
+        # ignored by the renderer: ownership transfers the teacher optical
+        # thickness to shell/strand without creating an additive copy.  Do not
+        # reject valid geometry merely because its unused opacity gate is zero.
+        birth_mass = birth_delta * birth_route_mass
+        if bool(cfg.fiber_additive_teacher_mode):
+            birth_mass = birth_mass * birth_opacity
+        birth_effective_mass = float(birth_mass.mean().detach().cpu())
+    else:
+        birth_deployment = 1.0
+        birth_effective_mass = 1.0
+    # Values originate in float32 parameters while thresholds are Python
+    # floats. A source initialized exactly on the configured boundary must not
+    # fail because 0.35 is represented as 0.349999994.
+    threshold_epsilon = 1e-6
+    structural_birth_ok = (
+        birth_deployment + threshold_epsilon
+        >= float(cfg.fiber_topology_min_birth_deployment)
+        and birth_effective_mass + threshold_epsilon
+        >= float(cfg.fiber_topology_min_birth_effective_mass)
+    )
+    accepted = bool(accepted and structural_birth_ok)
     if accepted:
         _clear_adam_rows(optimizer, optimizer_rows, optimizer_changed)
     else:
@@ -4303,6 +4440,12 @@ def _update_adaptive_topology(
         "delta": deltas,
         "margin": float(cfg.fiber_topology_validation_margin),
         "view_count": len(before_losses),
+        "minimum_mean_improvement": float(
+            cfg.fiber_topology_min_mean_improvement
+        ),
+        "birth_deployment": birth_deployment,
+        "birth_effective_mass": birth_effective_mass,
+        "structural_birth_ok": bool(structural_birth_ok),
     }
     return report
 
@@ -4481,41 +4624,69 @@ def _synchronize_outward_direction_signs(
     *,
     anchor_threshold: float,
     steps: int,
+    active_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Resolve the axial d/-d ambiguity with outward anchors and continuity."""
 
     direction = F.normalize(local_direction, dim=-1, eps=1e-8)
-    before_inward = float((direction[:, 2] < 0.0).float().mean().cpu())
-    original_normal = direction[:, 2].abs()
-    direction = torch.where(
-        (direction[:, 2] < 0.0)[:, None], -direction, direction
+    if active_mask is None:
+        active_mask = torch.ones(
+            direction.shape[0], dtype=torch.bool, device=direction.device
+        )
+    else:
+        active_mask = active_mask.to(device=direction.device, dtype=torch.bool)
+    active_count = active_mask.sum().clamp_min(1)
+    before_inward = float(
+        ((direction[:, 2] < 0.0) & active_mask).float().sum().div(active_count).cpu()
     )
-    anchored = original_normal >= max(float(anchor_threshold), 0.0)
+    original_normal = direction[:, 2].abs()
+    flip_inward = (direction[:, 2] < 0.0) & active_mask
+    direction = torch.where(flip_inward[:, None], -direction, direction)
+    anchored = (
+        original_normal >= max(float(anchor_threshold), 0.0)
+    ) & active_mask
     if neighbor_index.numel() > 0:
         for _ in range(max(int(steps), 0)):
             world = torch.einsum("nij,nj->ni", surface_frame, direction)
             neighbor_world = world[neighbor_index]
-            consensus = F.normalize(neighbor_world.mean(dim=1), dim=-1, eps=1e-8)
-            flip = (torch.sum(world * consensus, dim=-1) < 0.0) & (~anchored)
+            valid_neighbor = active_mask[neighbor_index]
+            consensus = F.normalize(
+                (neighbor_world * valid_neighbor[..., None]).sum(dim=1),
+                dim=-1,
+                eps=1e-8,
+            )
+            has_neighbor = valid_neighbor.any(dim=1)
+            flip = (
+                (torch.sum(world * consensus, dim=-1) < 0.0)
+                & (~anchored)
+                & active_mask
+                & has_neighbor
+            )
             direction = torch.where(flip[:, None], -direction, direction)
     # Never allow the continuity solve to turn a root decisively inward.
-    direction = torch.where(
-        (direction[:, 2] < 0.0)[:, None], -direction, direction
-    )
+    flip_inward = (direction[:, 2] < 0.0) & active_mask
+    direction = torch.where(flip_inward[:, None], -direction, direction)
     direction = F.normalize(direction, dim=-1, eps=1e-8)
     world = torch.einsum("nij,nj->ni", surface_frame, direction)
     if neighbor_index.numel() > 0:
         neighbor_dot = torch.sum(world[:, None] * world[neighbor_index], dim=-1)
-        disagreement = float((neighbor_dot < 0.0).float().mean().cpu())
+        valid_pair = active_mask[:, None] & active_mask[neighbor_index]
+        disagreement = float(
+            ((neighbor_dot < 0.0) & valid_pair).float().sum()
+            .div(valid_pair.sum().clamp_min(1))
+            .cpu()
+        )
     else:
         disagreement = 0.0
     return direction, {
         "inward_fraction_before": before_inward,
         "inward_fraction_after": float(
-            (direction[:, 2] < 0.0).float().mean().cpu()
+            (((direction[:, 2] < 0.0) & active_mask).float().sum() / active_count).cpu()
         ),
         "neighbor_sign_disagreement_after": disagreement,
-        "outward_anchor_fraction": float(anchored.float().mean().cpu()),
+        "outward_anchor_fraction": float(
+            anchored.float().sum().div(active_count).cpu()
+        ),
     }
 
 
@@ -6300,6 +6471,81 @@ def _routing_continuation(
     return 1.0, (float(hardness) if cfg.fiber_route_hardening else 0.0)
 
 
+def _scheduled_structure_detach_floor(
+    completed_step: int,
+    total_steps: int,
+    cfg: PipelineConfig,
+) -> float:
+    """Anneal active structured routes away from teacher geometry."""
+
+    final_gain = float(cfg.fiber_structure_detach_final_gain)
+    if final_gain <= 0.0:
+        return 0.0
+    start = float(cfg.fiber_structure_detach_start_fraction)
+    end = float(cfg.fiber_structure_detach_end_fraction)
+    fraction = float(completed_step) / max(float(total_steps), 1.0)
+    if end <= start:
+        progress = 1.0 if fraction >= end else 0.0
+    else:
+        progress = (fraction - start) / (end - start)
+    progress = min(max(progress, 0.0), 1.0)
+    # Smoothstep avoids a derivative discontinuity in the geometry presented
+    # to the renderer while still reaching an exact final floor.
+    progress = progress * progress * (3.0 - 2.0 * progress)
+    return min(max(final_gain * progress, 0.0), 1.0)
+
+
+def _enforce_structured_deployment_floor(
+    field: UnifiedFiberField,
+    floor: float,
+    *,
+    min_support_fraction: float = 0.0,
+) -> None:
+    if float(floor) <= 0.0:
+        return
+    with torch.no_grad():
+        active = field.route_active_gate[:, :2] > 0.5
+        if float(min_support_fraction) > 0.0:
+            active = active & _structured_support_mask(
+                field, min_support_fraction
+            )
+        current = field.structured_delta_raw[:, :2]
+        floor_tensor = torch.full_like(current, float(floor))
+        current.copy_(torch.where(active, torch.maximum(current, floor_tensor), current))
+
+
+def _structured_support_mask(
+    field: UnifiedFiberField,
+    min_support_fraction: float,
+) -> torch.Tensor:
+    threshold = min(max(float(min_support_fraction), 0.0), 1.0)
+    if threshold <= 0.0:
+        return torch.ones(
+            (field.point_count, 2),
+            dtype=torch.bool,
+            device=field.route_logits.device,
+        )
+    masks = []
+    for gate in (field.shell_visibility_gate, field.strand_visibility_gate):
+        if gate.ndim == 2 and gate.shape[0] == field.point_count and gate.shape[1] > 0:
+            masks.append(gate.mean(dim=1) >= threshold)
+        else:
+            masks.append(
+                torch.ones(
+                    field.point_count,
+                    dtype=torch.bool,
+                    device=field.route_logits.device,
+                )
+                if threshold <= 0.0
+                else torch.zeros(
+                    field.point_count,
+                    dtype=torch.bool,
+                    device=field.route_logits.device,
+                )
+            )
+    return torch.stack(masks, dim=-1)
+
+
 def _gradient_norm(module: torch.nn.Module) -> float:
     squared = None
     for parameter in module.parameters():
@@ -6372,6 +6618,7 @@ def _save_training_checkpoint(
                 ),
                 "expert_sh_max_delta": float(cfg.fiber_expert_sh_max_delta),
                 "expert_sh_degree": int(cfg.fiber_expert_sh_degree),
+                "additive_teacher_mode": bool(cfg.fiber_additive_teacher_mode),
                 "representation": cfg.fiber_representation,
                 "hard_route_policy": cfg.fiber_hard_route_policy,
             },

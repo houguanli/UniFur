@@ -478,7 +478,10 @@ class UnifiedFiberField(nn.Module):
         self.register_buffer(
             "route_neighbor_index",
             route_neighbor_index.long(),
-            persistent=False,
+            # The exact graph is part of the learned topology. Rebuilding KNN
+            # after root optimization can change signed continuity and makes
+            # checkpoint audits disagree with training-time regularization.
+            persistent=True,
         )
         self.register_buffer(
             "strand_root_occupancy",
@@ -1112,6 +1115,7 @@ class UnifiedFiberField(nn.Module):
         fin_aspect_ratio: float = 1.0,
         additive_teacher: bool = False,
         teacher_opacity_transfer: float = 0.0,
+        structured_delta_override: float | torch.Tensor | None = None,
     ) -> FiberPrimitives:
         if shell_samples < 1 or strand_samples < 1:
             raise ValueError("shell_samples and strand_samples must be positive")
@@ -1230,6 +1234,24 @@ class UnifiedFiberField(nn.Module):
         )
         strand_rotation = _quaternion_from_x_axis(strand_direction.reshape(-1, 3))
         delta_gain = self.structured_delta_gain
+        if structured_delta_override is not None:
+            override = torch.as_tensor(
+                structured_delta_override,
+                device=delta_gain.device,
+                dtype=delta_gain.dtype,
+            )
+            if override.numel() == 1:
+                override = override.expand_as(delta_gain)
+            if tuple(override.shape) != tuple(delta_gain.shape):
+                raise ValueError(
+                    "structured_delta_override must be scalar or have shape "
+                    f"{tuple(delta_gain.shape)}, got {tuple(override.shape)}"
+                )
+            # Used by the target-geometry auxiliary render: optimize the
+            # analytic primitive itself while the primary render remains an
+            # exact/near-exact teacher migration. This avoids the old loophole
+            # where a "deployment" loss still saw a collapsed learned gain.
+            delta_gain = override.clamp(0.0, 1.0)
         shell_mix = geometry_mix * delta_gain[:, 0]
         strand_mix = geometry_mix * delta_gain[:, 1]
         shell_teacher_xyz = residual_xyz[:, None, :].expand(

@@ -128,6 +128,7 @@ def _load_field(args: argparse.Namespace, motion, device: str):
         "strand_visibility_gate",
         "shell_visibility_gate",
         "route_active_gate",
+        "route_neighbor_index",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed
     if unexpected_missing or incompatible.unexpected_keys:
@@ -332,12 +333,19 @@ def _distribution_audit(
         axial_cosine = torch.abs(
             torch.sum(direction[:, None, :] * neighbor_direction, dim=-1)
         ).clamp(0.0, 1.0)
-        axial_angle = torch.rad2deg(torch.acos(axial_cosine)).mean(dim=1)
-        signed_disagreement = (
+        axial_angle_all = torch.rad2deg(torch.acos(axial_cosine))
+        signed_disagreement_all = (
             torch.sum(direction[:, None, :] * neighbor_direction, dim=-1) < 0.0
-        ).float().mean(dim=1)
+        ).float()
+        active_pair = (
+            strand_active_torch[:, None]
+            & strand_active_torch[neighbor_index]
+        )
+        axial_angle = axial_angle_all[active_pair]
+        signed_disagreement = signed_disagreement_all[active_pair]
     else:
-        axial_angle = torch.zeros(field.point_count, device=direction.device)
+        active_pair = torch.zeros((0,), dtype=torch.bool, device=direction.device)
+        axial_angle = torch.zeros(0, device=direction.device)
         signed_disagreement = torch.zeros_like(axial_angle)
 
     root = geometry["root"]
@@ -412,11 +420,12 @@ def _distribution_audit(
             "neighbor_graph_shape": list(neighbor_index.shape),
             "neighbor_graph_loaded": bool(has_neighbor_graph),
             "neighbor_axial_angle_deg": _quantiles(
-                axial_angle[strand_active_torch].detach().cpu().numpy()
+                axial_angle.detach().cpu().numpy()
             ),
             "signed_neighbor_disagreement": _quantiles(
-                signed_disagreement[strand_active_torch].detach().cpu().numpy()
+                signed_disagreement.detach().cpu().numpy()
             ),
+            "active_strand_pair_count": int(active_pair.sum().detach().cpu()),
             "direction_normal_cosine": _quantiles(
                 direction_normal_cosine[strand_active_torch].detach().cpu().numpy()
             ),
@@ -502,10 +511,19 @@ def _distribution_audit(
                 strand_opacity[strand_active_torch].detach().cpu().numpy()
             ),
             "effective_deployed_mass": {
-                "shell_mean": float(
+                # Geometry realization is the relevant quantity when teacher
+                # optical thickness is transferred rather than additively
+                # gated.  Keep both measures explicit for auditability.
+                "shell_geometry_mean": float(
+                    shell_delta[shell_active_torch].mean().cpu()
+                ) if int(shell_active.sum()) else 0.0,
+                "strand_geometry_mean": float(
+                    strand_delta[strand_active_torch].mean().cpu()
+                ) if int(strand_active.sum()) else 0.0,
+                "shell_opacity_weighted_mean": float(
                     (shell_delta[shell_active_torch] * shell_opacity[shell_active_torch]).mean().cpu()
                 ) if int(shell_active.sum()) else 0.0,
-                "strand_mean": float(
+                "strand_opacity_weighted_mean": float(
                     (strand_delta[strand_active_torch] * strand_opacity[strand_active_torch]).mean().cpu()
                 ) if int(strand_active.sum()) else 0.0,
             },
@@ -551,7 +569,7 @@ def _geometry_quality_gates(
             0.35,
         ),
         "effective_deployed_mass": (
-            float(optimization["effective_deployed_mass"]["strand_mean"]),
+            float(optimization["effective_deployed_mass"]["strand_geometry_mean"]),
             ">=",
             0.35,
         ),

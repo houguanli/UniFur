@@ -198,6 +198,9 @@ def evaluate_unified_fiber_stage2(
         shell_propagated_direction_weight=float(
             cfg.fiber_shell_propagated_direction_weight
         ),
+        neighbor_k=int(
+            metadata.get("route_neighbor_k", cfg.fiber_route_neighbor_k)
+        ),
         root_barycentric_max_delta=float(
             metadata.get(
                 "root_barycentric_max_delta",
@@ -265,6 +268,7 @@ def evaluate_unified_fiber_stage2(
         "barycentric_offset_raw",
         "strand_root_occupancy",
         "expert_sh_delta_raw",
+        "route_neighbor_index",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:

@@ -129,6 +129,7 @@ def _load_field(args, cfg, device):
         "initial_carrier_probabilities",
         "initial_carrier_root_tip",
         "route_active_gate",
+        "route_neighbor_index",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:

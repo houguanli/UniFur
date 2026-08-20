@@ -10,6 +10,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _bidirectional_mask_losses,
     _front_surface_visibility,
     _front_visible_sample_gate,
+    _enforce_structured_deployment_floor,
     _initialize_multiview_coverage_seeds,
     _initialize_render_preserving_adaptive_migration,
     _initialize_render_preserving_semantic_migration,
@@ -20,6 +21,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _parallel_transport_surface_directions,
     _residual_footprint_probe_points,
     _route_visual_hull_soft_loss,
+    _scheduled_structure_detach_floor,
     _resolve_fiber_point_budget,
     _freeze_residual_teacher_scaffold,
     _structured_spill_loss,
@@ -119,6 +121,49 @@ def test_topology_event_rejects_single_view_regression_despite_better_mean() -> 
         margin=0.01,
     )
     assert accepted
+
+
+def test_topology_event_requires_declared_mean_improvement() -> None:
+    accepted, _ = _topology_event_is_accepted(
+        [1.0, 1.0, 1.0],
+        [0.999999, 0.999999, 0.999999],
+        margin=0.01,
+        min_mean_improvement=1e-4,
+    )
+    assert not accepted
+    accepted, _ = _topology_event_is_accepted(
+        [1.0, 1.0, 1.0],
+        [0.9998, 0.9998, 0.9998],
+        margin=0.01,
+        min_mean_improvement=1e-4,
+    )
+    assert accepted
+
+
+def test_structured_detach_schedule_and_floor_are_route_specific() -> None:
+    cfg = PipelineConfig(
+        fiber_structure_detach_start_fraction=0.25,
+        fiber_structure_detach_end_fraction=0.75,
+        fiber_structure_detach_final_gain=1.0,
+    )
+    assert _scheduled_structure_detach_floor(20, 100, cfg) == 0.0
+    assert 0.0 < _scheduled_structure_detach_floor(50, 100, cfg) < 1.0
+    assert _scheduled_structure_detach_floor(80, 100, cfg) == 1.0
+
+    class Field:
+        route_active_gate = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        structured_delta_raw = torch.nn.Parameter(
+            torch.tensor([[0.1, 0.2], [0.3, 0.1], [0.4, 0.5]])
+        )
+
+    field = Field()
+    _enforce_structured_deployment_floor(field, 0.8)
+    torch.testing.assert_close(
+        field.structured_delta_raw,
+        torch.tensor([[0.8, 0.2], [0.3, 0.8], [0.4, 0.5]]),
+    )
 
 
 def test_area_stratified_scalp_atlas_covers_faces_with_interior_roots() -> None:

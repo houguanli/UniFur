@@ -116,6 +116,7 @@ def _load_field(args: argparse.Namespace, motion: DifferentiableSurfaceScaffold)
         "shell_visibility_gate",
         "strand_visibility_gate",
         "route_active_gate",
+        "route_neighbor_index",
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:

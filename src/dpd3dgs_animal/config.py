@@ -95,6 +95,13 @@ class PipelineConfig:
     # collection of collapsed residual Gaussians.
     fiber_structure_deployment_weight: float = 0.0
     fiber_structure_min_deployment_gain: float = 0.0
+    # Render-equivalent migration is only a bootstrap.  During the final
+    # fraction of training, active shell/strand routes are deterministically
+    # detached from teacher position/covariance and become real primitives.
+    fiber_structure_detach_start_fraction: float = 1.0
+    fiber_structure_detach_end_fraction: float = 1.0
+    fiber_structure_detach_final_gain: float = 0.0
+    fiber_structure_detach_min_support_fraction: float = 0.0
     fiber_route_lr_scale: float = 1.0
     fiber_initial_residual_trust: float = 0.95
     # Optional geometry-only initialization for sparse neutral scalp/head
@@ -221,11 +228,22 @@ class PipelineConfig:
     fiber_topology_local_warmup_steps: int = 4
     fiber_topology_local_warmup_lr: float = 0.0005
     fiber_topology_local_warmup_views: int = 4
+    # A birth must become visible structured geometry and improve held-out
+    # risk, rather than being accepted merely because it stays invisible.
+    fiber_topology_min_mean_improvement: float = 0.0
+    fiber_topology_min_birth_deployment: float = 0.0
+    fiber_topology_min_birth_effective_mass: float = 0.0
+    # Periodically resolve root-to-tip sign ambiguity after optimizer updates.
+    fiber_strand_sign_projection_every: int = 0
+    fiber_strand_sign_projection_steps: int = 4
     # Auxiliary supervision on the exact fully-deployed inference geometry.
     # This closes the continuation-schedule gap where an early checkpoint is
     # safe while partially blended during training but spills when evaluated
     # with geometry_blend=1.
     fiber_deployment_render_weight: float = 0.0
+    # Render supported analytic shell/strand targets with unit deployment for
+    # the auxiliary geometry loss while unsupported targets remain safe.
+    fiber_deployment_force_target_geometry: bool = False
     # Hair growth is optimized on the uncollapsed analytic target rather than
     # the residual-blended render proxy.  This closes a loophole where a
     # zero-gain strand trivially passes every visual-hull test.

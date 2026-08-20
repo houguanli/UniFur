@@ -201,6 +201,7 @@ def audit_unified_fiber_routes(
         "shell_visibility_gate",
         "strand_visibility_gate",
         "route_active_gate",
+        "route_neighbor_index",
         "carrier_logits",
         "carrier_root_tip_raw",
         "initial_carrier_probabilities",
