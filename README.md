@@ -32,6 +32,11 @@ are:
 See [the v16 limitation record](docs/wcurly_v16_known_issues_20260818.md) for
 the measured numbers and required next work.
 
+For the current end-to-end algorithm description, Panda/wCurly metric tables,
+geometry audit, independent three-perspective assessment and prioritized
+revision gates, see [the 2026-08-20 UniFur framework and progress
+assessment](docs/unifur_algorithm_framework_and_assessment_20260820.md).
+
 ## Pipeline
 
 ```text
