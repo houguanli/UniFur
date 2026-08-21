@@ -17,6 +17,7 @@ from .fiber import (
     partition_binding_cache,
 )
 from .fiber_optimize import _render
+from .gaussian import load_gaussian_ply
 from .scaffold import (
     DifferentiableSurfaceScaffold,
     _frame_paths,
@@ -171,6 +172,7 @@ def evaluate_unified_fiber_stage2(
             if "scalp_face_indices" in stage1_payload.files
             else None
         )
+    source_count = int(load_gaussian_ply(gaussian_ply).xyz.shape[0])
     field = create_unified_fiber_field(
         gaussian_ply,
         motion.rest_surface_vertices.detach().cpu().numpy(),
@@ -215,6 +217,7 @@ def evaluate_unified_fiber_stage2(
         ),
         initial_residual_trust=float(cfg.fiber_initial_residual_trust),
         scalp_face_indices=scalp_face_indices,
+        unbound_root_capacity=max(point_count - source_count, 0),
         binding_cache=(
             partition_binding_cache(cfg.fiber_binding_cache, "foreground")
             if split_fixed_base
