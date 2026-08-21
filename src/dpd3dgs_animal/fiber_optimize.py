@@ -3929,8 +3929,6 @@ def _topology_local_warmup(
         field.point_count, dtype=torch.bool, device=field.route_logits.device
     )
     local_mask[changed] = True
-    if field.route_neighbor_index.numel() > 0:
-        local_mask[field.route_neighbor_index[changed].reshape(-1)] = True
     local_rows = torch.nonzero(local_mask, as_tuple=False)[:, 0]
     parameters = [
         field.route_logits,
@@ -3944,7 +3942,17 @@ def _topology_local_warmup(
         field.direction_local_raw,
         field.bend_local,
         field.bend_cubic_local,
+        field.expert_color_delta,
     ]
+    if field.expert_sh_delta_raw is not None:
+        parameters.append(field.expert_sh_delta_raw)
+    first_moments = [
+        torch.zeros_like(parameter[local_rows]) for parameter in parameters
+    ]
+    second_moments = [
+        torch.zeros_like(parameter[local_rows]) for parameter in parameters
+    ]
+    beta1, beta2 = 0.9, 0.999
     losses: list[float] = []
     gradient_norms: list[float] = []
     for warmup_step in range(steps):
@@ -4003,13 +4011,30 @@ def _topology_local_warmup(
         )
         squared_gradient_norm = loss.new_zeros(())
         with torch.no_grad():
-            for parameter, gradient in zip(parameters, gradients, strict=True):
+            for index, (parameter, gradient) in enumerate(
+                zip(parameters, gradients, strict=True)
+            ):
                 if gradient is not None:
-                    squared_gradient_norm.add_(
-                        gradient[local_rows].square().sum()
+                    local_gradient = gradient[local_rows]
+                    squared_gradient_norm.add_(local_gradient.square().sum())
+                    first_moments[index].mul_(beta1).add_(
+                        local_gradient, alpha=1.0 - beta1
                     )
-                    parameter[local_rows].add_(
-                        gradient[local_rows], alpha=-learning_rate
+                    second_moments[index].mul_(beta2).addcmul_(
+                        local_gradient, local_gradient, value=1.0 - beta2
+                    )
+                    step_index = warmup_step + 1
+                    first_hat = first_moments[index] / (1.0 - beta1**step_index)
+                    second_hat = second_moments[index] / (1.0 - beta2**step_index)
+                    update = learning_rate * first_hat / (
+                        second_hat.sqrt() + 1e-8
+                    )
+                    # Advanced indexing returns a copy. index_copy_ is required
+                    # to write the local birth update into the Parameter.
+                    parameter.index_copy_(
+                        0,
+                        local_rows,
+                        parameter[local_rows] - update,
                     )
         losses.append(float(loss.detach().cpu()))
         gradient_norms.append(float(squared_gradient_norm.sqrt().cpu()))
@@ -5306,10 +5331,7 @@ def _estimate_multiview_orientation_directions(
             camera,
             orientation["vectors"][..., 1].to(device=device, dtype=dtype),
         )
-        theta = 0.5 * torch.atan2(vector_y, vector_x)
-        perpendicular = torch.stack(
-            [-torch.sin(theta), torch.cos(theta)], dim=-1
-        )
+        perpendicular = _hairgs_orientation_perpendicular(vector_x, vector_y)
 
         world_to_camera = torch.as_tensor(
             camera.world_to_camera, device=device, dtype=dtype
@@ -5403,6 +5425,17 @@ def _estimate_multiview_orientation_directions(
         torch.zeros_like(eigengap),
     )
     return local_direction, world_direction, confidence, report
+
+
+def _hairgs_orientation_perpendicular(
+    double_angle_cosine: torch.Tensor,
+    double_angle_sine: torch.Tensor,
+) -> torch.Tensor:
+    """Decode HairGS' y-axis-clockwise axial orientation convention."""
+
+    theta = 0.5 * torch.atan2(double_angle_sine, double_angle_cosine)
+    # HairGS tangent is [sin(theta), cos(theta)] in image x/y coordinates.
+    return torch.stack([torch.cos(theta), -torch.sin(theta)], dim=-1)
 
 
 def _initialize_multiview_coverage_seeds(

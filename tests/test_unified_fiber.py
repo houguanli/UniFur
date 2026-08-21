@@ -11,6 +11,7 @@ from dpd3dgs_animal.fiber_optimize import (
     _front_surface_visibility,
     _front_visible_sample_gate,
     _enforce_structured_deployment_floor,
+    _hairgs_orientation_perpendicular,
     _initialize_multiview_coverage_seeds,
     _initialize_render_preserving_adaptive_migration,
     _initialize_render_preserving_semantic_migration,
@@ -532,6 +533,21 @@ def test_surface_direction_propagation_fills_an_unobserved_root() -> None:
     torch.testing.assert_close(propagated[[0, 2]], local[[0, 2]])
 
 
+def test_hairgs_orientation_decode_uses_y_axis_clockwise_convention() -> None:
+    theta = torch.tensor([0.0, torch.pi / 4.0, torch.pi / 2.0])
+    perpendicular = _hairgs_orientation_perpendicular(
+        torch.cos(2.0 * theta), torch.sin(2.0 * theta)
+    )
+    tangent = torch.stack([torch.sin(theta), torch.cos(theta)], dim=-1)
+    torch.testing.assert_close(
+        torch.sum(perpendicular * tangent, dim=-1),
+        torch.zeros(3),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(perpendicular[0], torch.tensor([1.0, 0.0]))
+
+
 def test_shell_direction_can_be_decoupled_from_propagated_strand_flow() -> None:
     field, vertices, faces = _toy_field()
     field.shell_propagated_direction_weight = 0.0
@@ -726,6 +742,7 @@ def test_topology_birth_local_warmup_updates_only_cluster_rows() -> None:
     )
     target_mask = torch.zeros(32, 32)
     target_mask[:, 16:] = 1.0
+    appearance_before = field.expert_color_delta.detach().clone()
     report = _topology_local_warmup(
         field,
         [vertices],
@@ -738,10 +755,18 @@ def test_topology_birth_local_warmup_updates_only_cluster_rows() -> None:
     )
     assert report["steps"] == 2
     assert len(report["loss"]) == 2
-    # The one-ring contains both toy roots, so both are the explicit local set.
-    assert report["rows"] == 2
+    # A birth warmup updates only the proposed cluster, not established
+    # one-ring neighbors.
+    assert report["rows"] == 1
     assert max(report["gradient_norm"]) > 0.0
     assert all(np.isfinite(report["loss"]))
+    assert report["loss"][-1] != report["loss"][0]
+    assert not torch.equal(
+        field.expert_color_delta[0].detach(), appearance_before[0]
+    )
+    torch.testing.assert_close(
+        field.expert_color_delta[1].detach(), appearance_before[1]
+    )
 
 
 def test_residual_footprint_probes_cover_center_and_local_axes() -> None:
