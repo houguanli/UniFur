@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from dpd3dgs_animal.fiber import create_unified_fiber_field
+from dpd3dgs_animal.gaussian import load_gaussian_ply
 from dpd3dgs_animal.fiber_optimize import _sample_mask_at_world_points
 from dpd3dgs_animal.observations import resolve_observations
 from dpd3dgs_animal.scaffold import (
@@ -60,6 +61,8 @@ def _load_field(args: argparse.Namespace, motion, device: str):
             if "scalp_face_indices" in stage1_payload.files
             else None
         )
+    source_count = int(load_gaussian_ply(args.gaussian_ply).xyz.shape[0])
+    checkpoint_count = int(field_config.get("point_count", source_count))
     field = create_unified_fiber_field(
         args.gaussian_ply,
         motion.rest_surface_vertices.detach().cpu().numpy(),
@@ -106,6 +109,7 @@ def _load_field(args: argparse.Namespace, motion, device: str):
             field_config.get("initialize_direction_from_normal", False)
         ),
         scalp_face_indices=scalp_face_indices,
+        unbound_root_capacity=max(checkpoint_count - source_count, 0),
         binding_cache=field_config.get("binding_cache"),
     )
     state = payload["state_dict"]
