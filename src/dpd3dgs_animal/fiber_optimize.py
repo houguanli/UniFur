@@ -17,6 +17,7 @@ from .fiber import (
     CARRIER_NAMES,
     HARD_ROUTE_POLICIES,
     ROUTE_NAMES,
+    ScalpRootAtlas,
     UnifiedFiberField,
     apply_fin_view_gate,
     attach_fixed_gaussian_base,
@@ -89,10 +90,10 @@ def _load_residual_bootstrap_checkpoint(
                 f"representation='residual_only', got {representation!r}"
             )
         point_count = metadata.get("point_count")
-        if point_count is not None and int(point_count) != field.point_count:
+        if point_count is not None and int(point_count) > field.point_count:
             raise ValueError(
-                "Residual bootstrap point count does not match current field: "
-                f"{point_count} != {field.point_count}"
+                "Residual bootstrap point count exceeds current field capacity: "
+                f"{point_count} > {field.point_count}"
             )
 
     source_state = payload["state_dict"]
@@ -103,6 +104,18 @@ def _load_residual_bootstrap_checkpoint(
         if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
             raise ValueError(f"Residual bootstrap checkpoint lacks tensor {key!r}")
         if tuple(source.shape) != tuple(target.shape):
+            prefix_compatible = (
+                source.ndim == target.ndim
+                and tuple(source.shape[1:]) == tuple(target.shape[1:])
+                and source.shape[0] <= target.shape[0]
+            )
+            if prefix_compatible:
+                expanded = target.clone()
+                expanded[: source.shape[0]] = source.to(
+                    device=target.device, dtype=target.dtype
+                )
+                target_state[key] = expanded
+                continue
             raise ValueError(
                 f"Residual bootstrap tensor {key!r} shape mismatch: "
                 f"{tuple(source.shape)} != {tuple(target.shape)}"
@@ -652,6 +665,11 @@ def optimize_unified_fiber_stage2(
             cfg.fiber_initialize_direction_from_normal
         ),
         scalp_face_indices=scalp_face_indices,
+        unbound_root_capacity=(
+            int(cfg.fiber_scalp_unbound_root_capacity)
+            if representation == "unified"
+            else 0
+        ),
         binding_cache=(
             partition_binding_cache(cfg.fiber_binding_cache, "foreground")
             if split_fixed_base
@@ -3613,8 +3631,10 @@ def _apply_adaptive_topology_scores(
     )
 
     with torch.no_grad():
+        unbound_before = ~field.bound_root_mask
         active[pruned, residual_index] = 0.0
         if grown.numel() > 0:
+            field.bound_root_mask[grown] = True
             incremental_birth = bool(cfg.fiber_topology_incremental_birth)
             if incremental_birth:
                 # Keep the existing shell and admit an almost-zero-mass
@@ -3687,6 +3707,7 @@ def _apply_adaptive_topology_scores(
             if proposed_bend_local is not None:
                 field.bend_local[grown] = proposed_bend_local[grown]
         if densified.numel() > 0:
+            field.bound_root_mask[densified] = True
             if cfg.fiber_teacher_semantic_migration_mass is not None:
                 active[densified] = 0.0
             active[densified, shell_index] = 1.0
@@ -3763,6 +3784,8 @@ def _apply_adaptive_topology_scores(
         "pruned_count": int(pruned.numel()),
         "grown_count": int(grown.numel()),
         "densified_count": int(densified.numel()),
+        "grown_unbound_count": int(unbound_before[grown].sum().item()),
+        "densified_unbound_count": int(unbound_before[densified].sum().item()),
         "pruned_support": selected_stats(residual_support, pruned),
         "grown_deficit": selected_stats(deficit_score, grown),
         "grown_deficit_views": selected_stats(deficit_views, grown),
@@ -3796,6 +3819,12 @@ _TOPOLOGY_MUTABLE_FIELD_NAMES = (
     "direction_local_raw",
     "bend_local",
     "bend_cubic_local",
+    "face_index",
+    "barycentric",
+    "bound_root_mask",
+    "rest_surface_frame",
+    "initial_residual_offset_local",
+    "residual_offset_local",
 )
 
 
@@ -5004,6 +5033,10 @@ def _initialize_intrinsic_surface_propagation(
         strand_sign_report: dict[str, float] = {}
         if bool(cfg.fiber_scalp_occupancy_enabled):
             source_scalp = scalp_face_eligible[field.face_index]
+            # Atlas capacity is independent of the source PLY.  Reserve rows
+            # are eligible even before their placeholder face is replaced.
+            unbound_slots = ~field.bound_root_mask
+            source_scalp = source_scalp | unbound_slots
             field.strand_root_occupancy.copy_(source_scalp.to(dtype))
             scalp_sources = torch.nonzero(source_scalp, as_tuple=False).reshape(-1)
             initial_fraction = float(cfg.fiber_scalp_initial_strand_fraction)
@@ -5025,8 +5058,9 @@ def _initialize_intrinsic_surface_propagation(
                     + 0.20 * _rank_unit_interval(anisotropy)
                     + 0.10 * field.opacity.detach()
                 )
-                ranked = scalp_sources[
-                    torch.argsort(score[scalp_sources], descending=True)
+                bound_scalp_sources = scalp_sources[field.bound_root_mask[scalp_sources]]
+                ranked = bound_scalp_sources[
+                    torch.argsort(score[bound_scalp_sources], descending=True)
                 ]
                 initial_strands = ranked[:initial_count]
             if bool(cfg.fiber_scalp_atlas_enabled) and scalp_sources.numel() > 0:
@@ -5204,7 +5238,9 @@ def _initialize_intrinsic_surface_propagation(
             strand_index = ROUTE_NAMES.index("strand")
             residual_index = ROUTE_NAMES.index("residual")
             residual_active = field.route_active_gate[:, residual_index].clone()
-            field.route_active_gate[:, shell_index] = 1.0
+            field.route_active_gate[:, shell_index] = field.bound_root_mask.to(
+                field.route_active_gate.dtype
+            )
             field.route_active_gate[:, strand_index] = 0.0
             field.route_active_gate[initial_strands, shell_index] = 0.0
             field.route_active_gate[initial_strands, strand_index] = 1.0
@@ -5216,6 +5252,11 @@ def _initialize_intrinsic_surface_propagation(
             )
             scalp_source_count = int(scalp_sources.numel())
             scalp_initial_strand_count = int(initial_strands.numel())
+            field._scalp_atlas = ScalpRootAtlas(
+                field.face_index.detach().clone(),
+                field.barycentric.detach().clone(),
+                field.bound_root_mask.detach().clone(),
+            )
 
         final_quantized = torch.round(field.barycentric[:, :2] * 1023.0).long()
         unique_after = torch.unique(

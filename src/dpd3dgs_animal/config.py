@@ -347,6 +347,10 @@ class PipelineConfig:
     # rebinding strand sources to an area-stratified supported scalp atlas.
     fiber_scalp_atlas_enabled: bool = False
     fiber_scalp_atlas_min_roots_per_face: int = 1
+    # Extra rows owned by the canonical scalp atlas rather than by Stage-I
+    # Gaussians. They start unbound/zero-gated and are activated only after a
+    # multi-view deficit birth passes validation.
+    fiber_scalp_unbound_root_capacity: int = 0
     # Image orientation is axial: d and -d are observationally equivalent.
     # Resolve polarity before curves are deployed or visual-hull culled.
     fiber_strand_outward_sign_enabled: bool = False

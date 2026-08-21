@@ -23,6 +23,40 @@ CARRIER_NAMES = ("surface", "shell", "strand")
 HARD_ROUTE_POLICIES = ("argmax", "mass_preserving")
 
 
+@dataclass
+class ScalpRootAtlas:
+    """Canonical surface slots independent of the Stage-I Gaussian rows.
+
+    A slot is identified by ``(face_index, barycentric)``. ``bound`` is
+    deliberately separate from the coordinates: an atlas slot may exist in
+    the supported scalp domain while still being invisible to the renderer.
+    """
+
+    face_index: torch.Tensor
+    barycentric: torch.Tensor
+    bound: torch.Tensor
+
+    @property
+    def count(self) -> int:
+        return int(self.face_index.numel())
+
+    @property
+    def unbound_indices(self) -> torch.Tensor:
+        return torch.nonzero(~self.bound, as_tuple=False).reshape(-1)
+
+    def bind(self, indices: torch.Tensor) -> None:
+        if indices.numel() > 0:
+            self.bound[indices] = True
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "atlas_root_count": self.count,
+            "atlas_bound_count": int(self.bound.sum().item()),
+            "atlas_unbound_count": int((~self.bound).sum().item()),
+            "atlas_face_count": int(torch.unique(self.face_index).numel()),
+        }
+
+
 def mass_preserving_route_ids(probabilities: torch.Tensor) -> torch.Tensor:
     """Assign one route per source while preserving aggregate soft route mass.
 
@@ -431,12 +465,20 @@ class UnifiedFiberField(nn.Module):
         source_mask_threshold: float = 0.25,
         source_sh_coefficients: torch.Tensor | None = None,
         original_xyz: torch.Tensor | None = None,
+        bound_root_mask: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         eps = max(float(scene_scale) * 1e-7, 1e-8)
         self.positive_eps = eps
         self.register_buffer("face_index", face_index.long())
         self.register_buffer("barycentric", barycentric.float())
+        if bound_root_mask is None:
+            bound_root_mask = torch.ones(
+                (face_index.shape[0],), dtype=torch.bool, device=face_index.device
+            )
+        if tuple(bound_root_mask.shape) != (face_index.shape[0],):
+            raise ValueError("bound_root_mask must contain one value per root")
+        self.register_buffer("bound_root_mask", bound_root_mask.bool())
         if not 0.0 <= float(root_barycentric_max_delta) <= 1.0:
             raise ValueError("root_barycentric_max_delta must be in [0, 1]")
         self.root_barycentric_max_delta = float(root_barycentric_max_delta)
@@ -2061,6 +2103,7 @@ def create_unified_fiber_field(
     initial_strand_length_scale: float | None = None,
     initialize_direction_from_normal: bool = False,
     scalp_face_indices: np.ndarray | None = None,
+    unbound_root_capacity: int = 0,
     binding_cache: str | Path | None = None,
 ) -> UnifiedFiberField:
     device = device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"
@@ -2206,6 +2249,46 @@ def create_unified_fiber_field(
         if scalp_faces.min() < 0 or scalp_faces.max() >= len(faces):
             raise ValueError("scalp_face_indices contains an out-of-range face")
         binding_faces = faces[scalp_faces]
+
+    # Reserve genuinely independent atlas slots.  They are initialized at a
+    # valid surface location but have zero route gates (set immediately after
+    # construction), so they cannot change the teacher render.  Unlike the
+    # historical ``duplicate_slots`` pool these rows are not tied to a
+    # particular Stage-I Gaussian and can later be bound to any scalp face.
+    unbound_root_capacity = max(int(unbound_root_capacity), 0)
+    initial_bound_mask = np.ones((xyz.shape[0] + unbound_root_capacity,), dtype=bool)
+    if unbound_root_capacity > 0:
+        placeholder_face = int(
+            np.asarray(scalp_faces if scalp_faces is not None else [0]).reshape(-1)[0]
+        )
+        placeholder_tri = vertices[faces[placeholder_face]]
+        placeholder_xyz = placeholder_tri.mean(axis=0, keepdims=True).repeat(
+            unbound_root_capacity, axis=0
+        )
+        xyz = np.concatenate([xyz, placeholder_xyz.astype(np.float32)], axis=0)
+        color = np.concatenate(
+            [color, np.repeat(color.mean(axis=0, keepdims=True), unbound_root_capacity, axis=0)], axis=0
+        )
+        opacity = np.concatenate(
+            [opacity, np.full((unbound_root_capacity,), 1e-4, dtype=np.float32)], axis=0
+        )
+        scaling = np.concatenate(
+            [scaling, np.repeat(np.median(scaling, axis=0, keepdims=True), unbound_root_capacity, axis=0)], axis=0
+        )
+        rotation = np.concatenate(
+            [rotation, np.repeat(rotation[:1], unbound_root_capacity, axis=0)], axis=0
+        )
+        foreground_probability = np.concatenate(
+            [foreground_probability, np.ones((unbound_root_capacity,), dtype=np.float32)], axis=0
+        )
+        if sh_coefficients is not None:
+            sh_coefficients = np.concatenate(
+                [sh_coefficients, np.repeat(sh_coefficients.mean(axis=0, keepdims=True), unbound_root_capacity, axis=0)], axis=0
+            )
+        source_indices = np.concatenate(
+            [source_indices, -np.arange(1, unbound_root_capacity + 1, dtype=np.int64)], axis=0
+        )
+
     cache_key = _binding_cache_key(xyz, vertices, faces, scalp_faces)
     binding = None
     cache_path = Path(binding_cache) if binding_cache is not None else None
@@ -2368,7 +2451,7 @@ def create_unified_fiber_field(
     route_neighbor_index = _surface_knn_indices(roots, int(neighbor_k))
 
     tensor = lambda value: torch.as_tensor(value, dtype=torch.float32, device=device)
-    return UnifiedFiberField(
+    field = UnifiedFiberField(
         face_index=torch.as_tensor(binding.face_index, dtype=torch.long, device=device),
         barycentric=tensor(binding.barycentric),
         color=tensor(color),
@@ -2402,7 +2485,20 @@ def create_unified_fiber_field(
         source_sh_coefficients=(
             tensor(sh_coefficients) if sh_coefficients is not None else None
         ),
+        bound_root_mask=torch.as_tensor(initial_bound_mask, dtype=torch.bool, device=device),
     )
+    if unbound_root_capacity > 0:
+        reserve = torch.arange(
+            field.point_count - unbound_root_capacity,
+            field.point_count,
+            device=device,
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            field.bound_root_mask[reserve] = False
+            field.route_active_gate[reserve] = 0.0
+            field.strand_root_occupancy[reserve] = 0.0
+    return field
 
 
 def partition_binding_cache(

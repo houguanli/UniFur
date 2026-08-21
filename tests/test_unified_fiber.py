@@ -35,6 +35,7 @@ from dpd3dgs_animal.config import PipelineConfig, load_config
 from dpd3dgs_animal.fiber import (
     CARRIER_NAMES,
     FixedGaussianBase,
+    ScalpRootAtlas,
     UnifiedFiberField,
     _bind_exact_surface_vertices,
     _bind_nearest_surface_vertices,
@@ -512,6 +513,19 @@ def test_unified_routes_form_a_differentiable_partition() -> None:
     assert torch.isfinite(field.residual_trust_logits.grad).all()
     assert field.direction_local_raw.grad is not None
     assert torch.isfinite(field.direction_local_raw.grad).all()
+
+
+def test_scalp_atlas_keeps_unbound_slots_out_of_initial_routes() -> None:
+    field, _vertices, _faces = _toy_field()
+    field.bound_root_mask[1] = False
+    field.route_active_gate[1] = 0.0
+    atlas = ScalpRootAtlas(
+        field.face_index.clone(), field.barycentric.clone(), field.bound_root_mask.clone()
+    )
+    assert atlas.unbound_indices.tolist() == [1]
+    assert float(field.route_active_gate[1].sum()) == 0.0
+    atlas.bind(torch.tensor([1]))
+    assert atlas.unbound_indices.numel() == 0
 
 
 def test_surface_direction_propagation_fills_an_unobserved_root() -> None:
