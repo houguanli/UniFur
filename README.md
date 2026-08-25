@@ -1,179 +1,133 @@
 # UniFur
 
-Unified shell/strand Gaussian reconstruction for animal fur and human hair.
+HairGS-based adaptive shell/fin/strand reconstruction for multi-view hair.
 
-UniFur is an optimization-first research prototype. Given a calibrated
-multi-view image set, foreground masks, a surface/motion scaffold and an
-initial Gaussian cloud, it learns a shared Gaussian representation whose
-primitives are assigned to two editable structural families:
-
-- **shell/fin primitives** for dense, short fur;
-- **strand primitives** for long hair and directional fibers.
-
-The project does not claim exact recovery of every physical fiber. Its target
-is an equivalent, renderable and simulation-ready representation.
+This branch replaces the maintained hair reconstruction path with native
+HairGS Stage-1/Stage-2 geometry and rendering. UniFur adds deterministic route
+ownership, route-aware optimization, unified held-out evaluation, and
+leave-one-route-out auditing without changing HairGS camera or alpha semantics.
 
 ## Current milestone
 
-The frozen checkpoint is tagged
-[`v0.4.0-wcurly-v16`](https://github.com/houguanli/UniFur/tree/v0.4.0-wcurly-v16).
-It contains multi-view orientation supervision, occlusion-aware visual-hull
-constraints, adaptive shell/strand migration and grouped worst-view
-calibration.
+The WCurly milestone uses 12 training views and 4 held-out views at 500 x 500
+with fixed calibrated cameras. It retains the native HairGS Stage-2 model,
+freezes topology, and replaces the native 15k Stage-3 with route-aware 4k plus
+1k calibration.
 
-This milestone is reproducible but not the final model. The main known issues
-are:
+| Method | train FG PSNR | held-out FG PSNR | held-out LPIPS | held-out IoU | Stage-3 wall |
+|---|---:|---:|---:|---:|---:|
+| HairGS native 15k | 28.9437 | 16.8499 | 0.1309 | 0.8541 | 1376.22 s |
+| HairGS native 5k control | 28.0057 | 17.3031 | 0.1269 | 0.8467 | 317.89 s |
+| UniFur adaptive-route 5k | 27.9968 | **17.3480** | **0.1264** | 0.8466 | 323.08 s |
 
-- nearest-vertex binding collapses 108,981 sources to 5,802 distinct roots;
-- analytic strands use only five equal-width samples and do not taper;
-- held-out WCurly views still contain large connected holes and spill;
-- the v16 experiment accepted no topology birth/prune events.
+Against HairGS native 15k, the adaptive milestone reduces:
 
-See [the v16 limitation record](docs/wcurly_v16_known_issues_20260818.md) for
-the measured numbers and required next work.
+- Stage-3 wall time by 76.52%;
+- Stage-3 optimization steps by 66.67%;
+- final deployment bytes by 33.18%;
+- segment count by 48.04%.
 
-For the current end-to-end algorithm description, Panda/wCurly metric tables,
-geometry audit, independent three-perspective assessment and prioritized
-revision gates, see [the 2026-08-20 UniFur framework and progress
-assessment](docs/unifur_algorithm_framework_and_assessment_20260820.md).
+The median end-to-end render command improves by only 8.08%, so this milestone
+does not claim significant render-speed acceleration.
 
-## Pipeline
+## Claim boundary
 
-```text
-calibrated images + masks + camera manifest
-                    |
-surface/motion scaffold NPZ + initial Gaussian PLY
-                    |
-         continuous surface binding
-                    |
-        shell / strand structural experts
-                    |
-   differentiable Gaussian rasterization (Torch or HairGS)
-                    |
- RGB + bilateral mask + orientation + visual-hull losses
-                    |
- soft training mixture -> hard editable deployment
-                    |
- novel-view rendering / route audit / simulation carrier export
-```
+The same-budget native 5k control is practically equivalent to adaptive 5k:
+adaptive routing changes held-out foreground PSNR by +0.0449 dB and mask IoU by
+-0.0002. The validated milestone claim is therefore **quality retention plus
+training/storage efficiency and explicit route ownership**. It is not a claim
+that route-aware gradients significantly improve reconstruction quality.
 
-The head or body base can be supplied as a separate immutable Gaussian PLY so
-hair masks supervise only the fiber scaffold.
+All three routes are currently native HairGS line Gaussians:
 
-## Repository layout
+- `shell`: dense, low-curvature, scalp-near coverage;
+- `fin`: silhouette-supporting intermediate fibers;
+- `strand`: long, curved, tip-bearing detail.
+
+Non-hair head/base segments use route `-1`, remain available for composite RGB,
+and are excluded from hair route mass. The routes are not yet an explicit shell
+volume, fin ribbon mesh, or simulation-ready continuous strand graph.
+
+## Positive pipeline
 
 ```text
-src/dpd3dgs_animal/
-  fiber.py              shell/strand geometry and routing
-  fiber_optimize.py     multi-view optimization and structural constraints
-  fiber_evaluate.py     held-out rendering and metrics
-  fiber_route_audit.py  leave-one-route-out contribution audit
-  scaffold.py           static/dynamic surface scaffold loader
-  hairgs_renderer.py    HairGS rasterizer adapter
-  gaussian.py           Gaussian PLY and surface binding utilities
-  observations.py       camera-manifest protocol loader
-
-configs/                maintained Panda, WCurly and person0 experiments
-scripts/                data preparation, training, evaluation and baselines
-tests/                  unit and protocol tests
-docs/                   current design notes and frozen milestone reports
+native HairGS Stage-1 / Stage-2
+              |
+deterministic base / shell / fin / strand assignment
+              |
+route-aware 4k optimization, frozen topology
+              |
+1k calibration
+              |
+train12 + held-out test4 rendering at 500 x 500
+              |
+unified evaluator + route removal + topology audit
 ```
 
-Datasets, checkpoints, external repositories and generated results are not
-committed. The default external data root used by the maintained runners is
-`/mnt/f/fur_hair_unified_data` and can be overridden through `DATA_ROOT`.
+Route assignment uses chain length, curvature, scalp distance, tip distance,
+opacity, hair mask, and width. The current gradient scales are base 0.20, shell
+0.55, fin 0.80, and strand 1.00.
 
-## Installation
+## Reproduce
 
-Create the lightweight UniFur environment:
+Required external paths are configurable through environment variables; the
+tested defaults are WSL paths under `/home/aoki` and `/mnt/f`.
+
+Run the adaptive milestone:
 
 ```bash
-cd /home/aoki/Differentiable_Physical_Driven_3DGS_for_monocular_Animal_Motion_Reconstruction
-bash scripts/setup_wsl_env.sh
-conda activate dpd3dgs-animal
+bash hairgs_adaptive_routes/run_wcurly_stage2_routeaware5k.sh
 ```
 
-The native HairGS renderer is installed in its own `hair-gs` environment. The
-runner scripts set `PYTHONPATH` so the editable UniFur package and the native
-rasterizer can be used in the same process. See [external baselines and
-dependencies](EXTERNAL_BASELINES.md).
-
-## CLI
-
-The public CLI intentionally contains only the unified fiber workflow:
+Run the same-budget native HairGS control:
 
 ```bash
-unifur --help
-unifur --config CONFIG fiber-stage2 --help
-unifur --config CONFIG fiber-eval --help
-unifur --config CONFIG fiber-route-audit --help
+bash hairgs_adaptive_routes/run_wcurly_stage2_native5k_control.sh
 ```
 
-Minimal training invocation:
+Run leave-one-route-out evaluation:
 
 ```bash
-unifur --config configs/fiber_hairgs_wcurly_cleanhair_adaptive_v16_groupcal_6k.yaml \
-  fiber-stage2 \
-  --stage1-npz /path/to/scaffold.npz \
-  --gaussian-ply /path/to/hair_scaffold.ply \
-  --fixed-base-gaussian-ply /path/to/head_base.ply \
-  --frame-dir /path/to/train/images \
-  --camera-manifest /path/to/train/camera_manifest.json \
-  --out-dir /path/to/output \
-  --renderer hairgs
+bash hairgs_adaptive_routes/run_route_ablation_audit.sh
 ```
 
-## Maintained experiments
-
-### WCurly hair
+Generate the frozen audit report:
 
 ```bash
-bash scripts/run_unifur_wcurly_adaptive_v16.sh all
+conda run -n hair-gs python hairgs_adaptive_routes/audit_wcurly.py \
+  --baseline /path/to/hairgs_native_15k \
+  --candidate /path/to/adaptive_route_5k \
+  --native-control /path/to/native_5k_control \
+  --baseline-render-control /path/to/exact_baseline_render_control \
+  --ablations /path/to/route_ablations \
+  --output-dir /path/to/adaptive_route_5k/audit
 ```
 
-Protocol: 12 training views, 4 held-out views, 1000×1000, fixed calibrated
-cameras. The script renders both soft and hard routes and evaluates them with
-`scripts/evaluate_external_renders.py`.
+The numeric gates and attribution rule are frozen in
+[`hairgs_adaptive_routes/EVALUATION_STANDARD.md`](hairgs_adaptive_routes/EVALUATION_STANDARD.md).
 
-### Panda fur and downstream carrier test
+## Maintained code
 
-```bash
-bash scripts/run_unifur_fin_benchmarks.sh panda
+```text
+hairgs_adaptive_routes/
+  assign_routes.py                         deterministic Stage-2 assignment
+  train_adaptive.py                        route-aware HairGS optimization
+  route_ablate.py                          leave-one-route-out model export
+  run_wcurly_stage2_routeaware5k.sh        promoted training/evaluation flow
+  run_wcurly_stage2_native5k_control.sh    same-budget native control
+  run_route_ablation_audit.sh              contribution experiment
+  audit_wcurly.py                          protocol/quality/efficiency audit
+  make_wcurly_comparison.py                compact visual comparison
+  EVALUATION_STANDARD.md                   frozen promotion rules
 ```
 
-### GaussianHaircut person0
+Datasets, external HairGS source, checkpoints, rendered images, and generated
+audit outputs are not committed.
 
-```bash
-bash scripts/run_unifur_gaussian_haircut_person0.sh all
-```
+## Known structural limit
 
-Static multiview, dynamic multiview and single-view protocols must be reported
-in separate tables. Metrics are comparable only when data split, camera,
-resolution and held-out frames are identical.
-
-## External methods
-
-The maintained task-relevant baselines are:
-
-- NeuralFur for animal fur;
-- HairGS and GaussianHaircut for multi-view hair;
-- Im2Haircut for a separate single-image protocol.
-
-Adapter outputs are never described as official paper numbers. See
-[EXTERNAL_BASELINES.md](EXTERNAL_BASELINES.md).
-
-## Tests
-
-```bash
-pytest -q
-```
-
-Core validation covers shell/strand routing, structural loss terms, camera
-protocols, HairGS rendering, scaffold deformation and external evaluation.
-
-## Research status
-
-The next model revision should first repair continuous root binding and strand
-sampling, then enable multi-view-consistent topology birth/prune. Increasing
-the number of Gaussians without redistributing duplicated roots is not expected
-to solve held-out holes.
+The audited model contains 67,114 open-chain components, including 64,511
+single-segment components. Only 7,801 components contain an explicit root; the
+remainder use HairGS reference-scalp inference. The next structural milestone
+must address chain continuity and explicit roots before making downstream
+simulation claims.
