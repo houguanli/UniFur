@@ -35,6 +35,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-rows", type=int, default=4)
     parser.add_argument("--budget-label", default="22k")
+    parser.add_argument("--hairgs-label", default=None)
+    parser.add_argument("--soft-label", default=None)
+    parser.add_argument("--hard-label", default=None)
     args = parser.parse_args()
 
     evaluation = json.loads(
@@ -49,9 +52,9 @@ def main() -> None:
 
     labels = (
         "GT",
-        f"HairGS {args.budget_label}",
-        f"UniFur soft {args.budget_label}",
-        f"UniFur hard {args.budget_label}",
+        args.hairgs_label or f"HairGS {args.budget_label}",
+        args.soft_label or f"UniFur soft {args.budget_label}",
+        args.hard_label or f"UniFur hard {args.budget_label}",
         "hard alpha",
     )
     width, height = Image.open(args.ground_truth / names[0]).size

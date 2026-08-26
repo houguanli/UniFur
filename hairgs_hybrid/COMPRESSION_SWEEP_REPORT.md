@@ -69,6 +69,28 @@ time, observed GPU peak, PLY/sidecar bytes, render latency, FPS, and render GPU
 peak.  It is stored as `panda_all_budget_comparison.csv` and JSON beside the
 fine-sweep audit rather than truncating those fields in this readable table.
 
+### Uncompressed HairGS reference
+
+The 22k hard deployment was also audited against HairGS trained with all 96,991
+source segments. This is intentionally not a same-budget comparison: it asks
+whether the compressed model preserves useful dense-reference quality while
+materially reducing time and space.
+
+| Method | Segments | FG PSNR | Full PSNR | Masked LPIPS | Train | FPS | Train GPU | Render GPU | Size |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HairGS dense | 96,991 | 20.324 | 26.374 | 0.0711 | 310.5 s | 225.3 | 4,639 MiB | 119.0 MiB | 25.53 MiB |
+| UniFur hard | 22,000 | 20.232 | 26.984 | 0.0844 | 198.7 s | 275.3 | 4,017 MiB | 68.6 MiB | 5.86 MiB |
+
+UniFur uses 22.7% of the segments, trains 36.0% faster, stores 77.0% fewer
+bytes, renders with 18.1% lower latency, and uses 42.4% less allocated render
+memory. Held-out FG PSNR is within 0.093 dB and Full PSNR is +0.610 dB because
+the hard model removes most of the dense HairGS silhouette spill. This gain has
+the opposite boundary tradeoff: FN rises from 0.0185 to 0.0496 while FP falls
+from 0.0566 to 0.0003. Masked LPIPS is 0.0134 worse, and the visual comparison
+shows weaker fine fur detail. The supported conclusion is therefore
+near-quality dense-reference rendering with substantial time/space savings,
+not perceptual equivalence.
+
 ## WCurly hair results
 
 | Active hair | Method | FG PSNR | Full PSNR | Masked LPIPS | IoU | FN | FP | Train | FPS | Total size |

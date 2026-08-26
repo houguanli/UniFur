@@ -70,9 +70,9 @@ def artifact(root: Path) -> dict:
     }
 
 
-def method(root: Path) -> dict:
+def method(root: Path, benchmark_name: str = "render_benchmark.json") -> dict:
     evaluation = load(root / "evaluation_test/external_evaluation/evaluation.json")
-    benchmark_path = root / "audit/render_benchmark.json"
+    benchmark_path = root / "audit" / benchmark_name
     benchmark = load(benchmark_path) if benchmark_path.is_file() else None
     result = {
         "root": str(root.resolve()),

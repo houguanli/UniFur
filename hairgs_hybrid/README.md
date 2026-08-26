@@ -77,6 +77,19 @@ consistently, so this change supports latency/time/storage efficiency, not a
 VRAM-reduction claim. Machine-readable reports are stored under each result
 root as `audit/hard_route_comparison.json`.
 
+## Dense HairGS reference
+
+The Panda hard knee is additionally compared with uncompressed HairGS using all
+96,991 source segments. Both receive 5,000 steps and the same 28-fit/8-heldout,
+480x270 protocol. UniFur Hard uses 22,000 segments (22.7%), reduces training
+wall time by 36.0%, total model storage by 77.0%, measured render latency by
+18.1%, render allocated memory by 42.4%, and observed training-GPU memory by
+13.4%. Held-out FG PSNR is within 0.093 dB and Full PSNR is 0.610 dB higher,
+although masked LPIPS is 0.0134 worse and fine fur detail is visibly weaker.
+This supports an efficient near-quality operating point, not exact perceptual
+equivalence to the dense reference. Reproduce the checked comparison with
+`audit_dense_reference.py`; the output is `audit/dense_hairgs_reference.json`.
+
 ## Background-radiance calibration
 
 Hair/fur RGB supervision inside a binary mask does not constrain bright,
