@@ -29,6 +29,12 @@ from torch import nn
 
 from scene.hair_gaussian_model import HairGaussianModel
 
+from hairgs_hybrid.compact_state import (
+    SCHEMA as COMPACT_HARD_SCHEMA,
+    load_compact_hard_state,
+    save_compact_hard_state,
+)
+
 
 ROUTE_NAMES = ("shell", "fin", "strand")
 
@@ -37,6 +43,7 @@ ROUTE_NAMES = ("shell", "fin", "strand")
 class HybridModelConfig:
     route_sidecar: Path | None = None
     init_mode: str = "adaptive"
+    route_mode: str = "soft"
     temperature: float = 0.75
     shell_strength_init: float = 0.16
     fin_strength_init: float = 0.20
@@ -49,6 +56,8 @@ class HybridModelConfig:
     def validate(self) -> None:
         if self.init_mode not in {"adaptive", "all_strand"}:
             raise ValueError(f"Unsupported hybrid init mode: {self.init_mode}")
+        if self.route_mode not in {"soft", "hard"}:
+            raise ValueError(f"Unsupported hybrid route mode: {self.route_mode}")
         if self.temperature <= 0:
             raise ValueError("temperature must be positive")
         if self.strength_max < 0:
@@ -85,12 +94,78 @@ class HybridHairGaussianModel(HairGaussianModel):
         else:
             self._initialize_hybrid_state(self.runtime_config.route_sidecar)
         self._target_roll = self._compute_scalp_target_roll()
+        self._fused_state_cache = {}
         self._force_exact_hair_membership = False
         self._opacity_render_mode = "full"
         self._base_reference_cache = {}
         self._freeze_hook_handles = []
         self._initialize_hair_topology_masks()
         self._initialize_geometry_reference()
+
+    def _install_soft_parameters(
+        self,
+        route_ids: np.ndarray,
+        logits: np.ndarray,
+        strengths: np.ndarray,
+        rolls: np.ndarray,
+    ) -> None:
+        self._route_ids = torch.as_tensor(route_ids, device=self.device)
+        self._route_logits = nn.Parameter(
+            torch.as_tensor(logits, device=self.device).requires_grad_(True)
+        )
+        self._shape_strength_raw = nn.Parameter(
+            torch.as_tensor(strengths, device=self.device).requires_grad_(True)
+        )
+        self._roll_residual = nn.Parameter(
+            torch.as_tensor(rolls, device=self.device).requires_grad_(True)
+        )
+        self._hard_shell_strength_raw = None
+        self._hard_fin_strength_raw = None
+        self._hard_roll_residual = None
+        self._hard_route_probabilities = None
+
+    def _install_hard_parameters(
+        self,
+        route_ids: np.ndarray,
+        strengths: np.ndarray,
+        rolls: np.ndarray,
+    ) -> None:
+        """Keep only parameters active under immutable hard ownership."""
+
+        route_ids = np.asarray(route_ids, dtype=np.int64)
+        shell = np.flatnonzero(route_ids == 0)
+        fin = np.flatnonzero(route_ids == 1)
+        non_strand = np.flatnonzero(np.logical_or(route_ids == 0, route_ids == 1))
+        self._route_ids = torch.as_tensor(route_ids, device=self.device)
+        self._hard_shell_indices = torch.as_tensor(shell, device=self.device)
+        self._hard_fin_indices = torch.as_tensor(fin, device=self.device)
+        self._hard_non_strand_indices = torch.as_tensor(non_strand, device=self.device)
+        self._hard_shell_strength_raw = nn.Parameter(
+            torch.as_tensor(strengths[shell, 0], device=self.device).requires_grad_(True)
+        )
+        self._hard_fin_strength_raw = nn.Parameter(
+            torch.as_tensor(strengths[fin, 1], device=self.device).requires_grad_(True)
+        )
+        self._hard_roll_residual = nn.Parameter(
+            torch.as_tensor(rolls[non_strand, 0], device=self.device).requires_grad_(True)
+        )
+        # The dense soft tensors are intentionally absent from the optimizer and
+        # compact checkpoint.  Fixed one-hot probabilities preserve reporting
+        # and route-aware losses without evaluating softmax per render.
+        self._route_logits = None
+        self._shape_strength_raw = None
+        self._roll_residual = None
+        probabilities = torch.zeros(
+            (route_ids.size, 3), dtype=torch.float32, device=self.device
+        )
+        probabilities[:, 2] = 1.0
+        probabilities[self._hard_shell_indices] = torch.tensor(
+            (1.0, 0.0, 0.0), device=self.device
+        )
+        probabilities[self._hard_fin_indices] = torch.tensor(
+            (0.0, 1.0, 0.0), device=self.device
+        )
+        self._hard_route_probabilities = probabilities
 
     def _initialize_geometry_reference(self) -> None:
         """Freeze the loaded HairGS scaffold as a local geometry trust region.
@@ -173,20 +248,41 @@ class HybridHairGaussianModel(HairGaussianModel):
             strength_raw[:, 0] = _logit(shell_fraction)
             strength_raw[:, 1] = _logit(fin_fraction)
 
-        self._route_ids = torch.as_tensor(route_ids, device=self.device)
-        self._route_logits = nn.Parameter(
-            torch.as_tensor(logits, device=self.device).requires_grad_(True)
-        )
-        self._shape_strength_raw = nn.Parameter(
-            torch.as_tensor(strength_raw, device=self.device).requires_grad_(True)
-        )
-        self._roll_residual = nn.Parameter(
-            torch.zeros((count, 1), device=self.device).requires_grad_(True)
-        )
+        rolls = np.zeros((count, 1), dtype=np.float32)
+        if self.runtime_config.route_mode == "hard":
+            self._install_hard_parameters(route_ids, strength_raw, rolls)
+        else:
+            self._install_soft_parameters(route_ids, logits, strength_raw, rolls)
         self._loaded_hybrid_state = None
 
     def _load_hybrid_state(self, path: Path) -> None:
-        state = np.load(path)
+        with np.load(path, allow_pickle=False) as state:
+            schema = str(np.asarray(state["schema"]).item())
+        if schema == COMPACT_HARD_SCHEMA:
+            if self.runtime_config.route_mode != "hard":
+                raise ValueError(
+                    "A compact hard-route checkpoint must be loaded with route_mode=hard"
+                )
+            compact = load_compact_hard_state(path)
+            route_ids = compact["route_id"]
+            count = int(self.endpoint_pairs.shape[0])
+            if route_ids.shape != (count,):
+                raise ValueError(
+                    f"Compact state/PLY mismatch: {route_ids.shape} versus {(count,)}"
+                )
+            strengths = np.zeros((count, 2), dtype=np.float32)
+            rolls = np.zeros((count, 1), dtype=np.float32)
+            shell = route_ids == 0
+            fin = route_ids == 1
+            non_strand = np.logical_or(shell, fin)
+            strengths[shell, 0] = compact["shell_strength_raw"]
+            strengths[fin, 1] = compact["fin_strength_raw"]
+            rolls[non_strand, 0] = compact["non_strand_roll_residual"]
+            self._install_hard_parameters(route_ids, strengths, rolls)
+            self._loaded_hybrid_state = str(path.resolve())
+            return
+
+        state = np.load(path, allow_pickle=False)
         count = int(self.endpoint_pairs.shape[0])
         route_ids = np.asarray(state["route_id"], dtype=np.int64)
         logits = np.asarray(state["route_logits"], dtype=np.float32)
@@ -206,16 +302,10 @@ class HybridHairGaussianModel(HairGaussianModel):
         }
         if actual != expected:
             raise ValueError(f"Invalid hybrid state shapes: {actual}, expected {expected}")
-        self._route_ids = torch.as_tensor(route_ids, device=self.device)
-        self._route_logits = nn.Parameter(
-            torch.as_tensor(logits, device=self.device).requires_grad_(True)
-        )
-        self._shape_strength_raw = nn.Parameter(
-            torch.as_tensor(strengths, device=self.device).requires_grad_(True)
-        )
-        self._roll_residual = nn.Parameter(
-            torch.as_tensor(rolls, device=self.device).requires_grad_(True)
-        )
+        if self.runtime_config.route_mode == "hard":
+            self._install_hard_parameters(route_ids, strengths, rolls)
+        else:
+            self._install_soft_parameters(route_ids, logits, strengths, rolls)
         self._loaded_hybrid_state = str(path.resolve())
 
     @property
@@ -337,11 +427,15 @@ class HybridHairGaussianModel(HairGaussianModel):
             self._opacity,
             self._mask,
             self._width,
-            self._route_logits,
-            self._shape_strength_raw,
-            self._roll_residual,
         ):
             register(parameter, self.hair_route_mask)
+        if self.runtime_config.route_mode == "soft":
+            for parameter in (
+                self._route_logits,
+                self._shape_strength_raw,
+                self._roll_residual,
+            ):
+                register(parameter, self.hair_route_mask)
 
     def base_state_digest(self) -> dict[str, str]:
         """Hash the exact frozen native state for audit before/after training."""
@@ -367,6 +461,8 @@ class HybridHairGaussianModel(HairGaussianModel):
 
     @property
     def route_probabilities(self) -> torch.Tensor:
+        if self.runtime_config.route_mode == "hard":
+            return self._hard_route_probabilities
         probabilities = torch.softmax(
             self._route_logits / self.runtime_config.temperature, dim=1
         )
@@ -380,17 +476,141 @@ class HybridHairGaussianModel(HairGaussianModel):
 
     @property
     def shape_strengths(self) -> torch.Tensor:
+        if self.runtime_config.route_mode == "hard":
+            strengths = torch.zeros(
+                (int(self._route_ids.numel()), 2),
+                dtype=self._width.dtype,
+                device=self.device,
+            )
+            if self._hard_shell_strength_raw.numel():
+                shell = self.runtime_config.strength_max * torch.sigmoid(
+                    self._hard_shell_strength_raw
+                )
+                strengths = torch.index_copy(
+                    strengths,
+                    0,
+                    self._hard_shell_indices,
+                    torch.stack((shell, torch.zeros_like(shell)), dim=1),
+                )
+            if self._hard_fin_strength_raw.numel():
+                fin = self.runtime_config.strength_max * torch.sigmoid(
+                    self._hard_fin_strength_raw
+                )
+                strengths = torch.index_copy(
+                    strengths,
+                    0,
+                    self._hard_fin_indices,
+                    torch.stack((torch.zeros_like(fin), fin), dim=1),
+                )
+            return strengths
         if self.runtime_config.strength_max == 0:
             return torch.zeros_like(self._shape_strength_raw)
         return self.runtime_config.strength_max * torch.sigmoid(
             self._shape_strength_raw
         )
 
+    def effective_shape_regularizer(self) -> torch.Tensor:
+        """Regularize only shape variables that can affect the selected route."""
+
+        if self.runtime_config.route_mode == "hard":
+            values = []
+            if self._hard_shell_strength_raw.numel():
+                values.append(
+                    self.runtime_config.strength_max
+                    * torch.sigmoid(self._hard_shell_strength_raw)
+                )
+            if self._hard_fin_strength_raw.numel():
+                values.append(
+                    self.runtime_config.strength_max
+                    * torch.sigmoid(self._hard_fin_strength_raw)
+                )
+            if not values:
+                return torch.zeros((), dtype=self._width.dtype, device=self.device)
+            return torch.cat(values).square().mean()
+        hair = self.hair_route_mask
+        return self.shape_strengths[hair].square().mean()
+
+    def _hard_fused_cache_key(self) -> tuple:
+        return (
+            bool(torch.is_grad_enabled()),
+            self._endpoints._version,
+            self._width._version,
+            self._hard_shell_strength_raw._version,
+            self._hard_fin_strength_raw._version,
+            self._hard_roll_residual._version,
+        )
+
+    def _hard_fused_render_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build hard-route scale and rotation together and reuse per optimizer state.
+
+        HairGS asks for scale and rotation as separate properties, and training
+        renders RGB, visibility, and sometimes orientation before one backward
+        pass.  Version-keyed caching makes all of those rasterizations share one
+        route-conditioned parameter graph.  Evaluation reuses the detached
+        no-grad state across every camera.
+        """
+
+        key = self._hard_fused_cache_key()
+        cached = self._fused_state_cache.get("value")
+        if self._fused_state_cache.get("key") == key and cached is not None:
+            return cached
+
+        native_scaling = super().get_scaling
+        delta = torch.zeros_like(native_scaling)
+        if self._hard_shell_strength_raw.numel():
+            shell = self.runtime_config.strength_max * torch.sigmoid(
+                self._hard_shell_strength_raw
+            )
+            shell_delta = torch.stack((0.35 * shell, 0.35 * shell, -0.70 * shell), dim=1)
+            delta = torch.index_copy(
+                delta, 0, self._hard_shell_indices, shell_delta
+            )
+        if self._hard_fin_strength_raw.numel():
+            fin = self.runtime_config.strength_max * torch.sigmoid(
+                self._hard_fin_strength_raw
+            )
+            fin_delta = torch.stack(
+                (torch.zeros_like(fin), 0.50 * fin, -0.50 * fin), dim=1
+            )
+            delta = torch.index_copy(delta, 0, self._hard_fin_indices, fin_delta)
+        scaling = torch.clamp(native_scaling * torch.exp(delta), min=self.min_val)
+
+        native_rotation = super().get_rotation
+        rotation = native_rotation
+        if self._hard_non_strand_indices.numel():
+            residual = self.runtime_config.roll_residual_max * torch.tanh(
+                self._hard_roll_residual
+            )
+            angle = (
+                self._target_roll[self._hard_non_strand_indices, 0] + residual
+            )
+            half = 0.5 * angle
+            local_roll = torch.stack(
+                (
+                    torch.cos(half),
+                    torch.sin(half),
+                    torch.zeros_like(half),
+                    torch.zeros_like(half),
+                ),
+                dim=1,
+            )
+            routed = quaternion_multiply(
+                native_rotation[self._hard_non_strand_indices], local_roll
+            )
+            rotation = torch.index_copy(
+                native_rotation, 0, self._hard_non_strand_indices, routed
+            )
+        value = (scaling, rotation)
+        self._fused_state_cache = {"key": key, "value": value}
+        return value
+
     @property
     def get_scaling(self):
         native = super().get_scaling
         if self.runtime_config.init_mode == "all_strand":
             return native
+        if self.runtime_config.route_mode == "hard":
+            return self._hard_fused_render_state()[0]
         probabilities = self.route_probabilities
         strengths = self.shape_strengths
         shell = probabilities[:, 0:1] * strengths[:, 0:1]
@@ -414,6 +634,8 @@ class HybridHairGaussianModel(HairGaussianModel):
         native = super().get_rotation
         if self.runtime_config.init_mode == "all_strand":
             return native
+        if self.runtime_config.route_mode == "hard":
+            return self._hard_fused_render_state()[1]
         non_strand = self.route_probabilities[:, 0:2].sum(dim=1, keepdim=True)
         residual = self.runtime_config.roll_residual_max * torch.tanh(
             self._roll_residual
@@ -465,47 +687,75 @@ class HybridHairGaussianModel(HairGaussianModel):
     def training_setup(self, training_args):
         super().training_setup(training_args)
         if self.runtime_config.init_mode != "all_strand":
-            self.optimizer.add_param_group(
-                {
-                    "params": [self._route_logits],
-                    "lr": self.runtime_config.route_lr,
-                    "name": "hybrid_route_logits",
-                }
-            )
-            self.optimizer.add_param_group(
-                {
-                    "params": [self._shape_strength_raw],
-                    "lr": self.runtime_config.shape_lr,
-                    "name": "hybrid_shape_strength",
-                }
-            )
-            self.optimizer.add_param_group(
-                {
-                    "params": [self._roll_residual],
-                    "lr": self.runtime_config.roll_lr,
-                    "name": "hybrid_roll_residual",
-                }
-            )
+            if self.runtime_config.route_mode == "hard":
+                self.optimizer.add_param_group(
+                    {
+                        "params": [
+                            self._hard_shell_strength_raw,
+                            self._hard_fin_strength_raw,
+                        ],
+                        "lr": self.runtime_config.shape_lr,
+                        "name": "hybrid_hard_shape",
+                    }
+                )
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._hard_roll_residual],
+                        "lr": self.runtime_config.roll_lr,
+                        "name": "hybrid_hard_roll",
+                    }
+                )
+            else:
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._route_logits],
+                        "lr": self.runtime_config.route_lr,
+                        "name": "hybrid_route_logits",
+                    }
+                )
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._shape_strength_raw],
+                        "lr": self.runtime_config.shape_lr,
+                        "name": "hybrid_shape_strength",
+                    }
+                )
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._roll_residual],
+                        "lr": self.runtime_config.roll_lr,
+                        "name": "hybrid_roll_residual",
+                    }
+                )
         self._register_base_freeze_hooks()
 
     def save_ply(self, path):
         super().save_ply(path)
         state_path = Path(path).with_name("hybrid_state.npz")
-        np.savez_compressed(
-            state_path,
-            schema=np.asarray("hairgs-hybrid-state-v1"),
-            route_names=np.asarray(ROUTE_NAMES),
-            route_id=self._route_ids.detach().cpu().numpy().astype(np.int8),
-            route_logits=self._route_logits.detach().cpu().numpy().astype(np.float32),
-            shape_strength_raw=self._shape_strength_raw.detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32),
-            roll_residual=self._roll_residual.detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32),
-        )
+        if self.runtime_config.route_mode == "hard":
+            save_compact_hard_state(
+                state_path,
+                self._route_ids.detach().cpu().numpy().astype(np.int8),
+                self._hard_shell_strength_raw.detach().cpu().numpy(),
+                self._hard_fin_strength_raw.detach().cpu().numpy(),
+                self._hard_roll_residual.detach().cpu().numpy(),
+            )
+        else:
+            np.savez_compressed(
+                state_path,
+                schema=np.asarray("hairgs-hybrid-state-v1"),
+                route_names=np.asarray(ROUTE_NAMES),
+                route_id=self._route_ids.detach().cpu().numpy().astype(np.int8),
+                route_logits=self._route_logits.detach().cpu().numpy().astype(np.float32),
+                shape_strength_raw=self._shape_strength_raw.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+                roll_residual=self._roll_residual.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+            )
         report = self.hybrid_report()
         state_path.with_name("hybrid_report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
@@ -522,6 +772,7 @@ class HybridHairGaussianModel(HairGaussianModel):
         return {
             "schema": "hairgs-hybrid-report-v1",
             "init_mode": self.runtime_config.init_mode,
+            "route_mode": self.runtime_config.route_mode,
             "temperature": self.runtime_config.temperature,
             "loaded_hybrid_state": self._loaded_hybrid_state,
             "segment_count": int(hard.size),
@@ -538,6 +789,19 @@ class HybridHairGaussianModel(HairGaussianModel):
                 name: int(np.count_nonzero(np.logical_and(hair, hard == index)))
                 for index, name in enumerate(ROUTE_NAMES)
             },
+            "route_parameter_count": (
+                int(
+                    self._hard_shell_strength_raw.numel()
+                    + self._hard_fin_strength_raw.numel()
+                    + self._hard_roll_residual.numel()
+                )
+                if self.runtime_config.route_mode == "hard"
+                else int(
+                    self._route_logits.numel()
+                    + self._shape_strength_raw.numel()
+                    + self._roll_residual.numel()
+                )
+            ),
             "route_mass": {
                 name: float(probabilities[hair, index].sum())
                 for index, name in enumerate(ROUTE_NAMES)

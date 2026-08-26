@@ -115,14 +115,25 @@ active hair points and a 49.8% reduction of total points.
 
 ## Efficiency conclusion
 
-The experiment supports **quality per active Gaussian**, not a faster
-same-point renderer. The current soft router adds a sidecar and route-specific
-covariance work: training is 14--46% longer and rendering is 22--33% slower
-than the same-budget HairGS control. The Shell claim is therefore presently a
-compression result: large low-frequency fur regions tolerate fewer active
-Gaussians. A fused hard-route renderer and compact route-state serialization
-are required before claiming wall-clock or total-storage superiority at equal
-point count.
+The original sweep supports **quality per active Gaussian**. Its soft router
+adds a sidecar and route-specific covariance work: training is 14--46% longer
+and rendering is 22--33% slower than the same-budget HairGS control. The Shell
+claim remains a compression result: large low-frequency fur regions tolerate
+fewer active Gaussians.
+
+The subsequent hard-route deployment closes most of that execution gap without
+changing the selected topology. At the Panda 22k knee it reduces training time
+from 269.4 to 198.7 s, render latency from 4.677 to 3.805 ms, and the sidecar
+from 473,397 to 75,677 bytes. FG/Full PSNR change by only -0.056/-0.066 dB. At
+the WCurly 6k knee it reduces training time from 294.2 to 226.8 s, latency from
+5.035 to 4.087 ms, and the sidecar from 135,228 to 19,301 bytes; FG/Full PSNR
+increase by +0.019/+0.003 dB. In both cases FPS is 23% higher than soft routing
+and within 3--5% of the same-budget HairGS control.
+
+This is a fused route-conditioned scale/rotation construction and cache feeding
+the existing HairGS rasterizer, not a custom fused CUDA rasterizer. Total model
+storage is now within 0.5--1.3% of HairGS. Training GPU peaks were inconsistent
+(Panda +3.9%, WCurly -0.3% versus soft), so no VRAM improvement is claimed.
 
 Reproduce with:
 

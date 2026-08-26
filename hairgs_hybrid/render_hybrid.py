@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--type", "-t", type=int, default=0)
     parser.add_argument("--route-sidecar", type=str, default=None)
     parser.add_argument("--hybrid-init-mode", default=None)
+    parser.add_argument("--hybrid-route-mode", choices=("soft", "hard"), default=None)
     parser.add_argument("--hybrid-temperature", type=float, default=None)
     parser.add_argument("--hybrid-shell-strength", type=float, default=None)
     parser.add_argument("--hybrid-fin-strength", type=float, default=None)
@@ -57,6 +58,7 @@ def main() -> None:
         HybridModelConfig(
             route_sidecar=Path(args.route_sidecar) if args.route_sidecar else None,
             init_mode=getattr(args, "hybrid_init_mode", None) or "adaptive",
+            route_mode=getattr(args, "hybrid_route_mode", None) or "soft",
             temperature=getattr(args, "hybrid_temperature", None) or 0.75,
             shell_strength_init=getattr(args, "hybrid_shell_strength", None)
             if getattr(args, "hybrid_shell_strength", None) is not None

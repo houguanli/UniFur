@@ -17,6 +17,7 @@ EXPECTED_TOTAL="${EXPECTED_TOTAL:-70214}"
 EXPECTED_ACTIVE="${EXPECTED_ACTIVE:-40936}"
 RESULT_ROOT="${RESULT_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/wcurly_haironly_maskbounded5k_v1}"
 VARIANT="${VARIANT:-adaptive}"
+ROUTE_MODE="${ROUTE_MODE:-soft}"
 START_ITERATION=15007
 STEPS="${STEPS:-5000}"
 FINAL_ITERATION=$((START_ITERATION + STEPS))
@@ -95,6 +96,7 @@ train_model() {
       -s "${TRAIN_DATASET}" -m "${RESULT_ROOT}" -r 1 \
       --route-sidecar "${RESULT_ROOT}/point_cloud/iteration_${START_ITERATION}/routes.npz" \
       --hybrid-init-mode "${VARIANT}" \
+      --hybrid-route-mode "${ROUTE_MODE}" \
       --iterations "${STEPS}" --densify_until_iter 0 \
       --merge_interval 100000 --growth_interval 100000 \
       --position_lr_max_steps "${STEPS}" --lambda_mask 0 \
@@ -152,7 +154,7 @@ render_split() {
       --render-manifest "${output}/external_renders/render_manifest.json" \
       --ground-truth-dir "${PROTOCOL_ROOT}/${split}/images" \
       --output-dir "${output}/external_evaluation" \
-      --method "HairGS hybrid hair-only mask-bounded (${STEPS} steps)" \
+      --method "HairGS hybrid hair-only mask-bounded ${VARIANT}/${ROUTE_MODE} (${STEPS} steps)" \
       --protocol-id "${PROTOCOL_ID}-${split}" --device cuda
 }
 

@@ -14,6 +14,7 @@ INITIAL_PLY="${INITIAL_PLY:-${PROTOCOL_ROOT}/initial/point_cloud.ply}"
 ROUTE_SIDECAR="${ROUTE_SIDECAR:-${PROTOCOL_ROOT}/initial/routes.npz}"
 EXPECTED_SEGMENTS="${EXPECTED_SEGMENTS:-96991}"
 VARIANT="${VARIANT:-adaptive}"
+ROUTE_MODE="${ROUTE_MODE:-soft}"
 STEPS="${STEPS:-5000}"
 START_ITERATION=30000
 FINAL_ITERATION=$((START_ITERATION + STEPS))
@@ -98,6 +99,7 @@ train_model() {
       --sh_degree 3 \
       --route-sidecar "${RESULT_ROOT}/point_cloud/iteration_${START_ITERATION}/routes.npz" \
       --hybrid-init-mode "${VARIANT}" \
+      --hybrid-route-mode "${ROUTE_MODE}" \
       --iterations "${STEPS}" --densify_until_iter 0 \
       --merge_interval 100000 --growth_interval 100000 \
       --position_lr_max_steps "${STEPS}" --lambda_mask 0 \
@@ -150,7 +152,7 @@ render_split() {
       --render-manifest "${output}/external_renders/render_manifest.json" \
       --ground-truth-dir "${PANDA_ROOT}/$2/images" \
       --output-dir "${output}/external_evaluation" \
-      --method "Panda HairGS hybrid ${VARIANT} (${STEPS} steps, ${EXPECTED_SEGMENTS} segments)" \
+      --method "Panda HairGS hybrid ${VARIANT}/${ROUTE_MODE} (${STEPS} steps, ${EXPECTED_SEGMENTS} segments)" \
       --protocol-id "${PROTOCOL_ID}-${split}" --device cuda
 }
 

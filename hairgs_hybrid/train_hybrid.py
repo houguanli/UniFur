@@ -28,6 +28,9 @@ def add_hybrid_arguments(parser: ArgumentParser) -> None:
     parser.add_argument(
         "--hybrid-init-mode", choices=("adaptive", "all_strand"), default="adaptive"
     )
+    parser.add_argument(
+        "--hybrid-route-mode", choices=("soft", "hard"), default="soft"
+    )
     parser.add_argument("--hybrid-temperature", type=float, default=0.75)
     parser.add_argument("--hybrid-shell-strength", type=float, default=0.16)
     parser.add_argument("--hybrid-fin-strength", type=float, default=0.20)
@@ -55,6 +58,7 @@ def model_config(args) -> HybridModelConfig:
     return HybridModelConfig(
         route_sidecar=Path(args.route_sidecar),
         init_mode=args.hybrid_init_mode,
+        route_mode=args.hybrid_route_mode,
         temperature=args.hybrid_temperature,
         shell_strength_init=args.hybrid_shell_strength,
         fin_strength_init=args.hybrid_fin_strength,
@@ -291,16 +295,23 @@ def hybrid_loss(gaussians, image, camera, args):
     if probabilities.numel() > 0:
         costs = torch.tensor([0.35, 0.65, 1.0], device=probabilities.device)
         route_cost = (probabilities * costs).sum(dim=1).mean()
-        route_entropy = -(
-            probabilities * torch.log(probabilities.clamp_min(1.0e-8))
-        ).sum(dim=1).mean()
-        shape_reg = gaussians.shape_strengths[hair].square().mean()
-        loss = (
-            loss
-            + args.lambda_hybrid_route_cost * route_cost
-            + args.lambda_hybrid_route_entropy * route_entropy
-            + args.lambda_hybrid_shape_reg * shape_reg
-        )
+        shape_reg = gaussians.effective_shape_regularizer()
+        if gaussians.runtime_config.route_mode == "hard":
+            # Ownership is immutable and one-hot, so route cost/entropy cannot
+            # influence optimization.  Keep their diagnostic values while
+            # excluding constant graph work from the training objective.
+            route_entropy = torch.zeros_like(route_cost)
+            loss = loss + args.lambda_hybrid_shape_reg * shape_reg
+        else:
+            route_entropy = -(
+                probabilities * torch.log(probabilities.clamp_min(1.0e-8))
+            ).sum(dim=1).mean()
+            loss = (
+                loss
+                + args.lambda_hybrid_route_cost * route_cost
+                + args.lambda_hybrid_route_entropy * route_entropy
+                + args.lambda_hybrid_shape_reg * shape_reg
+            )
         loss_dict.update(
             {
                 "hybrid_route_cost": route_cost,

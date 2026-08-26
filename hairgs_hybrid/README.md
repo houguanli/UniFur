@@ -9,8 +9,15 @@ opacity, and hair mask, and expands each segment from the native
 - **fin**: tangent-aligned ribbon with broad binormal and thin normal;
 - **shell**: tangent-plane patch with broad tangent/binormal and thin normal.
 
-The soft router, shape strength, scalp-frame roll residual, and native HairGS
-hair attributes are optimized together. Head/base primitives are excluded using
+The default soft router, shape strength, scalp-frame roll residual, and native
+HairGS hair attributes are optimized together.  The audited deployment path can
+instead use `--hybrid-route-mode hard`: fixed ownership is converted to one-hot
+Shell/Fin/Strand routing, only route-effective shape/roll variables remain
+trainable, and scale plus rotation are constructed once per optimizer state and
+shared by the HairGS rasterizations.  This is a fused **state-construction and
+cache path**, not a replacement CUDA rasterizer.
+
+Head/base primitives are excluded using
 the exact route sidecar and are frozen at both endpoint and per-segment level.
 They remain in the renderer only as immutable occluders/background for a valid
 full composite. Topology is intentionally frozen in this increment so quality
@@ -45,7 +52,30 @@ the coverage/overflow tradeoff.
 
 The native PLY remains compatible with upstream HairGS.  Hybrid parameters are
 stored in an adjacent `hybrid_state.npz`; both files are required to reproduce a
-hybrid render.
+hybrid render. Soft checkpoints retain the dense v1 state. Hard checkpoints use
+the compact v2 codec: 2-bit packed ownership, FP16 route-effective strengths,
+and FP16 non-strand roll only. Dense logits, inactive route parameters, and
+redundant index arrays are omitted. Both v1 and v2 can be loaded by the hard
+runtime, which also makes soft-to-hard deployment explicit and reproducible.
+
+## Audited hard-route deployment
+
+The fixed-budget knees were rerun for 5,000 steps from the same compressed PLYs
+and training-only route allocations:
+
+- Panda 22k: 198.7 s training, 262.8 FPS, 75,677-byte sidecar; held-out FG/Full
+  PSNR 20.232/26.984 dB. Relative to soft routing this is 26.2% less training
+  time, 22.9% more FPS, and 84.0% less sidecar storage for -0.056/-0.066 dB.
+- WCurly 6k hair + 29,278 frozen base: 226.8 s, 244.7 FPS, 19,301-byte sidecar;
+  held-out FG/Full PSNR 17.571/17.538 dB. Relative to soft routing this is 22.9%
+  less training time, 23.2% more FPS, and 85.7% less sidecar storage, while both
+  PSNR values are slightly higher.
+
+The hard renderer is within 3--5% of same-budget HairGS FPS and its total model
+storage is within 0.5--1.3%. Observed training GPU peaks did not improve
+consistently, so this change supports latency/time/storage efficiency, not a
+VRAM-reduction claim. Machine-readable reports are stored under each result
+root as `audit/hard_route_comparison.json`.
 
 ## Background-radiance calibration
 

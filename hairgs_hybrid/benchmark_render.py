@@ -33,6 +33,7 @@ def configure_hybrid(args: Namespace) -> None:
         HybridModelConfig(
             route_sidecar=Path(args.route_sidecar) if args.route_sidecar else None,
             init_mode=getattr(args, "hybrid_init_mode", "adaptive"),
+            route_mode=getattr(args, "hybrid_route_mode", "soft"),
             temperature=getattr(args, "hybrid_temperature", 0.75),
             shell_strength_init=getattr(args, "hybrid_shell_strength", 0.16),
             fin_strength_init=getattr(args, "hybrid_fin_strength", 0.20),
