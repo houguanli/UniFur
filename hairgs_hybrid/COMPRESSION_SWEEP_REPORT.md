@@ -13,31 +13,61 @@ contribution; species labels and held-out views are not inputs.
   base in both methods. Only the active hair budget changes.
 - Each model receives 5,000 optimization steps.
 - Full, foreground, mask, LPIPS, training time, storage, and renderer timings
-  come from one completed `compression_sweep_audit.json`.
+  come from completed `compression_sweep_audit.json` artifacts.
 
 ## Panda fur results
 
 | Active points | Method | FG PSNR | Full PSNR | Masked LPIPS | IoU | FN | FP | Train | FPS | Size |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32k | UniFur | 20.658 | 27.332 | 0.0780 | 0.9534 | 0.0464 | 0.0002 | 284 s | 202.0 | 9.08 MiB |
+| 32k | HairGS | 20.409 | 26.471 | 0.0735 | 0.9337 | 0.0142 | 0.0561 | 203 s | 250.9 | 8.42 MiB |
+| 28k | UniFur | 20.535 | 27.253 | 0.0810 | 0.9517 | 0.0481 | 0.0002 | 269 s | 200.2 | 7.94 MiB |
+| 28k | HairGS | 20.021 | 26.264 | 0.0807 | 0.9298 | 0.0161 | 0.0586 | 199 s | 274.0 | 7.37 MiB |
 | 25k | UniFur | 20.379 | 27.154 | 0.0817 | 0.9509 | 0.0489 | 0.0002 | 267 s | 203.7 | 7.09 MiB |
 | 25k | HairGS | 19.998 | 26.231 | 0.0797 | 0.9312 | 0.0156 | 0.0574 | 193 s | 265.2 | 6.58 MiB |
+| **22k** | **UniFur** | **20.288** | **27.050** | **0.0833** | **0.9504** | **0.0494** | **0.0003** | **269 s** | **213.8** | **6.24 MiB** |
+| **22k** | **HairGS** | **19.788** | **26.088** | **0.0860** | **0.9304** | **0.0164** | **0.0576** | **185 s** | **277.0** | **5.79 MiB** |
+| 20k | UniFur | 20.054 | 26.849 | 0.0894 | 0.9486 | 0.0513 | 0.0002 | 264 s | 213.7 | 5.68 MiB |
+| 20k | HairGS | 19.919 | 26.131 | 0.0854 | 0.9329 | 0.0137 | 0.0574 | 184 s | 272.7 | 5.27 MiB |
+| 18k | UniFur | 19.982 | 26.763 | 0.0912 | 0.9479 | 0.0520 | 0.0002 | 255 s | 215.6 | 5.11 MiB |
+| 18k | HairGS | 19.695 | 25.943 | 0.0893 | 0.9300 | 0.0179 | 0.0562 | 198 s | 306.0 | 4.74 MiB |
 | 16k | UniFur | 19.836 | 26.656 | 0.0950 | 0.9465 | 0.0534 | 0.0001 | 255 s | 198.9 | 4.54 MiB |
 | 16k | HairGS | 19.754 | 25.899 | 0.0888 | 0.9283 | 0.0149 | 0.0615 | 176 s | 296.0 | 4.21 MiB |
+| 14k | UniFur | 19.634 | 26.571 | 0.1039 | 0.9435 | 0.0563 | 0.0002 | 273 s | 204.3 | 3.98 MiB |
+| 14k | HairGS | 19.319 | 25.672 | 0.0956 | 0.9303 | 0.0147 | 0.0594 | 189 s | 270.5 | 3.69 MiB |
+| 12k | UniFur | 19.248 | 26.243 | 0.1061 | 0.9418 | 0.0581 | 0.0001 | 259 s | 231.4 | 3.41 MiB |
+| 12k | HairGS | 19.315 | 25.553 | 0.0993 | 0.9253 | 0.0163 | 0.0635 | 178 s | 282.3 | 3.16 MiB |
 | 10k | UniFur | 18.910 | 26.026 | 0.1161 | 0.9401 | 0.0598 | 0.0001 | 243 s | 226.2 | 2.84 MiB |
 | 10k | HairGS | 19.167 | 25.521 | 0.1047 | 0.9253 | 0.0116 | 0.0685 | 170 s | 280.1 | 2.63 MiB |
+| 8k | UniFur | 18.633 | 25.617 | 0.1246 | 0.9366 | 0.0633 | 0.0001 | 253 s | 203.9 | 2.27 MiB |
+| 8k | HairGS | 18.828 | 25.150 | 0.1154 | 0.9231 | 0.0153 | 0.0670 | 167 s | 290.2 | 2.11 MiB |
 
 The learned route allocation is stable across budgets: 80.1% Shell, 14.4%
-Fin, and 5.5% Strand.  The recommended knee is **16k**, or 16.5% of the 96,991
-source points.  It retains a +0.757 dB same-budget Full-PSNR advantage and even
-exceeds the 25k HairGS Full PSNR by +0.425 dB with 36% fewer points.  It does
-not exceed 25k HairGS in foreground PSNR or masked LPIPS.  At 10k, foreground
-quality reverses, so 10k is an aggressive storage setting rather than the
-quality operating point.
+Fin, and 5.5% Strand.  The fine sweep moves the recommended compression/quality
+knee to **22k**, or 22.7% of the 96,991 source points.  Against byte-identical,
+same-budget HairGS initialization, 22k improves FG PSNR by +0.500 dB, Full PSNR
+by +0.962 dB, masked LPIPS by -0.00273, full LPIPS by -0.01946, and IoU by
++0.02001.  Its masked SSIM is effectively tied but slightly lower (-0.00031).
+The exact allocation is 17,619 Shell, 3,168 Fin, and 1,213 Strand.
+
+For absolute quality, **28k** is the quality-first setting: it has 20.535 dB
+FG PSNR and 27.253 dB Full PSNR, while masked LPIPS differs from 28k HairGS by
+only +0.00024.  The 32k setting has the highest absolute FG PSNR but loses more
+masked LPIPS, so extra capacity does not improve every dimension.  Below 20k,
+masked LPIPS and the largest missing component deteriorate; at 12k and below,
+same-budget foreground PSNR reverses.  No tested budget dominates HairGS in
+every metric because the two models choose different alpha tradeoffs.
 
 The Panda Full-PSNR improvement is not a background-accounting artifact:
-outside-mask RGB is explicitly calibrated against black, and FP drops by over
-0.06 at 16k.  The corresponding increase in FN must be reported: the method
-prefers a conservative silhouette and leaves more missing fur than HairGS.
+outside-mask RGB is explicitly calibrated against black, and at 22k FP falls
+from 0.05760 to 0.00026.  The corresponding increase in FN (0.01635 to 0.04936)
+and largest-FN component (0.00656 to 0.01220) must be reported: UniFur removes
+the visible HairGS halo but is more conservative at paws, belly, and thin fur.
+
+The complete train/test table contains all 16 evaluation metrics plus training
+time, observed GPU peak, PLY/sidecar bytes, render latency, FPS, and render GPU
+peak.  It is stored as `panda_all_budget_comparison.csv` and JSON beside the
+fine-sweep audit rather than truncating those fields in this readable table.
 
 ## WCurly hair results
 
@@ -87,7 +117,7 @@ active hair points and a 49.8% reduction of total points.
 
 The experiment supports **quality per active Gaussian**, not a faster
 same-point renderer. The current soft router adds a sidecar and route-specific
-covariance work: training is 14--45% longer and rendering is 22--33% slower
+covariance work: training is 14--46% longer and rendering is 22--33% slower
 than the same-budget HairGS control. The Shell claim is therefore presently a
 compression result: large low-frequency fur regions tolerate fewer active
 Gaussians. A fused hard-route renderer and compact route-state serialization
@@ -99,6 +129,11 @@ Reproduce with:
 ```bash
 bash hairgs_hybrid/run_adaptive_compression_sweep.sh
 
+# Panda-only fine sweep used for the 32k/28k/22k/20k/18k/14k/12k/8k rows
+RUN_PANDA=1 RUN_WCURLY=0 \
+PANDA_BUDGETS="32000 28000 22000 20000 18000 14000 12000 8000" \
+bash hairgs_hybrid/run_adaptive_compression_sweep.sh
+
 # WCurly-only fine sweep used for the 7k/6k/4k/3k/2k rows
 RUN_PANDA=0 RUN_WCURLY=1 \
 HAIR_BUDGETS="7000 6000 4000 3000 2000" \
@@ -106,6 +141,6 @@ bash hairgs_hybrid/run_adaptive_compression_sweep.sh
 ```
 
 The canonical local result roots are
-`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_spill_v1`
-and
-`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_wcurly_fine_v1`.
+`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_spill_v1`,
+`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_panda_fine_v1`,
+and `F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_wcurly_fine_v1`.
