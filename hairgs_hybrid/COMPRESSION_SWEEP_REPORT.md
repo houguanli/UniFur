@@ -47,15 +47,41 @@ prefers a conservative silhouette and leaves more missing fur than HairGS.
 | 12k | HairGS | 17.321 | 17.434 | 0.1391 | 0.8363 | 0.1222 | 0.0487 | 264 s | 250.7 | 3.75 MiB |
 | 8k | UniFur | 17.415 | 17.474 | 0.1431 | 0.8332 | 0.1294 | 0.0442 | 296 s | 191.0 | 3.61 MiB |
 | 8k | HairGS | 17.368 | 17.394 | 0.1437 | 0.8310 | 0.1319 | 0.0439 | 259 s | 249.4 | 3.44 MiB |
+| 7k | UniFur | 17.449 | 17.503 | 0.1435 | 0.8329 | 0.1291 | 0.0449 | 302 s | 179.3 | 3.51 MiB |
+| 7k | HairGS | 17.390 | 17.511 | 0.1444 | 0.8313 | 0.1308 | 0.0448 | 262 s | 264.5 | 3.36 MiB |
+| **6k** | **UniFur** | **17.551** | **17.534** | **0.1446** | **0.8330** | **0.1305** | **0.0431** | **294 s** | **198.6** | **3.41 MiB** |
+| **6k** | **HairGS** | **17.461** | **17.483** | **0.1472** | **0.8291** | **0.1335** | **0.0443** | **251 s** | **252.3** | **3.29 MiB** |
 | 5k | UniFur | 17.748 | 17.586 | 0.1478 | 0.8297 | 0.1358 | 0.0408 | 296 s | 183.6 | 3.31 MiB |
 | 5k | HairGS | 17.714 | 17.623 | 0.1474 | 0.8292 | 0.1353 | 0.0421 | 249 s | 252.1 | 3.21 MiB |
+| 4k | UniFur | 17.384 | 17.458 | 0.1518 | 0.8250 | 0.1432 | 0.0377 | 286 s | 187.4 | 3.21 MiB |
+| 4k | HairGS | 17.550 | 17.477 | 0.1514 | 0.8249 | 0.1435 | 0.0374 | 248 s | 254.5 | 3.13 MiB |
+| 3k | UniFur | 17.628 | 17.485 | 0.1552 | 0.8143 | 0.1530 | 0.0392 | 285 s | 191.5 | 3.11 MiB |
+| 3k | HairGS | 17.689 | 17.519 | 0.1558 | 0.8176 | 0.1490 | 0.0400 | 245 s | 232.1 | 3.05 MiB |
+| 2k | UniFur | 17.676 | 17.607 | 0.1571 | 0.8108 | 0.1576 | 0.0381 | 280 s | 196.3 | 3.01 MiB |
+| 2k | HairGS | 17.766 | 17.618 | 0.1576 | 0.8096 | 0.1623 | 0.0339 | 238 s | 247.2 | 2.97 MiB |
 
-The learned route allocation is 56.5% Shell, 22.5% Fin, and 21.0% Strand. The
-recommended knee is **8k**, or 19.5% of the 40,936 source hair points. It gives
-small but consistent same-budget improvements in FG PSNR (+0.048 dB), Full
-PSNR (+0.080 dB), masked LPIPS (-0.00065), and IoU (+0.00215). At 5k, Full
-PSNR and LPIPS no longer beat HairGS, so the apparent higher foreground PSNR is
-not a general quality improvement.
+The learned route allocation remains stable at 56.5% Shell, 22.5% Fin, and
+21.0% Strand.  The finer sweep moves the recommended knee from 8k to **6k**,
+or 14.7% of the 40,936 source hair points.  The exact 6k allocation is 3,388
+Shell, 1,351 Fin, and 1,261 Strand.  Against the byte-identical, same-budget
+HairGS initialization, it improves FG PSNR by +0.091 dB, Full PSNR by +0.051
+dB, masked LPIPS by -0.00268, IoU by +0.00391, and the largest false-negative
+component from 0.0677 to 0.0483.  This is the strongest consistent relative
+gap in the sweep, though still a modest visual rather than a generational
+improvement.
+
+The capacity knee is sharp rather than monotonic.  At 5k the Full-PSNR and
+LPIPS wins disappear; at 4k the routed model loses FG/Full PSNR and LPIPS; at
+3k it also loses IoU.  The isolated metric reversals at 2k do not constitute a
+recovery: IoU falls to 0.8108 and the largest missing connected component rises
+to 0.0896.  These low-budget failures are dominated by loss of spatial hair
+coverage, so further compression requires a coverage-aware topology change,
+not another budget reduction with the current shared support.
+
+The WCurly budget counts only active hair Gaussians.  Both methods also carry
+the same frozen 29,278-point head/base.  Therefore the 6k model has 35,278
+total points, versus 70,214 points in the dense source: an 85.3% reduction of
+active hair points and a 49.8% reduction of total points.
 
 ## Efficiency conclusion
 
@@ -72,7 +98,14 @@ Reproduce with:
 
 ```bash
 bash hairgs_hybrid/run_adaptive_compression_sweep.sh
+
+# WCurly-only fine sweep used for the 7k/6k/4k/3k/2k rows
+RUN_PANDA=0 RUN_WCURLY=1 \
+HAIR_BUDGETS="7000 6000 4000 3000 2000" \
+bash hairgs_hybrid/run_adaptive_compression_sweep.sh
 ```
 
-The canonical local result root is
-`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_spill_v1`.
+The canonical local result roots are
+`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_spill_v1`
+and
+`F:\fur_hair_unified_data\benchmarks\hairgs_hybrid\compression_sweep_wcurly_fine_v1`.

@@ -11,6 +11,8 @@ SCAFFOLD_ROOT="${SCAFFOLD_ROOT:-${OUTPUT_ROOT}/scaffolds}"
 PANDA_BUDGETS="${PANDA_BUDGETS:-25000 16000 10000}"
 HAIR_BUDGETS="${HAIR_BUDGETS:-12000 8000 5000}"
 STEPS="${STEPS:-5000}"
+RUN_PANDA="${RUN_PANDA:-1}"
+RUN_WCURLY="${RUN_WCURLY:-1}"
 
 PANDA_PROTOCOL="/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_protocol_r480"
 PANDA_SOURCE="${PANDA_PROTOCOL}/initial/point_cloud.ply"
@@ -65,6 +67,7 @@ mkdir -p "${OUTPUT_ROOT}" "${SCAFFOLD_ROOT}"
 manifest_lines="${OUTPUT_ROOT}/sweep_manifest.jsonl"
 : > "${manifest_lines}"
 
+if [[ "${RUN_PANDA}" == "1" ]]; then
 for budget in ${PANDA_BUDGETS}; do
   scaffold="${SCAFFOLD_ROOT}/panda_N${budget}"
   candidate="${OUTPUT_ROOT}/panda_N${budget}/unified"
@@ -83,7 +86,9 @@ for budget in ${PANDA_BUDGETS}; do
     "${budget}" "${PANDA_ACTIVE}" "${scaffold}/allocation_report.json" \
     "${candidate}" "${control}" >> "${manifest_lines}"
 done
+fi
 
+if [[ "${RUN_WCURLY}" == "1" ]]; then
 for budget in ${HAIR_BUDGETS}; do
   total=$((HAIR_BASE + budget))
   scaffold="${SCAFFOLD_ROOT}/wcurly_N${budget}"
@@ -106,6 +111,7 @@ for budget in ${HAIR_BUDGETS}; do
     "${budget}" "${HAIR_ACTIVE}" "${scaffold}/allocation_report.json" \
     "${candidate}" "${control}" >> "${manifest_lines}"
 done
+fi
 
 run_hairgs - "${manifest_lines}" "${OUTPUT_ROOT}/sweep_manifest.json" <<'PY'
 import json
