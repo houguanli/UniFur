@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,6 +86,8 @@ class HybridHairGaussianModel(HairGaussianModel):
             self._initialize_hybrid_state(self.runtime_config.route_sidecar)
         self._target_roll = self._compute_scalp_target_roll()
         self._force_exact_hair_membership = False
+        self._opacity_render_mode = "full"
+        self._base_reference_cache = {}
         self._freeze_hook_handles = []
         self._initialize_hair_topology_masks()
         self._initialize_geometry_reference()
@@ -218,6 +221,31 @@ class HybridHairGaussianModel(HairGaussianModel):
     @property
     def hair_route_mask(self) -> torch.Tensor:
         return self._route_ids >= 0
+
+    @property
+    def get_opacity(self):
+        """Expose a base-only render mode without mutating native parameters.
+
+        The frozen head/body is a valid occluder and appearance reference for
+        human-hair cases.  A temporary opacity view lets the loss render that
+        reference once per camera while keeping every hair opacity at exactly
+        zero.  Panda has no base segments, so its reference is black.
+        """
+        opacity = super().get_opacity
+        if getattr(self, "_opacity_render_mode", "full") == "base_only":
+            return torch.where(
+                self.hair_route_mask[:, None], torch.zeros_like(opacity), opacity
+            )
+        return opacity
+
+    @contextmanager
+    def base_only_render_mode(self):
+        previous = getattr(self, "_opacity_render_mode", "full")
+        self._opacity_render_mode = "base_only"
+        try:
+            yield
+        finally:
+            self._opacity_render_mode = previous
 
     @property
     def get_mask(self):

@@ -41,6 +41,7 @@ def add_hybrid_arguments(parser: ArgumentParser) -> None:
     parser.add_argument("--lambda-hybrid-mask-fn", type=float, default=0.06)
     parser.add_argument("--lambda-hybrid-hole", type=float, default=0.03)
     parser.add_argument("--lambda-hybrid-overflow-peak", type=float, default=0.10)
+    parser.add_argument("--lambda-hybrid-background-rgb", type=float, default=0.0)
     parser.add_argument("--hybrid-mask-temperature", type=float, default=0.05)
     parser.add_argument("--lambda-hybrid-route-cost", type=float, default=2.0e-4)
     parser.add_argument("--lambda-hybrid-route-entropy", type=float, default=5.0e-5)
@@ -172,6 +173,32 @@ def _balanced_visibility_loss(prediction: torch.Tensor, target: torch.Tensor):
     return 0.5 * (positive_bce + negative_bce)
 
 
+def _base_reference_image(gaussians, camera, image: torch.Tensor) -> torch.Tensor:
+    """Render and cache the frozen non-hair base for one training camera.
+
+    Comparing against black outside a hair-only mask is correct for Panda but
+    would incorrectly penalize the face/head in WCurly.  The base-only render
+    makes the spill term measure *additional hair radiance or occlusion* in
+    non-hair pixels for both protocols.
+    """
+    if torch.all(gaussians.hair_route_mask):
+        return torch.zeros_like(image)
+    key = (
+        int(getattr(camera, "uid", -1)),
+        str(getattr(camera, "image_name", "")),
+        int(camera.image_height),
+        int(camera.image_width),
+    )
+    cached = gaussians._base_reference_cache.get(key)
+    if cached is None:
+        with torch.no_grad(), gaussians.base_only_render_mode():
+            cached = render(
+                camera, gaussians, torch.zeros(3, device=image.device)
+            )["render"].detach()
+        gaussians._base_reference_cache[key] = cached
+    return cached
+
+
 def hybrid_loss(gaussians, image, camera, args):
     if not isinstance(gaussians, HybridHairGaussianModel):
         raise TypeError("Hybrid training constructed a non-hybrid HairGS model")
@@ -244,6 +271,20 @@ def hybrid_loss(gaussians, image, camera, args):
             "hair_overflow_peak": overflow_peak,
         }
     )
+
+    if args.lambda_hybrid_background_rgb > 0:
+        base_reference = _base_reference_image(gaussians, camera, image)
+        outside = (1.0 - target_mask)[None]
+        spill_residual = (image - base_reference) * outside
+        background_rgb_l1 = spill_residual.abs().sum() / float(image.numel())
+        background_rgb_mse = spill_residual.square().sum() / float(image.numel())
+        loss = loss + args.lambda_hybrid_background_rgb * background_rgb_l1
+        loss_dict.update(
+            {
+                "hybrid_background_rgb_l1": background_rgb_l1,
+                "hybrid_background_rgb_mse": background_rgb_mse,
+            }
+        )
 
     hair = gaussians.hair_route_mask
     probabilities = gaussians.route_probabilities[hair]
@@ -320,6 +361,10 @@ def main() -> None:
                 "rgb_supervision": "GT hair-mask pixels only, native full-frame gradient scale",
                 "head_body_policy": "strictly frozen, retained only as occluder/background",
                 "visibility_policy": "exact hair color with fixed head/body occlusion",
+                "background_rgb_policy": (
+                    "penalize route-induced RGB/occlusion outside the hair mask "
+                    "relative to a cached frozen-base render"
+                ),
                 "topology_frozen_required": True,
             },
             indent=2,

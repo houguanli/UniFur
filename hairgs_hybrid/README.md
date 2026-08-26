@@ -47,6 +47,23 @@ The native PLY remains compatible with upstream HairGS.  Hybrid parameters are
 stored in an adjacent `hybrid_state.npz`; both files are required to reproduce a
 hybrid render.
 
+## Background-radiance calibration
+
+Hair/fur RGB supervision inside a binary mask does not constrain bright,
+low-opacity Gaussian tails outside that mask. Hybrid training therefore
+supports `--lambda-hybrid-background-rgb`. It compares the full render with a
+cached base-only render outside the hair mask. Panda has no base and uses a
+black reference; human-hair cases retain the frozen head/body reference. This
+isolates route-induced spill without training hair Gaussians to repair the
+head.
+
+The compression sweep keeps the compressed PLY byte-identical between hybrid
+and native controls at each budget. Consequently a quality delta measures the
+Shell/Fin/Strand parameterization rather than a different spatial sample.
+Run `run_adaptive_compression_sweep.sh` to reproduce the audited Panda
+25k/16k/10k and WCurly 12k/8k/5k study.  The measured compression knee and all
+quality/efficiency trade-offs are recorded in `COMPRESSION_SWEEP_REPORT.md`.
+
 ## Adaptive fixed-budget Shell--Fin--Strand compression
 
 `adaptive_compress_scaffold.py` converts a learned dense HairGS hybrid teacher

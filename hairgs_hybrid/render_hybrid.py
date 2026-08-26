@@ -42,6 +42,7 @@ def main() -> None:
         ("lambda-hybrid-mask-fn", 0.06),
         ("lambda-hybrid-hole", 0.03),
         ("lambda-hybrid-overflow-peak", 0.10),
+        ("lambda-hybrid-background-rgb", 0.0),
         ("lambda-hybrid-route-cost", 2.0e-4),
         ("lambda-hybrid-route-entropy", 5.0e-5),
         ("lambda-hybrid-shape-reg", 2.0e-5),

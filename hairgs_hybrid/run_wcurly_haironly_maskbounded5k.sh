@@ -27,6 +27,7 @@ LAMBDA_MASK_FP="${LAMBDA_MASK_FP:-0.20}"
 LAMBDA_MASK_FN="${LAMBDA_MASK_FN:-0.08}"
 LAMBDA_HOLE="${LAMBDA_HOLE:-0.03}"
 LAMBDA_OVERFLOW_PEAK="${LAMBDA_OVERFLOW_PEAK:-0.12}"
+LAMBDA_BACKGROUND_RGB="${LAMBDA_BACKGROUND_RGB:-0.25}"
 
 export PYTHONPATH="${COMPAT_ROOT}:${HAIRGS_ROOT}:${EXPERIMENT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -104,6 +105,7 @@ train_model() {
       --lambda-hybrid-mask-fn "${LAMBDA_MASK_FN}" \
       --lambda-hybrid-hole "${LAMBDA_HOLE}" \
       --lambda-hybrid-overflow-peak "${LAMBDA_OVERFLOW_PEAK}" \
+      --lambda-hybrid-background-rgb "${LAMBDA_BACKGROUND_RGB}" \
       --lambda-hybrid-route-cost 0.0002 \
       --lambda-hybrid-route-entropy 0.00005 \
       --lambda-hybrid-shape-reg 0.00002 \

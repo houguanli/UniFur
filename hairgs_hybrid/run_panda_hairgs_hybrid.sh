@@ -109,6 +109,7 @@ train_model() {
       --lambda-hybrid-mask-fn "${LAMBDA_MASK_FN:-0.60}" \
       --lambda-hybrid-hole "${LAMBDA_HOLE:-0.20}" \
       --lambda-hybrid-overflow-peak "${LAMBDA_OVERFLOW_PEAK:-0.60}" \
+      --lambda-hybrid-background-rgb "${LAMBDA_BACKGROUND_RGB:-0.50}" \
       --lambda-hybrid-route-cost 0.0002 \
       --lambda-hybrid-route-entropy 0.00005 \
       --lambda-hybrid-shape-reg 0.00002 \
