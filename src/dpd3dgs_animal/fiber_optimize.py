@@ -1113,6 +1113,11 @@ def optimize_unified_fiber_stage2(
                         )
                     field.shell_visibility_gate = shell_visibility.detach()
                     field.strand_visibility_gate = strand_visibility.detach()
+                    if bool(cfg.fiber_strand_length_feasibility_enabled):
+                        length_report = _apply_strand_length_feasibility(
+                            field, strand_visibility, cfg
+                        )
+                        latest_visual_hull_report.update(length_report)
                     visual_hull_update_count += 1
                 primitives = field.primitives(
                     surface_vertices,
@@ -1132,6 +1137,7 @@ def optimize_unified_fiber_stage2(
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
                     teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                    visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
                 )
                 if (
                     phase != "gaussian_scaffold"
@@ -1229,6 +1235,7 @@ def optimize_unified_fiber_stage2(
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
                     teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                    visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
                     structured_delta_override=deployment_delta_override,
                 )
                 deployment_prediction = _render(
@@ -1710,6 +1717,9 @@ def optimize_unified_fiber_stage2(
                             additive_teacher=cfg.fiber_additive_teacher_mode,
                             teacher_opacity_transfer=(
                                 cfg.fiber_teacher_opacity_transfer
+                            ),
+                            visibility_mass_transfer_to_shell=(
+                                cfg.fiber_visibility_mass_transfer_to_shell
                             ),
                         )
                     calibration_student_prediction = _render(
@@ -2372,6 +2382,24 @@ def optimize_unified_fiber_stage2(
             "freeze_residual_teacher": bool(cfg.fiber_freeze_residual_teacher),
             "teacher_opacity_transfer": float(
                 cfg.fiber_teacher_opacity_transfer
+            ),
+            "visibility_mass_transfer_to_shell": bool(
+                cfg.fiber_visibility_mass_transfer_to_shell
+            ),
+            "strand_length_feasibility_enabled": bool(
+                cfg.fiber_strand_length_feasibility_enabled
+            ),
+            "strand_length_cap_min_fraction": float(
+                cfg.fiber_strand_length_cap_min_fraction
+            ),
+            "strand_length_cap_relaxation": float(
+                cfg.fiber_strand_length_cap_relaxation
+            ),
+            "strand_max_gaussian_aspect_ratio": float(
+                cfg.fiber_strand_max_gaussian_aspect_ratio
+            ),
+            "topology_bidirectional_admission": bool(
+                cfg.fiber_topology_bidirectional_admission
             ),
             "teacher_nonregression_weight": float(
                 cfg.fiber_teacher_nonregression_weight
@@ -3069,6 +3097,23 @@ def _validate_route_training_config(cfg: PipelineConfig) -> None:
         raise ValueError("fiber_topology_min_birth_deployment must be at most one")
     if float(cfg.fiber_topology_min_birth_effective_mass) > 1.0:
         raise ValueError("fiber_topology_min_birth_effective_mass must be at most one")
+    for name in (
+        "fiber_topology_max_mean_hole_regression",
+        "fiber_topology_max_mean_spill_regression",
+    ):
+        if float(getattr(cfg, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+    for name in (
+        "fiber_strand_length_cap_min_fraction",
+        "fiber_strand_length_cap_relaxation",
+    ):
+        value = float(getattr(cfg, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if float(cfg.fiber_strand_max_gaussian_aspect_ratio) < 0.0:
+        raise ValueError(
+            "fiber_strand_max_gaussian_aspect_ratio must be non-negative"
+        )
     if int(cfg.fiber_strand_sign_projection_every) < 0:
         raise ValueError("fiber_strand_sign_projection_every must be non-negative")
     if int(cfg.fiber_strand_sign_projection_steps) < 0:
@@ -3847,12 +3892,14 @@ def _topology_validation_losses(
     targets: list[dict[str, torch.Tensor]],
     cfg: PipelineConfig,
     renderer_name: str,
-) -> list[float]:
+) -> dict[str, list[float]]:
     if len(surface_vertices_per_view) < 2 or not (
         len(surface_vertices_per_view) == len(cameras) == len(targets)
     ):
         raise ValueError("Topology validation views must contain at least two items")
     losses: list[float] = []
+    holes: list[float] = []
+    spills: list[float] = []
     with torch.no_grad():
         for vertices, camera, target in zip(
             surface_vertices_per_view, cameras, targets, strict=True
@@ -3871,6 +3918,9 @@ def _topology_validation_losses(
                 fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
                 additive_teacher=bool(cfg.fiber_additive_teacher_mode),
                 teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+                visibility_mass_transfer_to_shell=bool(
+                    cfg.fiber_visibility_mass_transfer_to_shell
+                ),
             )
             prediction = _render(primitives, camera, cfg, renderer_name)
             loss, _parts = differentiable_render_loss(
@@ -3883,17 +3933,28 @@ def _topology_validation_losses(
                 cfg.mask_boundary_radius,
                 cfg.mask_balance_weight,
             )
+            inside_loss, outside_loss = _bidirectional_mask_losses(
+                prediction["mask"],
+                target["mask"],
+                inside_alpha_target=float(cfg.fiber_mask_inside_alpha_target),
+                outside_margin_px=int(cfg.fiber_mask_outside_margin_px),
+            )
+            loss = loss + (
+                float(cfg.fiber_mask_inside_coverage_weight) * inside_loss
+                + float(cfg.fiber_mask_outside_spill_weight) * outside_loss
+            )
+            maximum_hole = _maximum_hole_soft_loss(
+                prediction["mask"],
+                target["mask"],
+                kernel_size=int(cfg.fiber_max_hole_kernel),
+                topk_fraction=float(cfg.fiber_max_hole_topk_fraction),
+            )
             if float(cfg.fiber_max_hole_weight) > 0.0:
-                loss = loss + float(cfg.fiber_max_hole_weight) * (
-                    _maximum_hole_soft_loss(
-                        prediction["mask"],
-                        target["mask"],
-                        kernel_size=int(cfg.fiber_max_hole_kernel),
-                        topk_fraction=float(cfg.fiber_max_hole_topk_fraction),
-                    )
-                )
+                loss = loss + float(cfg.fiber_max_hole_weight) * maximum_hole
             losses.append(float(loss.detach().cpu()))
-    return losses
+            holes.append(float(maximum_hole.detach().cpu()))
+            spills.append(float(outside_loss.detach().cpu()))
+    return {"loss": losses, "hole": holes, "spill": spills}
 
 
 def _topology_local_warmup(
@@ -3975,6 +4036,9 @@ def _topology_local_warmup(
             fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
             additive_teacher=bool(cfg.fiber_additive_teacher_mode),
             teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+            visibility_mass_transfer_to_shell=bool(
+                cfg.fiber_visibility_mass_transfer_to_shell
+            ),
         )
         prediction = _render(primitives, cameras[view_index], cfg, renderer_name)
         loss, _parts = differentiable_render_loss(
@@ -4177,6 +4241,9 @@ def _update_adaptive_topology(
                 fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
                 additive_teacher=bool(cfg.fiber_additive_teacher_mode),
                 teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+                visibility_mass_transfer_to_shell=bool(
+                    cfg.fiber_visibility_mass_transfer_to_shell
+                ),
             )
             prediction = _render(primitives, camera, cfg, renderer_name)
             deficit_image = F.relu(target_mask - prediction["mask"]) * target_mask
@@ -4332,10 +4399,14 @@ def _update_adaptive_topology(
     validation_surface_vertices = validation_surface_vertices or []
     validation_cameras = validation_cameras or []
     validation_targets = validation_targets or []
-    before_losses: list[float] = []
+    before_metrics: dict[str, list[float]] = {
+        "loss": [],
+        "hole": [],
+        "spill": [],
+    }
     snapshot: dict[str, torch.Tensor] | None = None
     if validate_event:
-        before_losses = _topology_validation_losses(
+        before_metrics = _topology_validation_losses(
             field,
             validation_surface_vertices,
             surface_faces,
@@ -4396,7 +4467,7 @@ def _update_adaptive_topology(
         _clear_adam_rows(optimizer, optimizer_rows, optimizer_changed)
         return report
 
-    after_losses = _topology_validation_losses(
+    after_metrics = _topology_validation_losses(
         field,
         validation_surface_vertices,
         surface_faces,
@@ -4406,12 +4477,35 @@ def _update_adaptive_topology(
         renderer_name,
     )
     accepted, deltas = _topology_event_is_accepted(
-        before_losses,
-        after_losses,
+        before_metrics["loss"],
+        after_metrics["loss"],
         float(cfg.fiber_topology_validation_margin),
         allow_neutral=False,
         min_mean_improvement=float(cfg.fiber_topology_min_mean_improvement),
     )
+    hole_deltas = [
+        float(post - pre)
+        for pre, post in zip(
+            before_metrics["hole"], after_metrics["hole"], strict=True
+        )
+    ]
+    spill_deltas = [
+        float(post - pre)
+        for pre, post in zip(
+            before_metrics["spill"], after_metrics["spill"], strict=True
+        )
+    ]
+    bidirectional_ok = True
+    if bool(cfg.fiber_topology_bidirectional_admission):
+        mean_hole_delta = float(np.mean(hole_deltas))
+        mean_spill_delta = float(np.mean(spill_deltas))
+        bidirectional_ok = (
+            mean_hole_delta
+            <= float(cfg.fiber_topology_max_mean_hole_regression)
+            and mean_spill_delta
+            <= float(cfg.fiber_topology_max_mean_spill_regression)
+            and min(mean_hole_delta, mean_spill_delta) < -1e-8
+        )
     birth_rows = changed[field.route_active_gate[changed, 1] > 0.5]
     if birth_rows.numel() > 0:
         birth_delta = field.structured_delta_gain[birth_rows, 1]
@@ -4441,7 +4535,7 @@ def _update_adaptive_topology(
         and birth_effective_mass + threshold_epsilon
         >= float(cfg.fiber_topology_min_birth_effective_mass)
     )
-    accepted = bool(accepted and structural_birth_ok)
+    accepted = bool(accepted and structural_birth_ok and bidirectional_ok)
     if accepted:
         _clear_adam_rows(optimizer, optimizer_rows, optimizer_changed)
     else:
@@ -4460,11 +4554,18 @@ def _update_adaptive_topology(
         report["densified_count"] = 0
     report["validation"] = {
         "accepted": bool(accepted),
-        "before": before_losses,
-        "after": after_losses,
+        "before": before_metrics["loss"],
+        "after": after_metrics["loss"],
         "delta": deltas,
         "margin": float(cfg.fiber_topology_validation_margin),
-        "view_count": len(before_losses),
+        "view_count": len(before_metrics["loss"]),
+        "hole_before": before_metrics["hole"],
+        "hole_after": after_metrics["hole"],
+        "hole_delta": hole_deltas,
+        "spill_before": before_metrics["spill"],
+        "spill_after": after_metrics["spill"],
+        "spill_delta": spill_deltas,
+        "bidirectional_ok": bool(bidirectional_ok),
         "minimum_mean_improvement": float(
             cfg.fiber_topology_min_mean_improvement
         ),
@@ -6125,6 +6226,69 @@ def _shell_points_from_primitives(
     return shell.reshape(point_count, shell_samples, 3)
 
 
+def _apply_strand_length_feasibility(
+    field: UnifiedFiberField,
+    strand_gate: torch.Tensor,
+    cfg: PipelineConfig,
+) -> dict[str, float]:
+    """Project learned strand lengths into their multi-view feasible prefix.
+
+    The visual-hull gate is root-to-tip connected.  Its retained sample count
+    therefore defines a conservative upper bound on tip depth.  Applying the
+    bound to the 3D parameter (rather than only zeroing rendered samples) also
+    shortens segment centers and their Gaussian long axes.
+    """
+
+    expected = (field.point_count, int(cfg.fiber_strand_samples))
+    if tuple(strand_gate.shape) != expected:
+        raise ValueError(
+            f"strand_gate must have shape {expected}, got {tuple(strand_gate.shape)}"
+        )
+    samples = max(int(cfg.fiber_strand_samples), 1)
+    minimum_fraction = float(cfg.fiber_strand_length_cap_min_fraction)
+    relaxation = float(cfg.fiber_strand_length_cap_relaxation)
+    with torch.no_grad():
+        before = field.strand_length.detach()
+        # The feasible prefix is a bound on a stable unconstrained proposal,
+        # not a multiplier on the already-projected length.  Using ``before``
+        # recursively caused geometric decay at every hull refresh.  Permit a
+        # genuine later birth/growth proposal to raise the reference, while a
+        # previous projection can never lower it.
+        reference = field.strand_length_feasibility_reference.to(
+            device=before.device, dtype=before.dtype
+        )
+        reference = torch.maximum(reference, before)
+        field.strand_length_feasibility_reference.copy_(reference)
+        retained_fraction = (
+            (strand_gate > 0.5).to(before.dtype).sum(dim=1) / float(samples)
+        )
+        retained_fraction = retained_fraction.clamp(
+            min=minimum_fraction, max=1.0
+        )
+        cap = reference * retained_fraction
+        max_aspect = float(cfg.fiber_strand_max_gaussian_aspect_ratio)
+        if max_aspect > 0.0:
+            aspect_cap = (
+                2.0 * float(samples) * max_aspect * field.radius.detach()
+            )
+            cap = torch.minimum(cap, aspect_cap)
+        target = torch.lerp(before, torch.minimum(before, cap), relaxation)
+        changed = target < before - 1e-8
+        if changed.any():
+            field.strand_length_raw[changed, 0] = _positive_parameter_raw(
+                target[changed], eps=field.positive_eps
+            )
+        after = field.strand_length.detach()
+    return {
+        "length_feasibility_changed_fraction": float(changed.float().mean().cpu()),
+        "length_feasibility_mean_before": float(before.mean().cpu()),
+        "length_feasibility_mean_after": float(after.mean().cpu()),
+        "length_feasibility_mean_retained_fraction": float(
+            retained_fraction.mean().cpu()
+        ),
+    }
+
+
 def _compute_visual_hull_gates(
     field: UnifiedFiberField,
     surface_vertices: list[torch.Tensor],
@@ -6192,6 +6356,7 @@ def _compute_visual_hull_gates(
                     fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                     additive_teacher=cfg.fiber_additive_teacher_mode,
                     teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                    visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
                 )
                 shell_points = _shell_points_from_primitives(
                     primitives, field.point_count, shell_samples
@@ -6422,6 +6587,7 @@ def _estimate_route_ablation_risk(
                 fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                 additive_teacher=cfg.fiber_additive_teacher_mode,
                 teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
             )
             full_prediction = _render(primitives, camera, cfg, renderer_name)
             full_loss, _parts = differentiable_render_loss(
@@ -6842,6 +7008,7 @@ def _save_previews(
                         fin_aspect_ratio=cfg.fiber_fin_aspect_ratio,
                         additive_teacher=cfg.fiber_additive_teacher_mode,
                         teacher_opacity_transfer=cfg.fiber_teacher_opacity_transfer,
+                        visibility_mass_transfer_to_shell=cfg.fiber_visibility_mass_transfer_to_shell,
                     )
                 prediction = _render(primitives, camera, cfg, renderer_name)
                 image = (
@@ -6939,6 +7106,9 @@ def _measure_semantic_migration_render_equivalence(
             fin_aspect_ratio=float(cfg.fiber_fin_aspect_ratio),
             additive_teacher=bool(cfg.fiber_additive_teacher_mode),
             teacher_opacity_transfer=float(cfg.fiber_teacher_opacity_transfer),
+            visibility_mass_transfer_to_shell=bool(
+                cfg.fiber_visibility_mass_transfer_to_shell
+            ),
         )
         teacher_prediction = _render(
             teacher_primitives, camera, cfg, renderer_name

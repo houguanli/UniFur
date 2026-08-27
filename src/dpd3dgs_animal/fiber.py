@@ -642,6 +642,15 @@ class UnifiedFiberField(nn.Module):
         self.height_raw = nn.Parameter(_inverse_softplus(height.reshape(-1, 1), eps))
         self.shell_length_raw = nn.Parameter(_inverse_softplus(shell_length.reshape(-1, 1), eps))
         self.strand_length_raw = nn.Parameter(_inverse_softplus(strand_length.reshape(-1, 1), eps))
+        # Stable upper-bound reference for visual-hull feasibility projection.
+        # It is deliberately non-persistent: old checkpoints remain compatible
+        # and each optimization run reconstructs the reference from its input
+        # scaffold before observing any projected shortening.
+        self.register_buffer(
+            "strand_length_feasibility_reference",
+            strand_length.reshape(-1).float().clone(),
+            persistent=False,
+        )
         self.radius_raw = nn.Parameter(_inverse_softplus(radius.reshape(-1, 1), eps))
         self.route_logits = nn.Parameter(route_logits.float())
         if carrier_logits is None:
@@ -1115,6 +1124,7 @@ class UnifiedFiberField(nn.Module):
         fin_aspect_ratio: float = 1.0,
         additive_teacher: bool = False,
         teacher_opacity_transfer: float = 0.0,
+        visibility_mass_transfer_to_shell: bool = False,
         structured_delta_override: float | torch.Tensor | None = None,
     ) -> FiberPrimitives:
         if shell_samples < 1 or strand_samples < 1:
@@ -1316,6 +1326,48 @@ class UnifiedFiberField(nn.Module):
             strand_mix[:, None] / float(strand_samples)
         ).expand(-1, strand_samples).clone()
         strand_sample_weight[:, 0] += 1.0 - strand_mix
+
+        effective_shell_visibility: torch.Tensor | None = None
+        if shell_visibility is None and tuple(self.shell_visibility_gate.shape) == (
+            self.point_count,
+            shell_samples,
+        ):
+            shell_visibility = self.shell_visibility_gate
+        if shell_visibility is not None:
+            if tuple(shell_visibility.shape) != (self.point_count, shell_samples):
+                raise ValueError(
+                    "shell_visibility must have shape "
+                    f"({self.point_count}, {shell_samples}), got "
+                    f"{tuple(shell_visibility.shape)}"
+                )
+            shell_visibility = shell_visibility.to(
+                device=self.opacity.device, dtype=self.opacity.dtype
+            )
+            effective_shell_visibility = (
+                1.0 - shell_mix[:, None]
+                + shell_mix[:, None] * shell_visibility
+            )
+
+        effective_strand_visibility: torch.Tensor | None = None
+        if strand_visibility is None and tuple(self.strand_visibility_gate.shape) == (
+            self.point_count,
+            strand_samples,
+        ):
+            strand_visibility = self.strand_visibility_gate
+        if strand_visibility is not None:
+            if tuple(strand_visibility.shape) != (self.point_count, strand_samples):
+                raise ValueError(
+                    "strand_visibility must have shape "
+                    f"({self.point_count}, {strand_samples}), got "
+                    f"{tuple(strand_visibility.shape)}"
+                )
+            strand_visibility = strand_visibility.to(
+                device=self.opacity.device, dtype=self.opacity.dtype
+            )
+            effective_strand_visibility = (
+                1.0 - strand_mix[:, None]
+                + strand_mix[:, None] * strand_visibility
+            )
         if additive_teacher:
             shell_opacity = _weighted_split_opacity(
                 shell_source_opacity, shell_sample_weight
@@ -1330,60 +1382,44 @@ class UnifiedFiberField(nn.Module):
             # probabilities as transmittance exponents instead preserves
             # ``prod(1 - alpha_route_sample) == 1 - alpha_teacher`` exactly
             # whenever the structured copies are co-located and share color.
-            shell_opacity = _weighted_split_opacity(
-                self.opacity,
-                probabilities[:, 0, None] * shell_sample_weight,
-            )
-            strand_opacity = _weighted_split_opacity(
-                self.opacity,
-                probabilities[:, 1, None] * strand_sample_weight,
-            )
-        if shell_visibility is None and tuple(self.shell_visibility_gate.shape) == (
-            self.point_count,
-            shell_samples,
-        ):
-            shell_visibility = self.shell_visibility_gate
-        if shell_visibility is not None:
-            if tuple(shell_visibility.shape) != (self.point_count, shell_samples):
-                raise ValueError(
-                    "shell_visibility must have shape "
-                    f"({self.point_count}, {shell_samples}), got "
-                    f"{tuple(shell_visibility.shape)}"
-                )
-            shell_visibility = shell_visibility.to(
-                device=shell_opacity.device, dtype=shell_opacity.dtype
-            )
+            shell_weight = probabilities[:, 0, None] * shell_sample_weight
+            strand_weight = probabilities[:, 1, None] * strand_sample_weight
+            if bool(visibility_mass_transfer_to_shell):
+                # Visual-hull clipping previously destroyed optical thickness:
+                # suppressing an invalid strand sample also punched a hole in
+                # the structured reconstruction.  Preserve the source
+                # transmittance exponent by transferring the clipped strand
+                # fraction to the local shell underlayer.  This is a
+                # competition between the two structured routes, not an
+                # additive residual copy.
+                if effective_strand_visibility is not None:
+                    retained_strand_fraction = (
+                        strand_sample_weight * effective_strand_visibility
+                    ).sum(dim=1).clamp(0.0, 1.0)
+                    transferred_to_shell = probabilities[:, 1] * (
+                        1.0 - retained_strand_fraction
+                    )
+                    strand_weight = (
+                        strand_weight * effective_strand_visibility
+                    )
+                else:
+                    transferred_to_shell = torch.zeros_like(probabilities[:, 1])
+                shell_weight = (
+                    probabilities[:, 0] + transferred_to_shell
+                )[:, None] * shell_sample_weight
+                if effective_shell_visibility is not None:
+                    shell_weight = shell_weight * effective_shell_visibility
+            shell_opacity = _weighted_split_opacity(self.opacity, shell_weight)
+            strand_opacity = _weighted_split_opacity(self.opacity, strand_weight)
+        visibility_already_applied = (
+            not additive_teacher and bool(visibility_mass_transfer_to_shell)
+        )
+        if effective_shell_visibility is not None and not visibility_already_applied:
             # At zero structured displacement these samples are exact split
-            # copies of the residual teacher.  A visual-hull decision made on
-            # the *target* Fin must therefore not punch holes in that safe
-            # initialization.  Fade the hard gate in with the same geometric
-            # deployment gain; it becomes exact at full deployment.
-            shell_visibility_mix = shell_mix[:, None]
-            effective_shell_visibility = (
-                1.0 - shell_visibility_mix
-                + shell_visibility_mix * shell_visibility
-            )
+            # copies of the residual teacher.  Fade the target Fin gate in
+            # with the same geometric deployment gain.
             shell_opacity = shell_opacity * effective_shell_visibility
-        if strand_visibility is None and tuple(self.strand_visibility_gate.shape) == (
-            self.point_count,
-            strand_samples,
-        ):
-            strand_visibility = self.strand_visibility_gate
-        if strand_visibility is not None:
-            if tuple(strand_visibility.shape) != (self.point_count, strand_samples):
-                raise ValueError(
-                    "strand_visibility must have shape "
-                    f"({self.point_count}, {strand_samples}), got "
-                    f"{tuple(strand_visibility.shape)}"
-                )
-            strand_visibility = strand_visibility.to(
-                device=strand_opacity.device, dtype=strand_opacity.dtype
-            )
-            strand_visibility_mix = strand_mix[:, None]
-            effective_strand_visibility = (
-                1.0 - strand_visibility_mix
-                + strand_visibility_mix * strand_visibility
-            )
+        if effective_strand_visibility is not None and not visibility_already_applied:
             strand_opacity = strand_opacity * effective_strand_visibility
         if additive_teacher:
             residual_visible = (

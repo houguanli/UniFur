@@ -233,6 +233,11 @@ class PipelineConfig:
     fiber_topology_min_mean_improvement: float = 0.0
     fiber_topology_min_birth_deployment: float = 0.0
     fiber_topology_min_birth_effective_mass: float = 0.0
+    # Admit topology changes only when their coherent missing-foreground and
+    # excess-background risks are both non-regressing on held-out views.
+    fiber_topology_bidirectional_admission: bool = False
+    fiber_topology_max_mean_hole_regression: float = 0.0
+    fiber_topology_max_mean_spill_regression: float = 0.0
     # Periodically resolve root-to-tip sign ambiguity after optimizer updates.
     fiber_strand_sign_projection_every: int = 0
     fiber_strand_sign_projection_steps: int = 4
@@ -248,6 +253,16 @@ class PipelineConfig:
     # the residual-blended render proxy.  This closes a loophole where a
     # zero-gain strand trivially passes every visual-hull test.
     fiber_visual_hull_target_geometry: bool = False
+    # Convert the prefix visual-hull gate into a per-root strand-length bound.
+    # This constrains tip depth and Gaussian long axes in 3D instead of merely
+    # hiding unsupported distal samples after rasterization.
+    fiber_strand_length_feasibility_enabled: bool = False
+    fiber_strand_length_cap_min_fraction: float = 0.10
+    fiber_strand_length_cap_relaxation: float = 1.0
+    fiber_strand_max_gaussian_aspect_ratio: float = 0.0
+    # In the non-additive optical-thickness router, transfer strand exponent
+    # removed by its visibility prefix to the co-located shell underlayer.
+    fiber_visibility_mass_transfer_to_shell: bool = False
     # A shared, scalp-local orientation field and deployment constraints turn
     # independent short cubic splats into coherent, usable strand carriers.
     # All length values are normalized by the calibrated scene scale.
