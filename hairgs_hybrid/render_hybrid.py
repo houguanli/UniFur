@@ -13,6 +13,7 @@ from arguments import GeneralParams, ModelParams, OptimizationParams, get_combin
 from utils import safe_state
 
 from hairgs_hybrid.hybrid_model import HybridHairGaussianModel, HybridModelConfig
+from hairgs_hybrid.inference_config import completed_route_schedule
 
 
 def main() -> None:
@@ -27,6 +28,14 @@ def main() -> None:
     parser.add_argument("--hybrid-init-mode", default=None)
     parser.add_argument("--hybrid-route-mode", choices=("soft", "hard"), default=None)
     parser.add_argument("--hybrid-temperature", type=float, default=None)
+    parser.add_argument("--hybrid-temperature-final", type=float, default=None)
+    parser.add_argument("--hybrid-temperature-anneal-steps", type=int, default=None)
+    parser.add_argument("--hybrid-neutral-activation-steps", type=int, default=None)
+    parser.add_argument("--hybrid-topology-hard-forward-start", type=int, default=None)
+    parser.add_argument(
+        "--hybrid-route-schedule", choices=("constant", "staged"), default=None
+    )
+    parser.add_argument("--hybrid-route-warmup-steps", type=int, default=None)
     parser.add_argument("--hybrid-shell-strength", type=float, default=None)
     parser.add_argument("--hybrid-fin-strength", type=float, default=None)
     parser.add_argument("--hybrid-strength-max", type=float, default=None)
@@ -46,20 +55,30 @@ def main() -> None:
         ("lambda-hybrid-background-rgb", 0.0),
         ("lambda-hybrid-route-cost", 2.0e-4),
         ("lambda-hybrid-route-entropy", 5.0e-5),
+        ("lambda-hybrid-route-explore", 0.0),
+        ("lambda-hybrid-route-prior", 0.0),
+        ("lambda-hybrid-budget", 0.0),
         ("lambda-hybrid-shape-reg", 2.0e-5),
         ("lambda-hybrid-center-anchor", 0.0),
         ("lambda-hybrid-length-anchor", 0.0),
         ("lambda-hybrid-width-anchor", 0.0),
     ):
         parser.add_argument(f"--{name}", type=float, default=None)
+    parser.add_argument("--hybrid-target-active-splats", type=int, default=None)
     args = get_combined_args(parser)
+
+    # A persisted soft checkpoint represents the *completed* routing schedule.
+    # Rendering must therefore use the final temperature and fully enabled
+    # route geometry.  Replaying iteration zero here would silently turn a
+    # neutral checkpoint back into its native scaffold at evaluation time.
+    inference_schedule = completed_route_schedule(args)
 
     HybridHairGaussianModel.configure(
         HybridModelConfig(
             route_sidecar=Path(args.route_sidecar) if args.route_sidecar else None,
             init_mode=getattr(args, "hybrid_init_mode", None) or "adaptive",
             route_mode=getattr(args, "hybrid_route_mode", None) or "soft",
-            temperature=getattr(args, "hybrid_temperature", None) or 0.75,
+            **inference_schedule,
             shell_strength_init=getattr(args, "hybrid_shell_strength", None)
             if getattr(args, "hybrid_shell_strength", None) is not None
             else 0.16,
@@ -81,6 +100,14 @@ def main() -> None:
             roll_lr=getattr(args, "hybrid_roll_lr", None)
             if getattr(args, "hybrid_roll_lr", None) is not None
             else 5.0e-4,
+            # Rendering always represents the completed schedule.  If
+            # straight-through topology was enabled during training, activate
+            # its discrete forward path immediately when loading a checkpoint.
+            topology_hard_forward_start=(
+                0
+                if getattr(args, "hybrid_topology_hard_forward_start", -1) >= 0
+                else -1
+            ),
         )
     )
     scene_module.HairGaussianModel = HybridHairGaussianModel

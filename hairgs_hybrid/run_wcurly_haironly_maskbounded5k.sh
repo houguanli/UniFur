@@ -18,6 +18,14 @@ EXPECTED_ACTIVE="${EXPECTED_ACTIVE:-40936}"
 RESULT_ROOT="${RESULT_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/wcurly_haironly_maskbounded5k_v1}"
 VARIANT="${VARIANT:-adaptive}"
 ROUTE_MODE="${ROUTE_MODE:-soft}"
+ROUTE_SCHEDULE="${ROUTE_SCHEDULE:-constant}"
+ROUTE_WARMUP_STEPS="${ROUTE_WARMUP_STEPS:-0}"
+ROUTE_TEMPERATURE="${ROUTE_TEMPERATURE:-0.75}"
+ROUTE_TEMPERATURE_FINAL="${ROUTE_TEMPERATURE_FINAL:-${ROUTE_TEMPERATURE}}"
+ROUTE_TEMPERATURE_ANNEAL_STEPS="${ROUTE_TEMPERATURE_ANNEAL_STEPS:-0}"
+NEUTRAL_ACTIVATION_STEPS="${NEUTRAL_ACTIVATION_STEPS:-1000}"
+LAMBDA_ROUTE_EXPLORE="${LAMBDA_ROUTE_EXPLORE:-0}"
+LAMBDA_ROUTE_PRIOR="${LAMBDA_ROUTE_PRIOR:-0}"
 START_ITERATION=15007
 STEPS="${STEPS:-5000}"
 FINAL_ITERATION=$((START_ITERATION + STEPS))
@@ -97,6 +105,12 @@ train_model() {
       --route-sidecar "${RESULT_ROOT}/point_cloud/iteration_${START_ITERATION}/routes.npz" \
       --hybrid-init-mode "${VARIANT}" \
       --hybrid-route-mode "${ROUTE_MODE}" \
+      --hybrid-route-schedule "${ROUTE_SCHEDULE}" \
+      --hybrid-route-warmup-steps "${ROUTE_WARMUP_STEPS}" \
+      --hybrid-temperature "${ROUTE_TEMPERATURE}" \
+      --hybrid-temperature-final "${ROUTE_TEMPERATURE_FINAL}" \
+      --hybrid-temperature-anneal-steps "${ROUTE_TEMPERATURE_ANNEAL_STEPS}" \
+      --hybrid-neutral-activation-steps "${NEUTRAL_ACTIVATION_STEPS}" \
       --iterations "${STEPS}" --densify_until_iter 0 \
       --merge_interval 100000 --growth_interval 100000 \
       --position_lr_max_steps "${STEPS}" --lambda_mask 0 \
@@ -110,6 +124,8 @@ train_model() {
       --lambda-hybrid-background-rgb "${LAMBDA_BACKGROUND_RGB}" \
       --lambda-hybrid-route-cost 0.0002 \
       --lambda-hybrid-route-entropy 0.00005 \
+      --lambda-hybrid-route-explore "${LAMBDA_ROUTE_EXPLORE}" \
+      --lambda-hybrid-route-prior "${LAMBDA_ROUTE_PRIOR}" \
       --lambda-hybrid-shape-reg 0.00002 \
       --save_frequency "${STEPS}" --eval_frequency "${STEPS}" \
       --logger tensorboard --quiet 2>&1 | tee "${RESULT_ROOT}/audit/train.log"

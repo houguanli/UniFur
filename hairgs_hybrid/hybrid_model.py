@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HairGS-compatible anisotropic shell/fin/strand parameterization.
+"""HairGS-compatible shell/fin/strand parameterization and topology router.
 
 The upstream HairGS CUDA rasterizer already accepts a full 3-axis scale and a
 quaternion.  HairGS restricts that interface to a circular cross section
@@ -8,15 +8,20 @@ opacity, mask, and endpoints, but adds a differentiable route mixture that can
 turn the same primitive into a line (strand), ribbon (fin), or tangent plane
 (shell).
 
-No topology operation is supported in this first auditable increment.  Runs
-must disable densification, merging, and growth.  Extra state is saved next to
-the native PLY, so the PLY remains readable by unmodified HairGS.
+The legacy sidecar keeps one primitive per decision and only changes its
+covariance.  A ``hairgs-topology-candidate-bank-v1`` sidecar instead stores one
+shared decision for three *different* representations of a local source
+cluster: one shell splat, two fin splats, or four strand splats.  During soft
+training, group probabilities gate the candidate opacities.  Hard projection
+then keeps only the selected candidates, so the learned budget is an actual
+active-splat and storage budget rather than a label-count proxy.
 """
 
 from __future__ import annotations
 
 import json
 import hashlib
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +42,8 @@ from hairgs_hybrid.compact_state import (
 
 
 ROUTE_NAMES = ("shell", "fin", "strand")
+TOPOLOGY_SIDECAR_SCHEMA = "hairgs-topology-candidate-bank-v1"
+TOPOLOGY_STATE_SCHEMA = "hairgs-topology-route-state-v1"
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,10 @@ class HybridModelConfig:
     init_mode: str = "adaptive"
     route_mode: str = "soft"
     temperature: float = 0.75
+    temperature_final: float = 0.75
+    temperature_anneal_steps: int = 0
+    neutral_activation_steps: int = 1000
+    topology_hard_forward_start: int = -1
     shell_strength_init: float = 0.16
     fin_strength_init: float = 0.20
     strength_max: float = 0.80
@@ -54,12 +65,20 @@ class HybridModelConfig:
     roll_lr: float = 5.0e-4
 
     def validate(self) -> None:
-        if self.init_mode not in {"adaptive", "all_strand"}:
+        if self.init_mode not in {"adaptive", "all_strand", "neutral"}:
             raise ValueError(f"Unsupported hybrid init mode: {self.init_mode}")
         if self.route_mode not in {"soft", "hard"}:
             raise ValueError(f"Unsupported hybrid route mode: {self.route_mode}")
         if self.temperature <= 0:
             raise ValueError("temperature must be positive")
+        if self.temperature_final <= 0:
+            raise ValueError("temperature_final must be positive")
+        if self.temperature_anneal_steps < 0:
+            raise ValueError("temperature_anneal_steps must be non-negative")
+        if self.neutral_activation_steps < 0:
+            raise ValueError("neutral_activation_steps must be non-negative")
+        if self.topology_hard_forward_start < -1:
+            raise ValueError("topology_hard_forward_start must be -1 or non-negative")
         if self.strength_max < 0:
             raise ValueError("strength_max must be non-negative")
         for name, value in (
@@ -87,6 +106,12 @@ class HybridHairGaussianModel(HairGaussianModel):
 
     def load_ply(self, path):
         super().load_ply(path)
+        self._hybrid_iteration = 0
+        self._topology_mode = False
+        self._topology_group_id = None
+        self._topology_candidate_route = None
+        self._topology_group_logits = None
+        self._topology_route_counts = None
         source = Path(path)
         persisted = source.with_name("hybrid_state.npz")
         if persisted.is_file():
@@ -101,6 +126,68 @@ class HybridHairGaussianModel(HairGaussianModel):
         self._freeze_hook_handles = []
         self._initialize_hair_topology_masks()
         self._initialize_geometry_reference()
+
+    def _install_topology_parameters(
+        self,
+        group_id: np.ndarray,
+        candidate_route: np.ndarray,
+        group_logits: np.ndarray,
+        route_counts: np.ndarray,
+        strengths: np.ndarray,
+        rolls: np.ndarray,
+    ) -> None:
+        """Install shared group decisions over a real 1/2/4 candidate bank."""
+
+        count = int(self.endpoint_pairs.shape[0])
+        group_id = np.asarray(group_id, dtype=np.int64)
+        candidate_route = np.asarray(candidate_route, dtype=np.int64)
+        group_logits = np.asarray(group_logits, dtype=np.float32)
+        route_counts = np.asarray(route_counts, dtype=np.float32)
+        if group_id.shape != (count,) or candidate_route.shape != (count,):
+            raise ValueError("Topology candidate arrays do not match the PLY")
+        if not np.all(np.isin(candidate_route, [0, 1, 2])):
+            raise ValueError("Topology candidate routes must be shell/fin/strand")
+        group_count = int(group_id.max()) + 1 if count else 0
+        if group_count <= 0 or not np.array_equal(
+            np.unique(group_id), np.arange(group_count, dtype=np.int64)
+        ):
+            raise ValueError("Topology group ids must be contiguous from zero")
+        if group_logits.shape != (group_count, 3):
+            raise ValueError("Topology group logits have the wrong shape")
+        if route_counts.shape != (group_count, 3):
+            raise ValueError("Topology route counts have the wrong shape")
+        observed = np.zeros((group_count, 3), dtype=np.float32)
+        np.add.at(observed, (group_id, candidate_route), 1.0)
+        if not np.array_equal(observed, route_counts):
+            raise ValueError("Topology route counts do not match candidate membership")
+        if np.any(route_counts <= 0):
+            raise ValueError("Every topology group must expose all three routes")
+
+        self._topology_mode = True
+        self._topology_group_id = torch.as_tensor(group_id, device=self.device)
+        self._topology_candidate_route = torch.as_tensor(
+            candidate_route, device=self.device
+        )
+        self._topology_group_logits = nn.Parameter(
+            torch.as_tensor(group_logits, device=self.device).requires_grad_(True)
+        )
+        self._topology_route_counts = torch.as_tensor(
+            route_counts, device=self.device
+        )
+        # Candidate covariance is route-specific and immutable in ownership;
+        # the *group* logits choose which topology receives opacity mass.
+        self._route_ids = self._topology_candidate_route
+        self._route_logits = None
+        self._shape_strength_raw = nn.Parameter(
+            torch.as_tensor(strengths, device=self.device).requires_grad_(True)
+        )
+        self._roll_residual = nn.Parameter(
+            torch.as_tensor(rolls, device=self.device).requires_grad_(True)
+        )
+        self._hard_shell_strength_raw = None
+        self._hard_fin_strength_raw = None
+        self._hard_roll_residual = None
+        self._hard_route_probabilities = None
 
     def _install_soft_parameters(
         self,
@@ -208,6 +295,58 @@ class HybridHairGaussianModel(HairGaussianModel):
         if route_sidecar is None:
             raise ValueError("A route sidecar is required for a fresh hybrid model")
         route_data = np.load(Path(route_sidecar))
+        schema = (
+            str(np.asarray(route_data["schema"]).item())
+            if "schema" in route_data.files
+            else None
+        )
+        if schema == TOPOLOGY_SIDECAR_SCHEMA:
+            if self.runtime_config.route_mode != "soft":
+                raise ValueError(
+                    "A topology candidate bank must be learned in soft mode before "
+                    "physical hard projection"
+                )
+            group_id = np.asarray(route_data["topology_group_id"], dtype=np.int64)
+            candidate_route = np.asarray(
+                route_data["topology_candidate_route"], dtype=np.int64
+            )
+            group_logits = np.asarray(
+                route_data["topology_group_logits_init"], dtype=np.float32
+            )
+            route_counts = np.asarray(
+                route_data["topology_route_counts"], dtype=np.float32
+            )
+            if self.runtime_config.init_mode == "neutral":
+                # One common, case-independent starting point.
+                group_logits = np.zeros_like(group_logits)
+            elif self.runtime_config.init_mode == "all_strand":
+                group_logits = np.zeros_like(group_logits)
+                group_logits[:, 2] = 4.0
+            if not np.all(np.isfinite(group_logits)):
+                raise ValueError("Topology group logits contain non-finite values")
+            strength_max = self.runtime_config.strength_max
+            if strength_max == 0:
+                strength_raw = np.zeros((count, 2), dtype=np.float32)
+            else:
+                strength_raw = np.empty((count, 2), dtype=np.float32)
+                strength_raw[:, 0] = _logit(
+                    self.runtime_config.shell_strength_init / strength_max
+                )
+                strength_raw[:, 1] = _logit(
+                    self.runtime_config.fin_strength_init / strength_max
+                )
+            rolls = np.zeros((count, 1), dtype=np.float32)
+            self._route_prior = None
+            self._install_topology_parameters(
+                group_id,
+                candidate_route,
+                group_logits,
+                route_counts,
+                strength_raw,
+                rolls,
+            )
+            self._loaded_hybrid_state = None
+            return
         route_ids = np.asarray(route_data["route_id"], dtype=np.int64)
         if route_ids.shape != (count,):
             raise ValueError(
@@ -221,14 +360,41 @@ class HybridHairGaussianModel(HairGaussianModel):
             if "route_logits_init" in route_data.files
             else None
         )
+        provided_prior = (
+            np.asarray(route_data["route_prior"], dtype=np.float32)
+            if "route_prior" in route_data.files
+            else None
+        )
         if provided_logits is not None and provided_logits.shape != (count, 3):
             raise ValueError(
                 "route_logits_init must have shape "
                 f"{(count, 3)}, got {provided_logits.shape}"
             )
+        if provided_prior is not None:
+            if provided_prior.shape != (count, 3):
+                raise ValueError(
+                    "route_prior must have shape "
+                    f"{(count, 3)}, got {provided_prior.shape}"
+                )
+            if not np.all(np.isfinite(provided_prior)) or np.any(provided_prior < 0):
+                raise ValueError("route_prior must be finite and non-negative")
+            normalizer = provided_prior.sum(axis=1, keepdims=True)
+            if np.any(normalizer <= 0):
+                raise ValueError("Every route_prior row must have positive mass")
+            provided_prior = provided_prior / normalizer
+        self._route_prior = (
+            torch.as_tensor(provided_prior, device=self.device)
+            if provided_prior is not None
+            else None
+        )
         logits = np.full((count, 3), -2.0, dtype=np.float32)
         if self.runtime_config.init_mode == "all_strand":
             logits[:, 2] = 2.0
+        elif self.runtime_config.init_mode == "neutral":
+            # Every active primitive starts unassigned.  The structural
+            # activation gate can optionally keep the initial render native,
+            # while zero logits never encode a case-level ownership fraction.
+            logits.fill(0.0)
         elif provided_logits is not None:
             if not np.all(np.isfinite(provided_logits)):
                 raise ValueError("route_logits_init contains non-finite values")
@@ -256,8 +422,40 @@ class HybridHairGaussianModel(HairGaussianModel):
         self._loaded_hybrid_state = None
 
     def _load_hybrid_state(self, path: Path) -> None:
+        self._route_prior = None
         with np.load(path, allow_pickle=False) as state:
             schema = str(np.asarray(state["schema"]).item())
+        if schema == TOPOLOGY_STATE_SCHEMA:
+            if self.runtime_config.route_mode != "soft":
+                raise ValueError(
+                    "A soft topology checkpoint cannot be loaded as a hard model; "
+                    "run physical hard projection first"
+                )
+            with np.load(path, allow_pickle=False) as state:
+                group_id = np.asarray(state["topology_group_id"], dtype=np.int64)
+                candidate_route = np.asarray(
+                    state["topology_candidate_route"], dtype=np.int64
+                )
+                group_logits = np.asarray(
+                    state["topology_group_logits"], dtype=np.float32
+                )
+                route_counts = np.asarray(
+                    state["topology_route_counts"], dtype=np.float32
+                )
+                strengths = np.asarray(
+                    state["shape_strength_raw"], dtype=np.float32
+                )
+                rolls = np.asarray(state["roll_residual"], dtype=np.float32)
+            self._install_topology_parameters(
+                group_id,
+                candidate_route,
+                group_logits,
+                route_counts,
+                strengths,
+                rolls,
+            )
+            self._loaded_hybrid_state = str(path.resolve())
+            return
         if schema == COMPACT_HARD_SCHEMA:
             if self.runtime_config.route_mode != "hard":
                 raise ValueError(
@@ -288,6 +486,14 @@ class HybridHairGaussianModel(HairGaussianModel):
         logits = np.asarray(state["route_logits"], dtype=np.float32)
         strengths = np.asarray(state["shape_strength_raw"], dtype=np.float32)
         rolls = np.asarray(state["roll_residual"], dtype=np.float32)
+        prior = (
+            np.asarray(state["route_prior"], dtype=np.float32)
+            if "route_prior" in state.files
+            else None
+        )
+        self._route_prior = (
+            torch.as_tensor(prior, device=self.device) if prior is not None else None
+        )
         expected = {
             "route_id": (count,),
             "route_logits": (count, 3),
@@ -326,6 +532,11 @@ class HybridHairGaussianModel(HairGaussianModel):
             return torch.where(
                 self.hair_route_mask[:, None], torch.zeros_like(opacity), opacity
             )
+        if getattr(self, "_topology_mode", False):
+            # Each route partitions the same source cluster optical mass.  A
+            # probability gate therefore forms a mass-preserving soft mixture
+            # across real 1/2/4-splat representations.
+            return opacity * self.topology_candidate_gate[:, None]
         return opacity
 
     @contextmanager
@@ -429,7 +640,13 @@ class HybridHairGaussianModel(HairGaussianModel):
             self._width,
         ):
             register(parameter, self.hair_route_mask)
-        if self.runtime_config.route_mode == "soft":
+        if getattr(self, "_topology_mode", False):
+            for parameter in (
+                self._shape_strength_raw,
+                self._roll_residual,
+            ):
+                register(parameter, self.hair_route_mask)
+        elif self.runtime_config.route_mode == "soft":
             for parameter in (
                 self._route_logits,
                 self._shape_strength_raw,
@@ -461,10 +678,14 @@ class HybridHairGaussianModel(HairGaussianModel):
 
     @property
     def route_probabilities(self) -> torch.Tensor:
+        if getattr(self, "_topology_mode", False):
+            return torch.nn.functional.one_hot(
+                self._topology_candidate_route, num_classes=3
+            ).to(dtype=self._width.dtype)
         if self.runtime_config.route_mode == "hard":
             return self._hard_route_probabilities
         probabilities = torch.softmax(
-            self._route_logits / self.runtime_config.temperature, dim=1
+            self._route_logits / self.current_temperature, dim=1
         )
         if torch.any(~self.hair_route_mask):
             base = torch.zeros_like(probabilities)
@@ -473,6 +694,81 @@ class HybridHairGaussianModel(HairGaussianModel):
                 self.hair_route_mask[:, None], probabilities, base
             )
         return probabilities
+
+    @property
+    def routing_decision_probabilities(self) -> torch.Tensor:
+        """Probabilities at the ownership-decision granularity.
+
+        Legacy routing decides one label per segment.  Topology routing decides
+        once per spatial group and exposes three different candidate counts.
+        """
+
+        if getattr(self, "_topology_mode", False):
+            return torch.softmax(
+                self._topology_group_logits / self.current_temperature, dim=1
+            )
+        return self.route_probabilities[self.hair_route_mask]
+
+    @property
+    def topology_forward_probabilities(self) -> torch.Tensor:
+        """Opacity gates, optionally discrete with straight-through gradients."""
+
+        soft = self.routing_decision_probabilities
+        start = self.runtime_config.topology_hard_forward_start
+        if (
+            not getattr(self, "_topology_mode", False)
+            or start < 0
+            or self._hybrid_iteration < start
+        ):
+            return soft
+        hard = torch.nn.functional.one_hot(
+            soft.argmax(dim=1), num_classes=3
+        ).to(dtype=soft.dtype)
+        return hard - soft.detach() + soft
+
+    @property
+    def routing_route_costs(self) -> torch.Tensor:
+        if getattr(self, "_topology_mode", False):
+            return self._topology_route_counts
+        count = int(self.hair_route_mask.sum())
+        return torch.tensor(
+            (0.35, 0.65, 1.0), device=self.device, dtype=self._width.dtype
+        )[None].expand(count, -1)
+
+    @property
+    def expected_active_splats(self) -> torch.Tensor:
+        probabilities = self.routing_decision_probabilities
+        costs = self.routing_route_costs.to(
+            device=probabilities.device, dtype=probabilities.dtype
+        )
+        return (probabilities * costs).sum()
+
+    @property
+    def topology_candidate_gate(self) -> torch.Tensor:
+        if not getattr(self, "_topology_mode", False):
+            return torch.ones(
+                int(self.endpoint_pairs.shape[0]),
+                device=self.device,
+                dtype=self._width.dtype,
+            )
+        probability = self.topology_forward_probabilities
+        return probability[
+            self._topology_group_id, self._topology_candidate_route
+        ]
+
+    @property
+    def current_temperature(self) -> float:
+        steps = self.runtime_config.temperature_anneal_steps
+        if steps <= 0:
+            return float(self.runtime_config.temperature)
+        progress = min(max(float(self._hybrid_iteration) / float(steps), 0.0), 1.0)
+        start = math.log(self.runtime_config.temperature)
+        end = math.log(self.runtime_config.temperature_final)
+        return float(math.exp(start + progress * (end - start)))
+
+    @property
+    def route_prior(self) -> torch.Tensor | None:
+        return self._route_prior
 
     @property
     def shape_strengths(self) -> torch.Tensor:
@@ -505,9 +801,21 @@ class HybridHairGaussianModel(HairGaussianModel):
             return strengths
         if self.runtime_config.strength_max == 0:
             return torch.zeros_like(self._shape_strength_raw)
-        return self.runtime_config.strength_max * torch.sigmoid(
+        strengths = self.runtime_config.strength_max * torch.sigmoid(
             self._shape_strength_raw
         )
+        if self.runtime_config.init_mode == "neutral":
+            strengths = strengths * self.current_route_activation
+        return strengths
+
+    @property
+    def current_route_activation(self) -> float:
+        if self.runtime_config.init_mode != "neutral":
+            return 1.0
+        steps = self.runtime_config.neutral_activation_steps
+        if steps <= 0:
+            return 1.0
+        return min(max(float(self._hybrid_iteration) / float(steps), 0.0), 1.0)
 
     def effective_shape_regularizer(self) -> torch.Tensor:
         """Regularize only shape variables that can affect the selected route."""
@@ -636,11 +944,23 @@ class HybridHairGaussianModel(HairGaussianModel):
             return native
         if self.runtime_config.route_mode == "hard":
             return self._hard_fused_render_state()[1]
-        non_strand = self.route_probabilities[:, 0:2].sum(dim=1, keepdim=True)
+        probabilities = self.route_probabilities
+        non_strand = probabilities[:, 0:2].sum(dim=1, keepdim=True)
         residual = self.runtime_config.roll_residual_max * torch.tanh(
             self._roll_residual
         )
-        angle = non_strand * (self._target_roll + residual)
+        if self.runtime_config.init_mode == "neutral":
+            # The neutral gate is a warm-up device, not a permanently weaker
+            # representation.  At step 0 it makes rotation exactly native;
+            # once activation reaches one this is identical to the standard
+            # adaptive route geometry.
+            angle = (
+                self.current_route_activation
+                * non_strand
+                * (self._target_roll + residual)
+            )
+        else:
+            angle = non_strand * (self._target_roll + residual)
         angle = torch.where(self.hair_route_mask[:, None], angle, 0.0 * angle)
         half = 0.5 * angle
         local_roll = torch.cat(
@@ -687,7 +1007,29 @@ class HybridHairGaussianModel(HairGaussianModel):
     def training_setup(self, training_args):
         super().training_setup(training_args)
         if self.runtime_config.init_mode != "all_strand":
-            if self.runtime_config.route_mode == "hard":
+            if getattr(self, "_topology_mode", False):
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._topology_group_logits],
+                        "lr": self.runtime_config.route_lr,
+                        "name": "hybrid_topology_group_logits",
+                    }
+                )
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._shape_strength_raw],
+                        "lr": self.runtime_config.shape_lr,
+                        "name": "hybrid_shape_strength",
+                    }
+                )
+                self.optimizer.add_param_group(
+                    {
+                        "params": [self._roll_residual],
+                        "lr": self.runtime_config.roll_lr,
+                        "name": "hybrid_roll_residual",
+                    }
+                )
+            elif self.runtime_config.route_mode == "hard":
                 self.optimizer.add_param_group(
                     {
                         "params": [
@@ -729,24 +1071,34 @@ class HybridHairGaussianModel(HairGaussianModel):
                 )
         self._register_base_freeze_hooks()
 
+    def update_learning_rate(self, iteration):
+        self._hybrid_iteration = int(iteration)
+        return super().update_learning_rate(iteration)
+
     def save_ply(self, path):
         super().save_ply(path)
         state_path = Path(path).with_name("hybrid_state.npz")
-        if self.runtime_config.route_mode == "hard":
-            save_compact_hard_state(
-                state_path,
-                self._route_ids.detach().cpu().numpy().astype(np.int8),
-                self._hard_shell_strength_raw.detach().cpu().numpy(),
-                self._hard_fin_strength_raw.detach().cpu().numpy(),
-                self._hard_roll_residual.detach().cpu().numpy(),
-            )
-        else:
+        if getattr(self, "_topology_mode", False):
             np.savez_compressed(
                 state_path,
-                schema=np.asarray("hairgs-hybrid-state-v1"),
+                schema=np.asarray(TOPOLOGY_STATE_SCHEMA),
                 route_names=np.asarray(ROUTE_NAMES),
-                route_id=self._route_ids.detach().cpu().numpy().astype(np.int8),
-                route_logits=self._route_logits.detach().cpu().numpy().astype(np.float32),
+                topology_group_id=self._topology_group_id.detach()
+                .cpu()
+                .numpy()
+                .astype(np.int32),
+                topology_candidate_route=self._topology_candidate_route.detach()
+                .cpu()
+                .numpy()
+                .astype(np.int8),
+                topology_group_logits=self._topology_group_logits.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+                topology_route_counts=self._topology_route_counts.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
                 shape_strength_raw=self._shape_strength_raw.detach()
                 .cpu()
                 .numpy()
@@ -756,6 +1108,34 @@ class HybridHairGaussianModel(HairGaussianModel):
                 .numpy()
                 .astype(np.float32),
             )
+        elif self.runtime_config.route_mode == "hard":
+            save_compact_hard_state(
+                state_path,
+                self._route_ids.detach().cpu().numpy().astype(np.int8),
+                self._hard_shell_strength_raw.detach().cpu().numpy(),
+                self._hard_fin_strength_raw.detach().cpu().numpy(),
+                self._hard_roll_residual.detach().cpu().numpy(),
+            )
+        else:
+            payload = {
+                "schema": np.asarray("hairgs-hybrid-state-v1"),
+                "route_names": np.asarray(ROUTE_NAMES),
+                "route_id": self._route_ids.detach().cpu().numpy().astype(np.int8),
+                "route_logits": self._route_logits.detach().cpu().numpy().astype(np.float32),
+                "shape_strength_raw": self._shape_strength_raw.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+                "roll_residual": self._roll_residual.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32),
+            }
+            if self._route_prior is not None:
+                payload["route_prior"] = (
+                    self._route_prior.detach().cpu().numpy().astype(np.float32)
+                )
+            np.savez_compressed(state_path, **payload)
         report = self.hybrid_report()
         state_path.with_name("hybrid_report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
@@ -763,19 +1143,40 @@ class HybridHairGaussianModel(HairGaussianModel):
 
     def hybrid_report(self) -> dict:
         with torch.no_grad():
-            probabilities = self.route_probabilities.detach().cpu().numpy()
-            hard = probabilities.argmax(axis=1)
+            candidate_probabilities = self.route_probabilities.detach().cpu().numpy()
+            decision_probabilities = (
+                self.routing_decision_probabilities.detach().cpu().numpy()
+            )
+            hard = candidate_probabilities.argmax(axis=1)
             hair = self.hair_route_mask.detach().cpu().numpy()
             strengths = self.shape_strengths.detach().cpu().numpy()
             scaling = self.get_scaling.detach()
             ratios = (scaling / torch.clamp(super().get_scaling, min=self.min_val)).cpu().numpy()
         return {
-            "schema": "hairgs-hybrid-report-v1",
+            "schema": "hairgs-hybrid-report-v2",
             "init_mode": self.runtime_config.init_mode,
             "route_mode": self.runtime_config.route_mode,
             "temperature": self.runtime_config.temperature,
+            "temperature_final": self.runtime_config.temperature_final,
+            "temperature_current": self.current_temperature,
+            "temperature_anneal_steps": self.runtime_config.temperature_anneal_steps,
+            "neutral_activation_steps": self.runtime_config.neutral_activation_steps,
+            "topology_hard_forward_start": self.runtime_config.topology_hard_forward_start,
+            "topology_hard_forward_active": bool(
+                getattr(self, "_topology_mode", False)
+                and self.runtime_config.topology_hard_forward_start >= 0
+                and self._hybrid_iteration
+                >= self.runtime_config.topology_hard_forward_start
+            ),
+            "route_activation_current": self.current_route_activation,
+            "route_prior_present": self._route_prior is not None,
             "loaded_hybrid_state": self._loaded_hybrid_state,
             "segment_count": int(hard.size),
+            "topology_mode": bool(getattr(self, "_topology_mode", False)),
+            "routing_decision_count": int(decision_probabilities.shape[0]),
+            "expected_active_splats": float(
+                self.expected_active_splats.detach().cpu()
+            ),
             "hair_segment_count": int(np.count_nonzero(hair)),
             "base_segment_count": int(np.count_nonzero(~hair)),
             "hair_endpoint_count": int(self._hair_endpoint_mask.sum()),
@@ -797,13 +1198,21 @@ class HybridHairGaussianModel(HairGaussianModel):
                 )
                 if self.runtime_config.route_mode == "hard"
                 else int(
-                    self._route_logits.numel()
+                    (
+                        self._topology_group_logits.numel()
+                        if getattr(self, "_topology_mode", False)
+                        else self._route_logits.numel()
+                    )
                     + self._shape_strength_raw.numel()
                     + self._roll_residual.numel()
                 )
             ),
             "route_mass": {
-                name: float(probabilities[hair, index].sum())
+                name: float(decision_probabilities[:, index].sum())
+                for index, name in enumerate(ROUTE_NAMES)
+            },
+            "hard_decision_counts": {
+                name: int(np.count_nonzero(decision_probabilities.argmax(axis=1) == index))
                 for index, name in enumerate(ROUTE_NAMES)
             },
             "mean_strength": {

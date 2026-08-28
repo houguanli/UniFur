@@ -125,6 +125,7 @@ def main() -> None:
         rows.append(
             {
                 "case": entry["case"],
+                **({"variant": entry["variant"]} if "variant" in entry else {}),
                 "active_budget": entry["active_budget"],
                 "source_active": entry["source_active"],
                 "active_fraction": entry["active_budget"] / entry["source_active"],

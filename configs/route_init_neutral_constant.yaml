@@ -1,0 +1,11 @@
+name: neutral_constant
+init_mode: neutral
+route_mode: soft
+route_schedule: constant
+temperature_start: 0.75
+temperature_final: 0.75
+temperature_anneal_steps: 0
+warmup_steps: 0
+neutral_activation_steps: 1000
+lambda_route_explore: 0.0
+lambda_route_prior: 0.0

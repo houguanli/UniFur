@@ -15,6 +15,17 @@ ROUTE_SIDECAR="${ROUTE_SIDECAR:-${PROTOCOL_ROOT}/initial/routes.npz}"
 EXPECTED_SEGMENTS="${EXPECTED_SEGMENTS:-96991}"
 VARIANT="${VARIANT:-adaptive}"
 ROUTE_MODE="${ROUTE_MODE:-soft}"
+ROUTE_SCHEDULE="${ROUTE_SCHEDULE:-constant}"
+ROUTE_WARMUP_STEPS="${ROUTE_WARMUP_STEPS:-0}"
+ROUTE_TEMPERATURE="${ROUTE_TEMPERATURE:-0.75}"
+ROUTE_TEMPERATURE_FINAL="${ROUTE_TEMPERATURE_FINAL:-${ROUTE_TEMPERATURE}}"
+ROUTE_TEMPERATURE_ANNEAL_STEPS="${ROUTE_TEMPERATURE_ANNEAL_STEPS:-0}"
+NEUTRAL_ACTIVATION_STEPS="${NEUTRAL_ACTIVATION_STEPS:-1000}"
+TOPOLOGY_HARD_FORWARD_START="${TOPOLOGY_HARD_FORWARD_START:--1}"
+LAMBDA_ROUTE_EXPLORE="${LAMBDA_ROUTE_EXPLORE:-0}"
+LAMBDA_ROUTE_PRIOR="${LAMBDA_ROUTE_PRIOR:-0}"
+LAMBDA_BUDGET="${LAMBDA_BUDGET:-0}"
+TARGET_ACTIVE_SPLATS="${TARGET_ACTIVE_SPLATS:-0}"
 STEPS="${STEPS:-5000}"
 START_ITERATION=30000
 FINAL_ITERATION=$((START_ITERATION + STEPS))
@@ -100,6 +111,13 @@ train_model() {
       --route-sidecar "${RESULT_ROOT}/point_cloud/iteration_${START_ITERATION}/routes.npz" \
       --hybrid-init-mode "${VARIANT}" \
       --hybrid-route-mode "${ROUTE_MODE}" \
+      --hybrid-route-schedule "${ROUTE_SCHEDULE}" \
+      --hybrid-route-warmup-steps "${ROUTE_WARMUP_STEPS}" \
+      --hybrid-temperature "${ROUTE_TEMPERATURE}" \
+      --hybrid-temperature-final "${ROUTE_TEMPERATURE_FINAL}" \
+      --hybrid-temperature-anneal-steps "${ROUTE_TEMPERATURE_ANNEAL_STEPS}" \
+      --hybrid-neutral-activation-steps "${NEUTRAL_ACTIVATION_STEPS}" \
+      --hybrid-topology-hard-forward-start "${TOPOLOGY_HARD_FORWARD_START}" \
       --iterations "${STEPS}" --densify_until_iter 0 \
       --merge_interval 100000 --growth_interval 100000 \
       --position_lr_max_steps "${STEPS}" --lambda_mask 0 \
@@ -114,6 +132,10 @@ train_model() {
       --lambda-hybrid-background-rgb "${LAMBDA_BACKGROUND_RGB:-0.50}" \
       --lambda-hybrid-route-cost 0.0002 \
       --lambda-hybrid-route-entropy 0.00005 \
+      --lambda-hybrid-route-explore "${LAMBDA_ROUTE_EXPLORE}" \
+      --lambda-hybrid-route-prior "${LAMBDA_ROUTE_PRIOR}" \
+      --lambda-hybrid-budget "${LAMBDA_BUDGET}" \
+      --hybrid-target-active-splats "${TARGET_ACTIVE_SPLATS}" \
       --lambda-hybrid-shape-reg 0.00002 \
       --lambda-hybrid-center-anchor "${LAMBDA_CENTER_ANCHOR:-0.50}" \
       --lambda-hybrid-length-anchor "${LAMBDA_LENGTH_ANCHOR:-0.25}" \

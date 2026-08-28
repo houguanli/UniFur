@@ -26,12 +26,22 @@ from hairgs_hybrid.hybrid_model import HybridHairGaussianModel, HybridModelConfi
 def add_hybrid_arguments(parser: ArgumentParser) -> None:
     parser.add_argument("--route-sidecar", type=Path, required=True)
     parser.add_argument(
-        "--hybrid-init-mode", choices=("adaptive", "all_strand"), default="adaptive"
+        "--hybrid-init-mode",
+        choices=("adaptive", "all_strand", "neutral"),
+        default="adaptive",
     )
     parser.add_argument(
         "--hybrid-route-mode", choices=("soft", "hard"), default="soft"
     )
     parser.add_argument("--hybrid-temperature", type=float, default=0.75)
+    parser.add_argument("--hybrid-temperature-final", type=float, default=0.75)
+    parser.add_argument("--hybrid-temperature-anneal-steps", type=int, default=0)
+    parser.add_argument("--hybrid-neutral-activation-steps", type=int, default=1000)
+    parser.add_argument("--hybrid-topology-hard-forward-start", type=int, default=-1)
+    parser.add_argument(
+        "--hybrid-route-schedule", choices=("constant", "staged"), default="constant"
+    )
+    parser.add_argument("--hybrid-route-warmup-steps", type=int, default=0)
     parser.add_argument("--hybrid-shell-strength", type=float, default=0.16)
     parser.add_argument("--hybrid-fin-strength", type=float, default=0.20)
     parser.add_argument("--hybrid-strength-max", type=float, default=0.80)
@@ -48,6 +58,10 @@ def add_hybrid_arguments(parser: ArgumentParser) -> None:
     parser.add_argument("--hybrid-mask-temperature", type=float, default=0.05)
     parser.add_argument("--lambda-hybrid-route-cost", type=float, default=2.0e-4)
     parser.add_argument("--lambda-hybrid-route-entropy", type=float, default=5.0e-5)
+    parser.add_argument("--lambda-hybrid-route-explore", type=float, default=0.0)
+    parser.add_argument("--lambda-hybrid-route-prior", type=float, default=0.0)
+    parser.add_argument("--lambda-hybrid-budget", type=float, default=0.0)
+    parser.add_argument("--hybrid-target-active-splats", type=int, default=0)
     parser.add_argument("--lambda-hybrid-shape-reg", type=float, default=2.0e-5)
     parser.add_argument("--lambda-hybrid-center-anchor", type=float, default=0.0)
     parser.add_argument("--lambda-hybrid-length-anchor", type=float, default=0.0)
@@ -60,6 +74,10 @@ def model_config(args) -> HybridModelConfig:
         init_mode=args.hybrid_init_mode,
         route_mode=args.hybrid_route_mode,
         temperature=args.hybrid_temperature,
+        temperature_final=args.hybrid_temperature_final,
+        temperature_anneal_steps=args.hybrid_temperature_anneal_steps,
+        neutral_activation_steps=args.hybrid_neutral_activation_steps,
+        topology_hard_forward_start=args.hybrid_topology_hard_forward_start,
         shell_strength_init=args.hybrid_shell_strength,
         fin_strength_init=args.hybrid_fin_strength,
         strength_max=args.hybrid_strength_max,
@@ -68,6 +86,32 @@ def model_config(args) -> HybridModelConfig:
         shape_lr=args.hybrid_shape_lr,
         roll_lr=args.hybrid_roll_lr,
     )
+
+
+def _route_schedule(
+    iteration: int, total_steps: int, warmup_steps: int, mode: str
+) -> tuple[float, float]:
+    """Return (commitment, exploration) without a case-specific route quota."""
+
+    if mode == "constant":
+        return 1.0, 0.0
+    if mode != "staged":
+        raise ValueError(f"Unsupported route schedule: {mode}")
+    if warmup_steps < 0 or total_steps <= 0:
+        raise ValueError("Invalid staged route schedule")
+    warmup = min(warmup_steps, max(total_steps - 1, 0))
+    exploration = max(0.0, 1.0 - float(iteration) / float(max(warmup, 1)))
+    commitment = max(
+        0.0,
+        min(
+            1.0,
+            float(iteration - warmup) / float(max(total_steps - warmup, 1)),
+        ),
+    )
+    # A smooth ramp avoids making route cost, rather than reconstruction,
+    # decide ownership at the first non-warmup step.
+    commitment = commitment * commitment * (3.0 - 2.0 * commitment)
+    return commitment, exploration
 
 
 def _masked_l1(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
@@ -291,10 +335,22 @@ def hybrid_loss(gaussians, image, camera, args):
         )
 
     hair = gaussians.hair_route_mask
-    probabilities = gaussians.route_probabilities[hair]
+    probabilities = gaussians.routing_decision_probabilities
     if probabilities.numel() > 0:
-        costs = torch.tensor([0.35, 0.65, 1.0], device=probabilities.device)
-        route_cost = (probabilities * costs).sum(dim=1).mean()
+        costs = gaussians.routing_route_costs.to(
+            device=probabilities.device, dtype=probabilities.dtype
+        )
+        expected_active = (probabilities * costs).sum()
+        route_cost = expected_active / float(probabilities.shape[0])
+        if args.hybrid_target_active_splats > 0:
+            target_active = torch.as_tensor(
+                float(args.hybrid_target_active_splats),
+                device=probabilities.device,
+                dtype=probabilities.dtype,
+            )
+            budget_loss = ((expected_active - target_active) / target_active).square()
+        else:
+            budget_loss = torch.zeros_like(route_cost)
         shape_reg = gaussians.effective_shape_regularizer()
         if gaussians.runtime_config.route_mode == "hard":
             # Ownership is immutable and one-hot, so route cost/entropy cannot
@@ -303,20 +359,64 @@ def hybrid_loss(gaussians, image, camera, args):
             route_entropy = torch.zeros_like(route_cost)
             loss = loss + args.lambda_hybrid_shape_reg * shape_reg
         else:
+            commitment, exploration = _route_schedule(
+                int(gaussians._hybrid_iteration),
+                int(args.iterations),
+                int(args.hybrid_route_warmup_steps),
+                args.hybrid_route_schedule,
+            )
             route_entropy = -(
                 probabilities * torch.log(probabilities.clamp_min(1.0e-8))
             ).sum(dim=1).mean()
+            route_explore = (
+                probabilities
+                * torch.log((3.0 * probabilities).clamp_min(1.0e-8))
+            ).sum(dim=1).mean()
+            prior = gaussians.route_prior
+            if prior is None:
+                route_prior = torch.zeros_like(route_explore)
+            else:
+                prior = prior[hair].to(
+                    device=probabilities.device, dtype=probabilities.dtype
+                )
+                route_prior = (
+                    prior
+                    * (
+                        torch.log(prior.clamp_min(1.0e-8))
+                        - torch.log(probabilities.clamp_min(1.0e-8))
+                    )
+                ).sum(dim=1).mean()
             loss = (
                 loss
-                + args.lambda_hybrid_route_cost * route_cost
-                + args.lambda_hybrid_route_entropy * route_entropy
+                + commitment * args.lambda_hybrid_route_cost * route_cost
+                + commitment * args.lambda_hybrid_route_entropy * route_entropy
+                + exploration * args.lambda_hybrid_route_explore * route_explore
+                + commitment * args.lambda_hybrid_route_prior * route_prior
+                + commitment * args.lambda_hybrid_budget * budget_loss
                 + args.lambda_hybrid_shape_reg * shape_reg
+            )
+            loss_dict.update(
+                {
+                    "hybrid_route_explore": route_explore,
+                    "hybrid_route_prior": route_prior,
+                    "hybrid_route_commitment": torch.as_tensor(
+                        commitment, device=probabilities.device
+                    ),
+                    "hybrid_route_exploration_weight": torch.as_tensor(
+                        exploration, device=probabilities.device
+                    ),
+                    "hybrid_temperature": torch.as_tensor(
+                        gaussians.current_temperature, device=probabilities.device
+                    ),
+                }
             )
         loss_dict.update(
             {
                 "hybrid_route_cost": route_cost,
                 "hybrid_route_entropy": route_entropy,
                 "hybrid_shape_reg": shape_reg,
+                "hybrid_expected_active_splats": expected_active,
+                "hybrid_budget_loss": budget_loss,
             }
         )
     geometry = gaussians.geometry_anchor_losses()
@@ -368,6 +468,10 @@ def main() -> None:
                     if key.startswith("lambda_hybrid_")
                 },
                 "mask_membership_temperature": args.hybrid_mask_temperature,
+                "route_schedule": {
+                    "mode": args.hybrid_route_schedule,
+                    "warmup_steps": args.hybrid_route_warmup_steps,
+                },
                 "hair_membership": "exact route_id >= 0",
                 "rgb_supervision": "GT hair-mask pixels only, native full-frame gradient scale",
                 "head_body_policy": "strictly frozen, retained only as occluder/background",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pixel-level gate for the HairGS-compatible all-strand initialization."""
+"""Pixel-level gate for HairGS-compatible route initializations."""
 
 from __future__ import annotations
 
@@ -35,6 +35,9 @@ def main() -> None:
     parser.add_argument("--route-sidecar", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tolerance", type=float, default=1.0e-5)
+    parser.add_argument(
+        "--init-mode", choices=("all_strand", "neutral", "adaptive"), default="all_strand"
+    )
     args = parser.parse_args()
 
     scene = Scene(load_scene_args(args.baseline_model, args.dataset), shuffle=False)
@@ -49,10 +52,10 @@ def main() -> None:
     HybridHairGaussianModel.configure(
         HybridModelConfig(
             route_sidecar=args.route_sidecar,
-            init_mode="all_strand",
-            strength_max=0.0,
-            shell_strength_init=0.0,
-            fin_strength_init=0.0,
+            init_mode=args.init_mode,
+            strength_max=0.0 if args.init_mode == "all_strand" else 0.8,
+            shell_strength_init=0.0 if args.init_mode == "all_strand" else 0.16,
+            fin_strength_init=0.0 if args.init_mode == "all_strand" else 0.20,
         )
     )
     hybrid = HybridHairGaussianModel(sh_degree, extent, device="cuda")
@@ -85,6 +88,7 @@ def main() -> None:
         "tolerance": args.tolerance,
         "input_ply": str(args.input_ply.resolve()),
         "route_sidecar": str(args.route_sidecar.resolve()),
+        "init_mode": args.init_mode,
         "camera_count": len(rows),
         "max_abs_scaling": scaling_max,
         "max_abs_rotation": rotation_max,

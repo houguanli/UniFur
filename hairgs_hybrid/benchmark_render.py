@@ -28,13 +28,14 @@ def configure_hybrid(args: Namespace) -> None:
     import scene as scene_module
 
     from hairgs_hybrid.hybrid_model import HybridHairGaussianModel, HybridModelConfig
+    from hairgs_hybrid.inference_config import completed_route_schedule
 
     HybridHairGaussianModel.configure(
         HybridModelConfig(
             route_sidecar=Path(args.route_sidecar) if args.route_sidecar else None,
             init_mode=getattr(args, "hybrid_init_mode", "adaptive"),
             route_mode=getattr(args, "hybrid_route_mode", "soft"),
-            temperature=getattr(args, "hybrid_temperature", 0.75),
+            **completed_route_schedule(args),
             shell_strength_init=getattr(args, "hybrid_shell_strength", 0.16),
             fin_strength_init=getattr(args, "hybrid_fin_strength", 0.20),
             strength_max=getattr(args, "hybrid_strength_max", 0.80),
