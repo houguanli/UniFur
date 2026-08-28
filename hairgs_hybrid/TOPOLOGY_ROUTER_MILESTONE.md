@@ -127,8 +127,7 @@ bash hairgs_hybrid/run_panda_topology_router.sh
 bash hairgs_hybrid/refine_panda_hard_topology.sh
 
 # Unit and integration-level topology checks.
-python -m pytest -q tests/test_topology_router.py \
-  tests/test_hairgs_inference_config.py
+python -m pytest -q
 ```
 
 Generated datasets, checkpoints, renders, and evaluation outputs stay outside

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/mnt/f/unifur_hairgs_hybrid_experiment}"
-EVAL_PROJECT="${EVAL_PROJECT:-/home/aoki/Differentiable_Physical_Driven_3DGS_for_monocular_Animal_Motion_Reconstruction}"
+EVAL_PROJECT="${EVAL_PROJECT:-${EXPERIMENT_ROOT}}"
 HAIRGS_ROOT="${HAIRGS_ROOT:-/home/aoki/fur_hair_baselines/hair-gs}"
 CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
-COMPAT_ROOT="${HAIRGS_COMPAT_ROOT:-${EVAL_PROJECT}/compat/hairgs_sitecustomize}"
+COMPAT_ROOT="${HAIRGS_COMPAT_ROOT:-${EXPERIMENT_ROOT}/compat/hairgs_sitecustomize}"
 PANDA_ROOT="${PANDA_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/neuralfur_panda_shared}"
 OFFICIAL_ROOT="${OFFICIAL_ROOT:-/mnt/f/fur_hair_unified_data/neuralfur_official/extracted/data/Artemis/panda_processed_GH2/walk}"
 PROTOCOL_ROOT="${PROTOCOL_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_protocol_r480}"
@@ -169,8 +169,7 @@ render_split() {
     --camera-manifest "${dataset}/camera_manifest.json" \
     --output-dir "${output}/external_renders" --iteration "${FINAL_ITERATION}" \
     --output-size 480 270 --hairgs-root "${HAIRGS_ROOT}"
-  "${CONDA_BIN}" run --no-capture-output -n dpd3dgs-animal python \
-    scripts/evaluate_external_renders.py \
+  run_hairgs scripts/evaluate_external_renders.py \
       --render-manifest "${output}/external_renders/render_manifest.json" \
       --ground-truth-dir "${PANDA_ROOT}/$2/images" \
       --output-dir "${output}/external_evaluation" \

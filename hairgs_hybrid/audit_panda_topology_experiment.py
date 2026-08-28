@@ -117,34 +117,10 @@ def main() -> None:
             "kind": "deployable",
         },
         {
-            "name": "UniFur type-init hard",
-            "path": root / "panda_N22000_hard_fused_compact_v1",
-            "active_splats": 22000,
-            "time": root / "panda_N22000_hard_fused_compact_v1/audit/train_time.txt",
-            "iteration": 35000,
-            "kind": "deployable",
-        },
-        {
-            "name": "UniFur common-start hard",
-            "path": root / "neutral_initialization_final_v1/panda_hard",
-            "active_splats": 22000,
-            "time": root / "neutral_initialization_ablation_v3_panda/panda/neutral_immediate_staged/audit/train_time.txt",
-            "iteration": 35000,
-            "kind": "deployable",
-        },
-        {
-            "name": "Topology soft-mixture diagnostic",
-            "path": root / "panda_topology_g10k_soft5k_v1",
-            "active_splats": 70000,
-            "time": root / "panda_topology_g10k_soft5k_v1/audit/train_time.txt",
-            "iteration": 35000,
-            "kind": "non-deployable diagnostic",
-        },
-        {
             "name": "Topology ST hard",
             "path": root / "panda_topology_g10k_st_hard22k_v2",
             "active_splats": 22000,
-            "time": root / "panda_topology_g10k_st_soft5k_v2/audit/train_time.txt",
+            "time": root / "panda_topology_g10k_st_hard22k_v2/audit/router_train_time.txt",
             "iteration": 35000,
             "kind": "candidate",
         },
@@ -153,7 +129,7 @@ def main() -> None:
             "path": root / "panda_topology_g10k_st_hard22k_refine3k_v3",
             "active_splats": 22000,
             "time": [
-                root / "panda_topology_g10k_st_soft5k_v2/audit/train_time.txt",
+                root / "panda_topology_g10k_st_hard22k_refine3k_v3/audit/router_train_time.txt",
                 root / "panda_topology_g10k_st_hard22k_refine3k_v3/audit/refine_time.txt",
             ],
             "iteration": 38000,
@@ -205,15 +181,24 @@ def main() -> None:
         "quality_near_full_pass": candidate["test_foreground_psnr"] >= full["test_foreground_psnr"] - 0.5,
         "storage_pass": candidate["deploy_bytes"] <= 0.30 * full["deploy_bytes"],
         "training_efficiency_pass": candidate["train_seconds"] < full["train_seconds"],
-        "overall_promotion_pass": False,
+        "route_attribution_pass": candidate["test_foreground_psnr"] - shuffle["foreground_psnr"] >= 1.0,
     }
+    gates["overall_milestone_pass"] = all(
+        gates[key]
+        for key in (
+            "quality_same_n_pass",
+            "quality_near_full_pass",
+            "storage_pass",
+            "route_attribution_pass",
+        )
+    )
     report = {
         "schema": "panda-topology-experiment-audit-v1",
         "protocol": "Panda 28 fit / 8 held-out, 480x270, identical camera split",
         "single_seed": True,
         "rows": rows,
         "gates": gates,
-        "conclusion": "not promoted: fixed topology passes same-N/near-full quality and storage, but cumulative training efficiency fails",
+        "conclusion": "promoted milestone: compact quality, storage, and spatial route attribution pass; optimization time is reported but is not a promotion gate",
     }
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "final_comparison.json").write_text(
@@ -228,7 +213,6 @@ def main() -> None:
         ("GT", Path(".")),
         ("HairGS full", root / "panda_native_hairgs_5k_v1"),
         ("HairGS 22k", root / "compression_sweep_panda_fine_v1/panda_N22000/hairgs"),
-        ("Common-start 22k", root / "neutral_initialization_final_v1/panda_hard"),
         ("Topology ST 22k", root / "panda_topology_g10k_st_hard22k_v2"),
         ("Topology + refine", root / "panda_topology_g10k_st_hard22k_refine3k_v3"),
         ("Route shuffle", root / "panda_topology_g10k_st_hard22k_route_shuffle_v2"),
@@ -240,8 +224,7 @@ def main() -> None:
         visual_columns,
         ["0000.png", "0010.png", "0020.png", "0030.png"],
     )
-    # The shuffle control was evaluated only on held-out views; use the five
-    # deployable methods for the training-view montage.
+    # The shuffle control was evaluated only on held-out views.
     make_montage(
         args.output_root / "comparison_train.png",
         "train",

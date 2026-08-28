@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unifur"
-version = "0.4.0"
-description = "Unified shell/strand Gaussian reconstruction for fur and hair."
+version = "0.5.0"
+description = "Adaptive Shell/Fin/Strand topology compression for HairGS."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,21 +14,16 @@ dependencies = [
   "torchmetrics",
   "opencv-python",
   "pillow",
-  "pyyaml",
-  "trimesh",
   "plyfile",
   "scipy",
-  "tqdm",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
-[project.scripts]
-unifur = "dpd3dgs_animal.cli:main"
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["hairgs_hybrid*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

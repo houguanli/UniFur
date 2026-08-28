@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hairgs_hybrid.compress_panda_scaffold import (
+from hairgs_hybrid.scaffold_io import (
     ROUTE_NAMES,
     load_scaffold,
     logit,

@@ -1,49 +1,32 @@
-# Model checkpoints are stored outside Git.
-checkpoints/*
+# Generated training and evaluation artifacts
+output/
+checkpoints/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 
-# Generated samples, renders, meshes, logs, and optimization states.
-output/
-
-# Local datasets and upstream implementations are not redistributed.
-samples/*
-third_party/*
-!third_party/README.md
-
-# Python
+# Python and test caches
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 
-# Conda and local environments
+# Local environments and native extensions
 .conda/
 .venv/
 venv/
-
-# Native build output
 build/
 cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
 *.so
 *.dll
 *.dylib
 *.o
 *.obj
 
-# IDE and OS metadata
+# Editor and OS metadata
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-
-# Temporary geometry/interchange files
-_skipped.*
-*.node
-*.face
-*.ele

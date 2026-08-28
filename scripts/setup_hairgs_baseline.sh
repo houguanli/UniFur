@@ -21,7 +21,7 @@ fi
   --index-url https://download.pytorch.org/whl/cu118
 "${CONDA_BIN}" run -n hair-gs python -m pip install \
   setuptools==69.5.1 numpy==1.26.4 scipy==1.11.4 cython \
-  tqdm tensorboard wandb plyfile pyrr opencv-python-headless pyvista \
+  tqdm tensorboard torchmetrics==1.8.2 wandb plyfile pyrr opencv-python-headless pyvista \
   pyvistaqt PyQt5 PyOpenGL PyOpenGL-accelerate glfw smplx chumpy-fix \
   dreifus nersemble_data fvcore iopath pytest huggingface_hub
 "${CONDA_BIN}" run -n hair-gs python -m pip install \

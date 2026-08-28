@@ -1,182 +1,207 @@
 # UniFur
 
-HairGS-based adaptive Shell/Fin/Strand topology compression for multi-view fur
-and hair.
+UniFur learns a compact, spatially adaptive Shell/Fin/Strand Gaussian topology
+on top of a calibrated multi-view HairGS scaffold.  The maintained milestone is
+the Panda 28-fit / 8-held-out experiment at 480x270 with a final budget of
+22,000 splats.
 
-## Current milestone: topology routing
+## Pipeline
 
-The current Panda milestone replaces covariance-only route labels with a real
-topology candidate bank.  Each spatial group can be represented by one Shell
-splat, two Fin splats, or four Strand splats.  Every group starts from the same
-zero route logits, learns its route from reconstruction gradients, and is then
-projected to an exact 22,000-splat hard model.  A final fixed-topology
-refinement updates only the selected compact representation.
-
-```text
-HairGS dense scaffold (96,991 segments)
-        |
-balanced spatial grouping (10,000 groups)
-        |
-real candidate bank: Shell x1 / Fin x2 / Strand x4
-        |
-zero-logit common start + differentiable topology routing
-        |
-exact 22,000-splat hard projection
-        |
-fixed-topology compact refinement
-        |
-native HairGS rendering + unified held-out evaluation
+```mermaid
+flowchart TD
+    A[Calibrated multi-view RGB, masks and cameras] --> B[Dense HairGS scaffold<br/>96,991 line Gaussians]
+    B --> C[Balanced spatial partition<br/>10,000 groups, 9-10 source segments each]
+    C --> D{Real topology candidate bank<br/>70,000 training candidates}
+    D --> D1[Shell<br/>1 aggregated splat / group]
+    D --> D2[Fin<br/>2 aggregated splats / group]
+    D --> D3[Strand<br/>4 directional splats / group]
+    D1 --> E[Common zero-logit router<br/>initial probability 1/3 each]
+    D2 --> E
+    D3 --> E
+    E --> F[Differentiable rendering optimization<br/>geometry + opacity + SH + route logits]
+    F --> G[Straight-through hard forwarding<br/>expose deployable topology during training]
+    G --> H[Exact-budget projection<br/>Lagrangian choice + budget repair]
+    H --> I[Physical pruning to 22,000 splats<br/>compact PLY + state sidecar]
+    I --> J[Fixed-topology refinement<br/>optimize selected geometry and appearance]
+    J --> K[Native HairGS rendering]
+    K --> L[Strict train / held-out evaluation<br/>PSNR, SSIM, LPIPS, mask, holes, overflow]
+    H --> M[Route-shuffle control<br/>same count and histogram]
+    M --> L
 ```
 
-Panda uses the frozen 28-fit / 8-held-out, 480x270 camera protocol.  The table
-below reports one seed, as requested; held-out views are never used to train or
-select routes.
+### 1. Dense scaffold and grouping
 
-| Method | splats | FG PSNR | Full PSNR | Full LPIPS | deploy size | FPS | optimization wall |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| HairGS full | 96,991 | **20.3245** | 26.3744 | **0.1119** | 26.77 MB | 209.0 | 310 s |
-| HairGS equal-count | 22,000 | 19.7876 | 26.0876 | 0.1348 | **6.07 MB** | **277.0** | **185 s** |
-| previous common-start UniFur | 22,000 | 20.2831 | **27.0918** | 0.1125 | 6.13 MB | 269.6 | 285 s |
-| **topology-routed UniFur** | **22,000** | **20.0893** | 26.9131 | 0.1258 | 6.11 MB | 250.7 | 574 s |
+The input is a fitted HairGS line-Gaussian scaffold with calibrated cameras.
+Panda contains 96,991 source segments.  A deterministic balanced spatial
+partition creates 10,000 local groups with 9-10 segments each.  This makes route
+decisions local and prevents dense image regions from monopolizing the budget.
 
-The topology-routed model improves over equal-count HairGS by +0.302 dB
-foreground PSNR and +0.825 dB full PSNR.  Against full HairGS it retains
-foreground PSNR within 0.235 dB while reducing deployment bytes by 77.18% and
-raising measured throughput from 209.0 to 250.7 FPS.  Training time is not a
-claim of this milestone.
+### 2. Real topology candidates
 
-The learned group allocation is 44.70% Shell, 22.95% Fin, and 32.35% Strand.
-Because the routes cost 1/2/4 splats, the deployed model contains 4,470 Shell,
-4,590 Fin, and 12,940 Strand splats.  A route-shuffle control preserves these
-counts and the exact 22k budget but moves ownership between spatial groups; its
-foreground PSNR falls by 4.528 dB.  This is the primary evidence that routing
-learns useful spatial structure rather than only a global class histogram.
+Each group represents the same source optical mass in three ways:
 
-See
-[`hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md`](hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md)
-for the implementation, ablations, metrics, and claim boundary.
+| Route | Cost | Intended role |
+|---|---:|---|
+| Shell | 1 splat | broad, low-cost regional coverage |
+| Fin | 2 splats | silhouette and transition support |
+| Strand | 4 splats | directional and high-frequency detail |
 
-## Previous functional-route baseline
+The 70k candidate bank is only a differentiable search space.  It is never
+reported as the deployed model.
+
+### 3. Common-start adaptive routing
+
+Every group starts from route logits `[0, 0, 0]`, hence probabilities
+`[1/3, 1/3, 1/3]`.  There is no Panda-specific Shell/Fin/Strand quota.  RGB,
+bidirectional mask supervision, topology cost, and reconstruction gradients
+jointly optimize:
+
+- route logits;
+- Gaussian position and line endpoints;
+- scale and orientation;
+- opacity;
+- spherical-harmonic appearance;
+- route-specific shape strength and roll.
+
+The router uses real route costs `[1, 2, 4]`.  Its budget loss therefore tracks
+expected active splats rather than a label-count proxy.
+
+### 4. Hard projection and compact refinement
+
+Hardening selects one topology per group and repairs the assignment to exactly
+22,000 active splats.  Unselected candidates are physically removed.  The
+selected topology is frozen for compact refinement, while its geometry,
+opacity, orientation, scale, and SH appearance remain trainable.
+
+The learned Panda allocation is:
+
+| Route | Groups | Group share | Deployed splats | Splat share |
+|---|---:|---:|---:|---:|
+| Shell | 4,470 | 44.70% | 4,470 | 20.32% |
+| Fin | 2,295 | 22.95% | 4,590 | 20.86% |
+| Strand | 3,235 | 32.35% | 12,940 | 58.82% |
+
+### 5. Evaluation and attribution
+
+All methods use the same 28 fit views, 8 held-out views, resolution, cameras,
+alpha semantics, renderer, and self-contained evaluator.  A route-shuffle
+control preserves both the exact 22k count and learned route histogram but
+reassigns the routes to different spatial groups.
+
+## Panda milestone
+
+| Method | splats | held-out FG PSNR | Full PSNR | masked LPIPS | deploy size | FPS |
+|---|---:|---:|---:|---:|---:|---:|
+| HairGS full | 96,991 | **20.3245** | 26.3744 | **0.0711** | 26.77 MB | 209.0 |
+| HairGS equal-count | 22,000 | 19.7876 | 26.0876 | 0.0860 | **6.07 MB** | **277.0** |
+| **UniFur topology + refinement** | **22,000** | **20.0893** | **26.9131** | 0.0907 | 6.11 MB | 250.7 |
+| route-shuffle control | 22,000 | 15.5609 | - | - | 6.11 MB | - |
+
+At equal count, UniFur improves foreground PSNR by 0.302 dB and full PSNR by
+0.825 dB over HairGS.  Against full HairGS, it retains foreground PSNR within
+0.235 dB, reduces deployment bytes by 77.18%, and raises measured throughput
+from 209.0 to 250.7 FPS.  Route shuffling reduces foreground PSNR by 4.528 dB,
+showing that spatial ownership—not only the global route ratio—matters.
+
+Optimization wall time is not a claim of this milestone.  Full HairGS remains
+better in masked LPIPS and fine-fiber fidelity.  Detailed metrics and claim
+limits are recorded in
+[`hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md`](hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md).
+
+## Repository layout
 
 ```text
-HairGS dense scaffold
-        |
-exact-N geometry compression shared with the HairGS control
-        |
-all active primitives start from route logits [0, 0, 0]
-        |
-soft Shell/Fin/Strand optimization with no case-specific route quota
-        |
-final-temperature argmax projection
-        |
-compact hard-route sidecar + native HairGS PLY renderer
+hairgs_hybrid/
+  build_topology_candidate_bank.py  balanced grouping and 1/2/4 candidates
+  scaffold_io.py                    minimal HairGS line-scaffold PLY I/O
+  hybrid_model.py                   differentiable topology router
+  train_hybrid.py                   reconstruction and route optimization
+  harden_topology_checkpoint.py     exact-budget physical pruning
+  render_hybrid.py                  native HairGS rendering adapter
+  benchmark_render.py               deployment throughput measurement
+  prepare_panda_hairgs.py           frozen Panda HairGS protocol conversion
+  prepare_hair_mask_manifest.py     immutable mask/provenance validation
+  run_panda_hairgs_hybrid.sh        shared training/evaluation stage
+  run_panda_topology_router.sh      candidate search and hard projection
+  refine_panda_hard_topology.sh     fixed-topology refinement
+  audit_panda_topology_experiment.py strict table and visual comparison
+scripts/
+  export_hairgs_external_renders.py renderer-to-evaluator manifest adapter
+  evaluate_external_renders.py      self-contained unified image evaluator
+  setup_hairgs_baseline.sh          pinned upstream HairGS environment
+tests/
+  test_topology_router.py
+  test_hairgs_compact_state.py
+  test_hairgs_inference_config.py
+  test_external_evaluator.py
 ```
 
-The preceding common-start preset is
-[`configs/route_init_neutral_immediate_staged.yaml`](configs/route_init_neutral_immediate_staged.yaml).
-It exposes route-conditioned geometry from the first gradient step, delays
-route commitment regularizers for 1,000 steps, and anneals temperature from
-1.5 to 0.5. Training-camera geometry evidence is retained only for audit and
-has zero prior weight in the promoted preset.
+## Setup
 
-## Four-way held-out comparison
+The maintained code extends upstream HairGS commit
+`16588656b1f6f048bc3bc83f3cb98c2da8596754` and expects CUDA-capable HairGS
+extensions.
 
-| Case | Method | active GS | FG PSNR | Full PSNR | masked LPIPS | IoU | largest FN |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Panda | HairGS | 22,000 | 19.7876 | 26.0876 | 0.08600 | 0.93038 | 0.00656 |
-| Panda | previous type-initialized UniFur hard | 22,000 | 20.2321 | 26.9843 | 0.08440 | **0.95019** | 0.01409 |
-| Panda | **UniFur common-start hard** | 22,000 | **20.2831** | **27.0918** | **0.08426** | **0.95008** | 0.01292 |
-| Panda | full HairGS | 96,991 | 20.3245 | 26.3744 | **0.07105** | 0.92926 | **0.00749** |
-| WCurly | HairGS strict | 6,000 | 17.4607 | 17.4833 | 0.14723 | 0.82906 | 0.06770 |
-| WCurly | previous type-initialized UniFur hard | 6,000 | **17.5707** | 17.5378 | 0.14484 | 0.83190 | 0.04018 |
-| WCurly | **UniFur common-start hard** | 6,000 | 17.5458 | 17.4916 | 0.14569 | 0.83074 | 0.04587 |
-| WCurly | full HairGS | 107,610 | 16.8499 | **17.5558** | **0.13087** | **0.85413** | **0.03272** |
+```bash
+bash scripts/setup_hairgs_baseline.sh
+```
 
-Panda uses 28 fit / 8 held-out views at 480x270. WCurly uses 12 fit / 4
-held-out views at 500x500. The protocols are reported separately.
-
-Against the final full HairGS models, Panda removes 77.3% of primitives and
-WCurly removes 94.4% of active hair primitives. Panda foreground PSNR is only
-0.041 dB below full HairGS; WCurly foreground PSNR is 0.696 dB higher and full
-PSNR is 0.064 dB lower. Perceptual and silhouette equivalence is not complete:
-both compact models retain a roughly 0.013--0.015 masked-LPIPS gap, and WCurly
-IoU is 0.0234 lower than full HairGS.
-
-This proximity claim is held-out-specific. On fitted views, Panda common-start
-is 1.36 dB below full HairGS foreground PSNR and WCurly is 6.91 dB below. The
-compact WCurly model generalizes better in held-out PSNR but does not reproduce
-the full model's training-view high-frequency fidelity.
-
-The primary efficiency claim is deployment storage, render memory, throughput,
-and—in WCurly's full 15k Stage-3 comparison—optimization time. It is not a
-claim that common-start training is cheaper than the previous fixed-route hard
-training at the same point count.
-
-See [`hairgs_hybrid/NEUTRAL_INITIALIZATION_AUDIT.md`](hairgs_hybrid/NEUTRAL_INITIALIZATION_AUDIT.md)
-for the corrected ablation, resource audit, route counts, and claim limits.
+Paths are configurable through environment variables.  The tested WSL defaults
+use `/home/aoki/fur_hair_baselines/hair-gs` for HairGS and `/mnt/f` for data and
+outputs.
 
 ## Reproduce
 
-Run the current Panda topology milestone:
-
 ```bash
+# Candidate construction, soft/ST training, exact hard projection,
+# learned-route and route-shuffle evaluation.
 bash hairgs_hybrid/run_panda_topology_router.sh
+
+# Fixed 22k topology refinement and final train/held-out evaluation.
 bash hairgs_hybrid/refine_panda_hard_topology.sh
-python hairgs_hybrid/audit_panda_topology_experiment.py --help
+
+# Rebuild the final numeric table and train/test montages.
+python hairgs_hybrid/audit_panda_topology_experiment.py \
+  --benchmark-root /path/to/hairgs_hybrid_outputs \
+  --output-root /path/to/final_audit \
+  --panda-root /path/to/panda_observations
 ```
 
-The first command builds the candidate bank, optimizes the differentiable
-router, creates learned and route-shuffled exact-budget hard models, and runs
-the strict evaluator.  The second command refines the selected hard topology.
-The audit command accepts explicit model/evaluation paths so generated outputs
-remain outside the repository.
+The runners refuse ambiguous restarts and duplicate GPU training.  Datasets,
+checkpoints, renders, logs, and audit outputs remain outside Git.
 
-Run the previous functional-route preset on one or both frozen protocols:
+## Retained local outputs
+
+The cleaned Panda benchmark root keeps only:
+
+```text
+panda_protocol_r480/                         frozen data/camera protocol
+panda_native_hairgs_5k_v1/                  full 96,991-splat reference
+compression_sweep_panda_fine_v1/            equal-count 22k HairGS reference
+panda_topology_g10k_st_hard22k_v2/          direct hard diagnostic
+panda_topology_g10k_st_hard22k_refine3k_v3/ final model and audit
+panda_topology_g10k_st_hard22k_route_shuffle_v2/ attribution control
+```
+
+Only final checkpoints, unified evaluation manifests/arrays, audit reports, and
+comparison images are retained.  Candidate banks, soft checkpoints, native
+temporary render folders, smoke runs, failed runs, and superseded ablations are
+regenerable and intentionally removed.
+
+## Validation
+
+Run the maintained tests in the HairGS environment:
 
 ```bash
-bash hairgs_hybrid/run_common_start_final.sh panda
-bash hairgs_hybrid/run_common_start_final.sh wcurly
-bash hairgs_hybrid/run_common_start_final.sh both
+PYTHONPATH=/path/to/hair-gs:. python -m pytest -q
 ```
-
-Run all correctness-valid initialization variants:
-
-```bash
-bash hairgs_hybrid/run_neutral_initialization_ablation.sh
-```
-
-Project a trained soft checkpoint to the compact hard state:
-
-```bash
-python hairgs_hybrid/harden_soft_checkpoint.py \
-  --source-model /path/to/soft/model \
-  --source-iteration 35000 \
-  --output-model /path/to/hard/model \
-  --output-iteration 35000 \
-  --temperature 0.5
-```
-
-External HairGS source, datasets, checkpoints, renders, and generated audit
-outputs are intentionally not committed.
 
 ## Claim boundary
 
-- The current Shell/Fin/Strand routes have different primitive counts and
-  geometry, so topology ownership is real.  They are still Gaussian
-  approximations, not literal volumetric shells, ribbon meshes, or continuous
-  simulation-ready fibers.
-- The 70k soft candidate bank is a training representation, not the deployed
-  model.  All deployment metrics use the physically pruned 22k checkpoint.
-- The reported topology result requires fixed-topology refinement.  The direct
-  straight-through hard projection reaches only 18.533 dB foreground PSNR.
-- The milestone claims compact quality retention and meaningful adaptive
-  ownership.  It does not claim lower optimization time than HairGS.
-- Zero logits mean “unassigned”; soft probabilities are necessarily uniform
-  because a categorical distribution cannot contain three zero probabilities.
-- Learned case-dependent route counts demonstrate adaptive allocation, not
-  perfect semantic purity of every Shell/Fin/Strand label.
-- WCurly's full baseline is the final native HairGS Stage-3 model with 107,610
-  active hair segments and 135,141 total segments. Equal-count quality is
-  separately compared with strict 6k native HairGS.
-- The current output is a compact functional covariance decomposition. It is
-  not yet a continuous, simulation-ready strand graph or volumetric shell.
+- Shell/Fin/Strand are different Gaussian topologies, but are not literal
+  volumetric shells, ribbon meshes, or continuous simulation-ready fibers.
+- The result supports compact quality retention and meaningful adaptive spatial
+  ownership, not lossless compression.
+- The result does not claim optimization-time superiority.
+- Full HairGS retains better perceptual/high-frequency quality.
+- One requested Panda seed is reported; no variance claim is made.
