@@ -1,0 +1,5 @@
+# Python runtime dependencies shared by UniFur and the pinned HairGS submodule.
+# CUDA/PyTorch packages are isolated in requirements/cuda118.txt because their
+# wheels are tied to the CUDA ABI. Native extensions are built from the
+# repository submodule by scripts/setup_hairgs_baseline.sh.
+-r requirements/runtime.txt

@@ -129,6 +129,13 @@ scripts/
   export_hairgs_external_renders.py renderer-to-evaluator manifest adapter
   evaluate_external_renders.py      self-contained unified image evaluator
   setup_hairgs_baseline.sh          pinned upstream HairGS environment
+third_party/
+  hair-gs/                           upstream HairGS Git submodule
+requirements/
+  cuda118.txt                        PyTorch/CUDA ABI pins
+  pytorch3d-cu118.txt                PyTorch3D wheel and ABI pin
+  runtime.txt                        pinned Python runtime
+  dev.txt                            validation/test dependencies
 tests/
   test_topology_router.py
   test_hairgs_compact_state.py
@@ -139,16 +146,44 @@ tests/
 ## Setup
 
 The maintained code extends upstream HairGS commit
-`16588656b1f6f048bc3bc83f3cb98c2da8596754` and expects CUDA-capable HairGS
-extensions.
+`16588656b1f6f048bc3bc83f3cb98c2da8596754`.  HairGS is tracked as the
+`third_party/hair-gs` Git submodule; UniFur does not vendor or silently patch
+its CUDA rasterizer.
+
+Prerequisites are Linux or WSL2, an NVIDIA GPU/driver, the CUDA 11.8 toolkit,
+Conda, and Git.  The validated Python ABI is 3.10.
 
 ```bash
+git clone --recurse-submodules https://github.com/houguanli/UniFur.git
+cd UniFur
 bash scripts/setup_hairgs_baseline.sh
 ```
 
-Paths are configurable through environment variables.  The tested WSL defaults
-use `/home/aoki/fur_hair_baselines/hair-gs` for HairGS and `/mnt/f` for data and
-outputs.
+For an existing clone, initialize the dependency with
+`git submodule update --init --recursive`.  All runners resolve HairGS from
+`third_party/hair-gs` by default, independent of the checkout location.
+The installer creates the `unifur` environment by default, consumes the pinned
+files under `requirements/`, builds all three native extensions from the
+submodule, exercises CUDA forward/backward, runs `pip check`, and executes the
+test suite.  `CONDA_ENV`, `CONDA_BIN`, `CUDA_HOME`, and `HAIRGS_ROOT` remain
+explicit overrides.
+
+Datasets and experiment outputs are intentionally not part of the source
+repository.  Runners default to `data/` and `outputs/` inside the checkout;
+external storage can be selected without editing code:
+
+```bash
+export UNIFUR_DATA_ROOT=/path/to/unifur_data
+export UNIFUR_OUTPUT_ROOT=/path/to/unifur_outputs
+```
+
+To re-run the dependency and CUDA integrity check independently:
+
+```bash
+PYTHONPATH=compat/hairgs_sitecustomize:third_party/hair-gs:. \
+  conda run --no-capture-output -n unifur \
+  python scripts/verify_reproducibility.py
+```
 
 ## Reproduce
 
@@ -193,7 +228,8 @@ regenerable and intentionally removed.
 Run the maintained tests in the HairGS environment:
 
 ```bash
-PYTHONPATH=/path/to/hair-gs:. python -m pytest -q
+PYTHONPATH=compat/hairgs_sitecustomize:third_party/hair-gs:. \
+  conda run --no-capture-output -n unifur python -m pytest -q
 ```
 
 ## Claim boundary

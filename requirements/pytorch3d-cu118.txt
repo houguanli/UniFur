@@ -1,0 +1,3 @@
+--no-index
+--find-links https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu118_pyt211/download.html
+pytorch3d==0.7.5

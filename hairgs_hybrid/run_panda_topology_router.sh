@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/mnt/f/unifur_hairgs_hybrid_experiment}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+source "${EXPERIMENT_ROOT}/scripts/lib/runtime.sh"
 EVAL_PROJECT="${EVAL_PROJECT:-${EXPERIMENT_ROOT}}"
-HAIRGS_ROOT="${HAIRGS_ROOT:-/home/aoki/fur_hair_baselines/hair-gs}"
-CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
+HAIRGS_ROOT="${HAIRGS_ROOT:-${EXPERIMENT_ROOT}/third_party/hair-gs}"
+CONDA_BIN="$(resolve_conda_bin)"
+CONDA_ENV="${CONDA_ENV:-unifur}"
 COMPAT_ROOT="${HAIRGS_COMPAT_ROOT:-${EXPERIMENT_ROOT}/compat/hairgs_sitecustomize}"
-PROTOCOL_ROOT="${PROTOCOL_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_protocol_r480}"
-PANDA_ROOT="${PANDA_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/neuralfur_panda_shared}"
-BANK_ROOT="${BANK_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_bank_g10000_t22000_v1}"
-SOFT_ROOT="${SOFT_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_g10k_st_soft5k_v2}"
-HARD_ROOT="${HARD_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_g10k_st_hard22k_v2}"
-SHUFFLE_ROOT="${SHUFFLE_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_g10k_st_hard22k_route_shuffle_v2}"
+DATA_ROOT="${UNIFUR_DATA_ROOT:-${DATA_ROOT:-${EXPERIMENT_ROOT}/data}}"
+OUTPUT_ROOT="${UNIFUR_OUTPUT_ROOT:-${OUTPUT_ROOT:-${EXPERIMENT_ROOT}/outputs}}"
+PROTOCOL_ROOT="${PROTOCOL_ROOT:-${OUTPUT_ROOT}/protocols/panda_r480}"
+PANDA_ROOT="${PANDA_ROOT:-${DATA_ROOT}/benchmarks/neuralfur_panda_shared}"
+BANK_ROOT="${BANK_ROOT:-${OUTPUT_ROOT}/work/panda_topology_bank_g10000_t22000_v1}"
+SOFT_ROOT="${SOFT_ROOT:-${OUTPUT_ROOT}/work/panda_topology_g10k_st_soft5k_v2}"
+HARD_ROOT="${HARD_ROOT:-${OUTPUT_ROOT}/experiments/panda_topology_g10k_st_hard22k_v2}"
+SHUFFLE_ROOT="${SHUFFLE_ROOT:-${OUTPUT_ROOT}/controls/panda_topology_g10k_st_hard22k_route_shuffle_v2}"
 GROUP_COUNT="${GROUP_COUNT:-10000}"
 TARGET_ACTIVE="${TARGET_ACTIVE:-22000}"
 STEPS="${STEPS:-5000}"
@@ -23,10 +28,11 @@ export PYTHONPATH="${COMPAT_ROOT}:${HAIRGS_ROOT}:${EXPERIMENT_ROOT}${PYTHONPATH:
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 
-run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n hair-gs python "$@"; }
+run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python "$@"; }
 
 preflight() {
   cd "${EXPERIMENT_ROOT}"
+  test -f "${HAIRGS_ROOT}/train.py"
   run_hairgs -m pytest -q tests/test_topology_router.py tests/test_hairgs_inference_config.py
   test -f "${PROTOCOL_ROOT}/initial/point_cloud.ply"
   test -f "${PROTOCOL_ROOT}/train_v28/camera_manifest.json"

@@ -1,57 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
-BASELINE_ROOT="${BASELINE_ROOT:-/home/aoki/fur_hair_baselines/hair-gs}"
-DATA_ROOT="${DATA_ROOT:-/mnt/f/fur_hair_unified_data}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/lib/runtime.sh"
+CONDA_BIN="$(resolve_conda_bin)"
+CONDA_ENV="${CONDA_ENV:-unifur}"
+HAIRGS_ROOT="${HAIRGS_ROOT:-${BASELINE_ROOT:-${REPOSITORY_ROOT}/third_party/hair-gs}}"
 HAIRGS_COMMIT="16588656b1f6f048bc3bc83f3cb98c2da8596754"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-11.8}"
 
-if [[ ! -d "${BASELINE_ROOT}/.git" ]]; then
-  mkdir -p "$(dirname "${BASELINE_ROOT}")"
-  git clone --recursive https://github.com/yimin-pan/hair-gs.git "${BASELINE_ROOT}"
+if [[ "${HAIRGS_ROOT}" == "${REPOSITORY_ROOT}/third_party/hair-gs" ]]; then
+  git -C "${REPOSITORY_ROOT}" submodule update --init --recursive third_party/hair-gs
 fi
-git -C "${BASELINE_ROOT}" checkout "${HAIRGS_COMMIT}"
-
-if ! "${CONDA_BIN}" env list | awk '{print $1}' | grep -qx hair-gs; then
-  "${CONDA_BIN}" create -y -n hair-gs python=3.10 pip setuptools=69.5.1 wheel ninja cmake
+actual_commit="$(git -C "${HAIRGS_ROOT}" rev-parse HEAD)"
+if [[ "${actual_commit}" != "${HAIRGS_COMMIT}" ]]; then
+  echo "HairGS submodule mismatch: expected ${HAIRGS_COMMIT}, got ${actual_commit}" >&2
+  exit 3
+fi
+# DrvFS exposes every file as executable unless metadata is enabled.  Ignore
+# that host-specific bit so a clean submodule remains clean on WSL-mounted
+# Windows drives.
+if [[ "${HAIRGS_ROOT}" == /mnt/* ]]; then
+  git -C "${HAIRGS_ROOT}" config core.filemode false
 fi
 
-"${CONDA_BIN}" run -n hair-gs python -m pip install \
-  torch==2.1.2 torchvision==0.16.2 \
-  --index-url https://download.pytorch.org/whl/cu118
-"${CONDA_BIN}" run -n hair-gs python -m pip install \
-  setuptools==69.5.1 numpy==1.26.4 scipy==1.11.4 cython \
-  tqdm tensorboard torchmetrics==1.8.2 wandb plyfile pyrr opencv-python-headless pyvista \
-  pyvistaqt PyQt5 PyOpenGL PyOpenGL-accelerate glfw smplx chumpy-fix \
-  dreifus nersemble_data fvcore iopath pytest huggingface_hub
-"${CONDA_BIN}" run -n hair-gs python -m pip install \
-  --no-deps --no-index --no-cache-dir pytorch3d \
-  -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu118_pyt211/download.html
+export PYTHONPATH="${REPOSITORY_ROOT}/compat/hairgs_sitecustomize:${HAIRGS_ROOT}:${REPOSITORY_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-cd "${BASELINE_ROOT}"
-CUDA_HOME=/usr/local/cuda-11.8 \
-TORCH_CUDA_ARCH_LIST=8.9 \
+if ! "${CONDA_BIN}" env list | awk '{print $1}' | grep -qx "${CONDA_ENV}"; then
+  "${CONDA_BIN}" create -y -n "${CONDA_ENV}" \
+    python=3.10 pip setuptools=69.5.1 wheel ninja cmake
+fi
+
+PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= \
+  "${CONDA_BIN}" run -n "${CONDA_ENV}" python -m pip --isolated install setuptools==69.5.1
+PIP_INDEX_URL=https://pypi.org/simple \
+PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu118 \
+  "${CONDA_BIN}" run -n "${CONDA_ENV}" python -m pip --isolated install \
+  -r "${REPOSITORY_ROOT}/requirements/cuda118.txt"
+PIP_INDEX_URL=https://pypi.org/simple PIP_EXTRA_INDEX_URL= \
+  "${CONDA_BIN}" run -n "${CONDA_ENV}" python -m pip --isolated install \
+  -r "${REPOSITORY_ROOT}/requirements/dev.txt"
+"${CONDA_BIN}" run -n "${CONDA_ENV}" python -m pip --isolated install \
+  --no-deps --no-cache-dir \
+  -r "${REPOSITORY_ROOT}/requirements/pytorch3d-cu118.txt"
+
+if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  echo "CUDA 11.8 toolkit not found at ${CUDA_HOME}; set CUDA_HOME explicitly" >&2
+  exit 4
+fi
+if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+  TORCH_CUDA_ARCH_LIST="$(
+    "${CONDA_BIN}" run -n "${CONDA_ENV}" python -c \
+      'import torch; p=torch.cuda.get_device_capability(); print(f"{p[0]}.{p[1]}")'
+  )"
+fi
+
+cd "${HAIRGS_ROOT}"
+CUDA_HOME="${CUDA_HOME}" \
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
 MAX_JOBS="${MAX_JOBS:-8}" \
-"${CONDA_BIN}" run -n hair-gs python -m pip install --no-build-isolation \
+"${CONDA_BIN}" run -n "${CONDA_ENV}" python -m pip --isolated install --no-build-isolation \
   ./c_utils ./submodules/diff-gaussian-rasterization ./submodules/simple-knn -e .
 
-mkdir -p "${DATA_ROOT}/cem_yuksel_raw" "${DATA_ROOT}/hair-gs_parsed/cem_yuksel"
-mkdir -p dataset/raw dataset/parsed
-[[ -e dataset/raw/cem_yuksel ]] || \
-  ln -s "${DATA_ROOT}/cem_yuksel_raw" dataset/raw/cem_yuksel
-[[ -e dataset/parsed/cem_yuksel ]] || \
-  ln -s "${DATA_ROOT}/hair-gs_parsed/cem_yuksel" dataset/parsed/cem_yuksel
-
-"${CONDA_BIN}" run -n hair-gs python - <<'PY'
-import torch
-import pytorch3d
-import c_utils
-import diff_gaussian_rasterization
-import simple_knn
-
-assert torch.cuda.is_available()
-print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("gpu", torch.cuda.get_device_name(0))
-print("pytorch3d", pytorch3d.__version__)
-print("HairGS extensions imported successfully")
-PY
+cd "${REPOSITORY_ROOT}"
+"${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" \
+  python scripts/verify_reproducibility.py
+"${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" \
+  python -m pip check
+"${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" \
+  python -m pytest -q

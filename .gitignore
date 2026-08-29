@@ -1,5 +1,7 @@
 # Generated training and evaluation artifacts
 output/
+outputs/
+data/
 checkpoints/
 *.pt
 *.pth

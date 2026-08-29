@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -34,7 +36,7 @@ def main() -> int:
     parser.add_argument(
         "--hairgs-root",
         type=Path,
-        default=Path("/home/aoki/fur_hair_baselines/hair-gs"),
+        default=REPOSITORY_ROOT / "third_party/hair-gs",
     )
     args = parser.parse_args()
 

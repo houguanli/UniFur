@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/mnt/f/unifur_hairgs_hybrid_experiment}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+source "${EXPERIMENT_ROOT}/scripts/lib/runtime.sh"
 EVAL_PROJECT="${EVAL_PROJECT:-${EXPERIMENT_ROOT}}"
-HAIRGS_ROOT="${HAIRGS_ROOT:-/home/aoki/fur_hair_baselines/hair-gs}"
-CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
+HAIRGS_ROOT="${HAIRGS_ROOT:-${EXPERIMENT_ROOT}/third_party/hair-gs}"
+CONDA_BIN="$(resolve_conda_bin)"
+CONDA_ENV="${CONDA_ENV:-unifur}"
 COMPAT_ROOT="${HAIRGS_COMPAT_ROOT:-${EXPERIMENT_ROOT}/compat/hairgs_sitecustomize}"
-PROTOCOL_ROOT="${PROTOCOL_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_protocol_r480}"
-PANDA_ROOT="${PANDA_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/neuralfur_panda_shared}"
-SOURCE_ROOT="${SOURCE_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_g10k_st_hard22k_v2}"
-RESULT_ROOT="${RESULT_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_topology_g10k_st_hard22k_refine3k_v3}"
+DATA_ROOT="${UNIFUR_DATA_ROOT:-${DATA_ROOT:-${EXPERIMENT_ROOT}/data}}"
+OUTPUT_ROOT="${UNIFUR_OUTPUT_ROOT:-${OUTPUT_ROOT:-${EXPERIMENT_ROOT}/outputs}}"
+PROTOCOL_ROOT="${PROTOCOL_ROOT:-${OUTPUT_ROOT}/protocols/panda_r480}"
+PANDA_ROOT="${PANDA_ROOT:-${DATA_ROOT}/benchmarks/neuralfur_panda_shared}"
+SOURCE_ROOT="${SOURCE_ROOT:-${OUTPUT_ROOT}/experiments/panda_topology_g10k_st_hard22k_v2}"
+RESULT_ROOT="${RESULT_ROOT:-${OUTPUT_ROOT}/experiments/panda_topology_g10k_st_hard22k_refine3k_v3}"
 SOURCE_ITERATION="${SOURCE_ITERATION:-35000}"
 STEPS="${STEPS:-3000}"
 FINAL_ITERATION=$((SOURCE_ITERATION + STEPS))
@@ -17,7 +22,7 @@ PROTOCOL_ID="panda-hairgs-28fit-8heldout-r480-v1"
 
 export PYTHONPATH="${COMPAT_ROOT}:${HAIRGS_ROOT}:${EXPERIMENT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n hair-gs python "$@"; }
+run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python "$@"; }
 
 prepare() {
   [[ -f "${RESULT_ROOT}/.prepared" ]] && return
@@ -47,7 +52,7 @@ train() {
   [[ -f "${RESULT_ROOT}/point_cloud/iteration_${FINAL_ITERATION}/hybrid_state.npz" ]] && return
   cd "${HAIRGS_ROOT}"
   /usr/bin/time -v -o "${RESULT_ROOT}/audit/refine_time.txt" \
-    "${CONDA_BIN}" run --no-capture-output -n hair-gs python \
+    "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python \
       "${EXPERIMENT_ROOT}/hairgs_hybrid/train_hybrid.py" \
       -s "${PROTOCOL_ROOT}/train_v28" -m "${RESULT_ROOT}" -r 1 --sh_degree 3 \
       --route-sidecar "${RESULT_ROOT}/point_cloud/iteration_${SOURCE_ITERATION}/routes.npz" \

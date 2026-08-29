@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/mnt/f/unifur_hairgs_hybrid_experiment}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+source "${EXPERIMENT_ROOT}/scripts/lib/runtime.sh"
 EVAL_PROJECT="${EVAL_PROJECT:-${EXPERIMENT_ROOT}}"
-HAIRGS_ROOT="${HAIRGS_ROOT:-/home/aoki/fur_hair_baselines/hair-gs}"
-CONDA_BIN="${CONDA_BIN:-/home/aoki/miniconda3/bin/conda}"
+HAIRGS_ROOT="${HAIRGS_ROOT:-${EXPERIMENT_ROOT}/third_party/hair-gs}"
+CONDA_BIN="$(resolve_conda_bin)"
+CONDA_ENV="${CONDA_ENV:-unifur}"
 COMPAT_ROOT="${HAIRGS_COMPAT_ROOT:-${EXPERIMENT_ROOT}/compat/hairgs_sitecustomize}"
-PANDA_ROOT="${PANDA_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/neuralfur_panda_shared}"
-OFFICIAL_ROOT="${OFFICIAL_ROOT:-/mnt/f/fur_hair_unified_data/neuralfur_official/extracted/data/Artemis/panda_processed_GH2/walk}"
-PROTOCOL_ROOT="${PROTOCOL_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_protocol_r480}"
-RESULT_ROOT="${RESULT_ROOT:-/mnt/f/fur_hair_unified_data/benchmarks/hairgs_hybrid/panda_hybrid_full97k_5k_v1}"
+DATA_ROOT="${UNIFUR_DATA_ROOT:-${DATA_ROOT:-${EXPERIMENT_ROOT}/data}}"
+OUTPUT_ROOT="${UNIFUR_OUTPUT_ROOT:-${OUTPUT_ROOT:-${EXPERIMENT_ROOT}/outputs}}"
+PANDA_ROOT="${PANDA_ROOT:-${DATA_ROOT}/benchmarks/neuralfur_panda_shared}"
+OFFICIAL_ROOT="${OFFICIAL_ROOT:-${DATA_ROOT}/neuralfur_official/extracted/data/Artemis/panda_processed_GH2/walk}"
+PROTOCOL_ROOT="${PROTOCOL_ROOT:-${OUTPUT_ROOT}/protocols/panda_r480}"
+RESULT_ROOT="${RESULT_ROOT:-${OUTPUT_ROOT}/experiments/panda_hybrid_full97k_5k_v1}"
 INITIAL_PLY="${INITIAL_PLY:-${PROTOCOL_ROOT}/initial/point_cloud.ply}"
 ROUTE_SIDECAR="${ROUTE_SIDECAR:-${PROTOCOL_ROOT}/initial/routes.npz}"
 EXPECTED_SEGMENTS="${EXPECTED_SEGMENTS:-96991}"
@@ -36,7 +41,7 @@ export PYTHONPATH="${COMPAT_ROOT}:${HAIRGS_ROOT}:${EXPERIMENT_ROOT}${PYTHONPATH:
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 
-run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n hair-gs python "$@"; }
+run_hairgs() { "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python "$@"; }
 
 preflight() {
   mkdir -p "${RESULT_ROOT}/audit"
@@ -104,7 +109,7 @@ train_model() {
   local monitor_pid=$!
   trap 'kill "${monitor_pid}" 2>/dev/null || true' EXIT
   /usr/bin/time -v -o "${RESULT_ROOT}/audit/train_time.txt" \
-    "${CONDA_BIN}" run --no-capture-output -n hair-gs python \
+    "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python \
       "${EXPERIMENT_ROOT}/hairgs_hybrid/train_hybrid.py" \
       -s "${PROTOCOL_ROOT}/train_v28" -m "${RESULT_ROOT}" -r 1 \
       --sh_degree 3 \
@@ -155,11 +160,11 @@ render_split() {
   mkdir -p "${output}"
   rm -rf "${RESULT_ROOT}/render/train/iteration_${FINAL_ITERATION}"
   cd "${HAIRGS_ROOT}"
-  "${CONDA_BIN}" run --no-capture-output -n hair-gs python \
+  "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python \
     "${EXPERIMENT_ROOT}/hairgs_hybrid/render_hybrid.py" \
     -s "${dataset}" -m "${RESULT_ROOT}" -r 1 --iterations "${FINAL_ITERATION}" \
     --skip_test --type 0 --quiet
-  "${CONDA_BIN}" run --no-capture-output -n hair-gs python \
+  "${CONDA_BIN}" run --no-capture-output -n "${CONDA_ENV}" python \
     "${EXPERIMENT_ROOT}/hairgs_hybrid/render_hybrid.py" \
     -s "${dataset}" -m "${RESULT_ROOT}" -r 1 --iterations "${FINAL_ITERATION}" \
     --skip_test --type 2 --quiet
