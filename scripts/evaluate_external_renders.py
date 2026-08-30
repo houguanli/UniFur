@@ -81,16 +81,28 @@ def _load_gt_frame_torch(
     bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if bgr is None:
         raise FileNotFoundError(path)
+    if np.issubdtype(bgr.dtype, np.integer):
+        value_scale = float(np.iinfo(bgr.dtype).max)
+    elif np.issubdtype(bgr.dtype, np.floating):
+        value_scale = 1.0
+    else:
+        raise TypeError(f"Unsupported ground-truth dtype: {bgr.dtype}")
     if bgr.shape[1] != width or bgr.shape[0] != height:
         bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
     if bgr.ndim == 3 and bgr.shape[2] == 4:
-        alpha = bgr[..., 3].astype(np.float32) / 255.0
-        rgb = cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        alpha = bgr[..., 3].astype(np.float32) / value_scale
+        rgb = (
+            cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2RGB).astype(np.float32)
+            / value_scale
+        )
         mask = (alpha > 0.5).astype(np.float32)
     else:
-        rgb = cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        gray = cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2GRAY)
-        mask = (gray > 5).astype(np.float32)
+        rgb = (
+            cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2RGB).astype(np.float32)
+            / value_scale
+        )
+        gray = cv2.cvtColor(bgr[..., :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        mask = (gray > (5.0 / 255.0) * value_scale).astype(np.float32)
     return {
         "rgb": torch.as_tensor(rgb, dtype=torch.float32, device=device),
         "mask": torch.as_tensor(mask, dtype=torch.float32, device=device),

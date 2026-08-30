@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+import cv2
+import numpy as np
+import pytest
 import torch
 
-from scripts.evaluate_external_renders import _connected_mask_errors, _frame_metrics
+from scripts.evaluate_external_renders import (
+    _connected_mask_errors,
+    _frame_metrics,
+    _load_gt_frame_torch,
+)
+
+
+def test_load_gt_preserves_uint16_rgba_dynamic_range(tmp_path) -> None:
+    rgba = np.zeros((2, 2, 4), dtype=np.uint16)
+    rgba[0, 0] = [16384, 32768, 49152, 65535]  # BGRA
+    path = tmp_path / "frame.png"
+    assert cv2.imwrite(str(path), rgba)
+
+    loaded = _load_gt_frame_torch(path, 2, 2, "cpu")
+
+    assert loaded["mask"][0, 0].item() == pytest.approx(1.0)
+    assert loaded["rgb"][0, 0].tolist() == pytest.approx(
+        [49152 / 65535, 32768 / 65535, 16384 / 65535], abs=1.0e-6
+    )
 
 
 def test_perfect_frame_metrics() -> None:

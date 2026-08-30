@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 import scene as scene_module
-import train as upstream_train
 from arguments import GeneralParams, ModelParams, OptimizationParams
 from gaussian_renderer import render
 from loss.losses import bidirectional_angle_difference, create_window
@@ -449,8 +448,6 @@ def main() -> None:
     # Scene resolves HairGaussianModel from its module globals at construction.
     # The subclass still passes every upstream isinstance check.
     scene_module.HairGaussianModel = HybridHairGaussianModel
-    upstream_train.loss_function = hybrid_loss
-
     route_sidecar = Path(args.route_sidecar).resolve()
     args.route_sidecar = str(route_sidecar)
     prepare_output_path(args)
@@ -490,10 +487,17 @@ def main() -> None:
     enable_accelerated_rasterization()
     model_args = model.extract(args)
     optimization_args = optimization.extract(args)
-    general_args = general.extract(args)
-    upstream_train.op = optimization_args
-    upstream_train.network_gui.init(general_args.ip, general_args.port)
-    upstream_train.training(model_args, optimization_args, general_args, args)
+    general.extract(args)
+    # The pinned upstream training entry unconditionally enters its optional
+    # strand-GT evaluation branch at the final iteration.  On image-only
+    # datasets ``scene.gt`` is absent and upstream then dereferences an
+    # undefined local ``pred`` before saving.  Reuse the same Scene, renderer,
+    # optimizer and loss through our headless orchestration loop, which omits
+    # only that optional geometry evaluation/GUI layer.
+    from hairgs_hybrid import train_native as native_training
+
+    native_training.loss_function = hybrid_loss
+    native_training.train(model_args, optimization_args, args)
 
 
 if __name__ == "__main__":

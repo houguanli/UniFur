@@ -108,6 +108,17 @@ better in masked LPIPS and fine-fiber fidelity.  Detailed metrics and claim
 limits are recorded in
 [`hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md`](hairgs_hybrid/TOPOLOGY_ROUTER_MILESTONE.md).
 
+## Animals60 dense-teacher compression milestone
+
+The multi-case extension has been audited on eight Animals60 subjects under a
+common 48-fit / 12-held-out, 512x512 protocol. At 75% compression, UniFur
+averages 112,930 deployed segments, 29.86 MiB and 251.59 FPS, while reducing
+false-positive area on every case relative to equal-budget HairGS. Its
+foreground PSNR is still 2.350 dB lower than equal-budget HairGS; the higher
+full-image PSNR comes from reduced background leakage rather than better
+foreground appearance. Protocol, complete tables and claim boundaries are in
+[`hairgs_hybrid/ANIMALS60_DENSE_TEACHER_MILESTONE.md`](hairgs_hybrid/ANIMALS60_DENSE_TEACHER_MILESTONE.md).
+
 ## Repository layout
 
 ```text
