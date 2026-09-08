@@ -1,5 +1,31 @@
 # UniFur
 
+## Current experimental pipeline: teacher-free Shell / Strand
+
+The current animal-reconstruction prototype is
+[teacher_free_shell_strand_v1](hairgs_hybrid/teacher_free_shell_strand_v1/README.md).
+It initializes its own learnable support from training RGB, cameras and alpha,
+fits Shell at 512, then opens evidence-driven Strand birth at 1024 and refinement
+at 2048. It does **not** consume a trained HairGS model, teacher loss, MVS point
+bank, Fin branch or residual branch. HairGS supplies the native rasterizer and
+Gaussian-optimization principles, not reconstructed training targets.
+
+See the [method contract](hairgs_hybrid/TEACHER_FREE_LOD_CONTRACT.md) and the
+module's frozen run configuration. The A050 tail-v3 8,000-step run and both
+HairGS controls are complete. **This update does not demonstrate an overall
+improvement over equal-budget GS (the HairGS compressed-finetune control).**
+At 64,717 rendered primitives, ours has slightly higher test foreground PSNR
+and lower missing-foreground area, but worse full PSNR, masked SSIM/LPIPS,
+overflow and measured FPS. See the [verified result and limitations](reports/a050_tail_v3_20260909.md).
+
+This is a matched deployed-count comparison, not an identical-training-budget
+ablation: ours trains at 512 -> 1024 -> 2048 with SH degree 2; HairGS trains at
+native 2048 with SH degree 3, and its compact control starts from the unrestricted
+616,005-GS model, then compresses and fine-tunes for 8,000 steps. These results
+must not be mixed with the historical benchmark below.
+
+## Historical compression milestone (not the current initialization)
+
 UniFur learns a compact, spatially adaptive Shell/Fin/Strand Gaussian topology
 on top of a calibrated multi-view HairGS scaffold.  The maintained milestone is
 the Panda 28-fit / 8-held-out experiment at 480x270 with a final budget of

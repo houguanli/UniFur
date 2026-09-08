@@ -95,16 +95,72 @@ def load_scaffold(path: Path) -> dict[str, np.ndarray | tuple[str, ...]]:
         "fields": fields,
         "field_names": field_names,
         "roots": segment_roots,
+        "endpoints": xyz,
+        "endpoint_pairs": pairs,
+        "root_endpoint_indices": np.asarray(
+            ply["strand_root_idx"].data["strand_root_idx"], dtype=np.int64
+        ),
+        "ref_roots": root_xyz,
     }
 
 
 def subset(
     source: dict[str, np.ndarray | tuple[str, ...]], indices: np.ndarray
 ) -> dict[str, np.ndarray | tuple[str, ...]]:
-    return {
-        key: np.asarray(value)[indices] if key != "field_names" else value
-        for key, value in source.items()
+    indices = np.asarray(indices, dtype=np.int64)
+    output = {
+        key: np.asarray(source[key])[indices]
+        for key in ("centers", "direction", "half_length", "width", "fields", "roots")
     }
+    output["field_names"] = source["field_names"]
+    if "endpoint_pairs" not in source or "endpoints" not in source:
+        return output
+
+    selected_pairs = np.asarray(source["endpoint_pairs"], dtype=np.int64)[indices]
+    used = np.unique(selected_pairs)
+    mapping = np.full(int(used.max()) + 1, -1, dtype=np.int64)
+    mapping[used] = np.arange(len(used), dtype=np.int64)
+    pairs = mapping[selected_pairs]
+    endpoints = np.asarray(source["endpoints"], dtype=np.float64)[used]
+
+    # Reconstruct one audited root per surviving connected component.  This
+    # preserves shared endpoints through hard projection while removing roots
+    # owned only by pruned candidate routes.
+    parent = np.arange(len(endpoints), dtype=np.int64)
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = int(parent[value])
+        return value
+
+    for first, second in pairs:
+        left, right = find(int(first)), find(int(second))
+        if left != right:
+            parent[right] = left
+    component = np.asarray([find(int(pair[0])) for pair in pairs], dtype=np.int64)
+    degree = np.bincount(pairs.reshape(-1), minlength=len(endpoints))
+    root_indices: list[int] = []
+    ref_roots: list[np.ndarray] = []
+    for component_id in np.unique(component):
+        segment_ids = np.flatnonzero(component == component_id)
+        endpoint_ids = np.unique(pairs[segment_ids])
+        candidates = endpoint_ids[degree[endpoint_ids] == 1]
+        if len(candidates) == 0:
+            candidates = endpoint_ids
+        reference = np.asarray(output["roots"])[segment_ids].mean(axis=0)
+        distance = np.linalg.norm(endpoints[candidates] - reference[None], axis=1)
+        root_indices.append(int(candidates[int(np.argmin(distance))]))
+        ref_roots.append(reference)
+    output.update(
+        {
+            "endpoints": endpoints,
+            "endpoint_pairs": pairs,
+            "root_endpoint_indices": np.asarray(root_indices, dtype=np.int64),
+            "ref_roots": np.asarray(ref_roots, dtype=np.float64),
+        }
+    )
+    return output
 
 
 def write_scaffold(path: Path, data: dict) -> None:
@@ -115,27 +171,40 @@ def write_scaffold(path: Path, data: dict) -> None:
     roots = np.asarray(data["roots"], dtype=np.float32)
     names = tuple(data["field_names"])
     count = len(centers)
-    endpoints = np.concatenate(
-        [centers + direction * half[:, None], centers - direction * half[:, None]],
-        axis=0,
-    )
+    if "endpoints" in data and "endpoint_pairs" in data:
+        endpoints = np.asarray(data["endpoints"], dtype=np.float32)
+        endpoint_pairs = np.asarray(data["endpoint_pairs"], dtype=np.int32)
+        if endpoint_pairs.shape != (count, 2):
+            raise ValueError("Explicit endpoint topology does not match segments")
+    else:
+        endpoints = np.concatenate(
+            [centers + direction * half[:, None], centers - direction * half[:, None]],
+            axis=0,
+        )
+        endpoint_pairs = np.column_stack(
+            [np.arange(count), np.arange(count, 2 * count)]
+        ).astype(np.int32)
     vertex = np.empty(
-        2 * count,
+        len(endpoints),
         dtype=[(name, "f4") for name in ("x", "y", "z", "nx", "ny", "nz")],
     )
     vertex[:] = list(
         map(tuple, np.concatenate([endpoints, np.zeros_like(endpoints)], axis=1))
     )
     edge = np.empty(count, dtype=[("vertex1", "i4"), ("vertex2", "i4")])
-    edge[:] = list(
-        map(tuple, np.column_stack([np.arange(count), np.arange(count, 2 * count)]))
-    )
+    edge[:] = list(map(tuple, endpoint_pairs))
     segment = np.empty(count, dtype=[(name, "f4") for name in names])
     segment[:] = list(map(tuple, fields))
-    root_index = np.empty(count, dtype=[("strand_root_idx", "i4")])
-    root_index["strand_root_idx"] = np.arange(count, dtype=np.int32)
-    root = np.empty(count, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
-    root[:] = list(map(tuple, roots))
+    root_endpoint_indices = np.asarray(
+        data.get("root_endpoint_indices", endpoint_pairs[:, 0]), dtype=np.int32
+    )
+    ref_roots = np.asarray(data.get("ref_roots", roots), dtype=np.float32)
+    root_index = np.empty(
+        len(root_endpoint_indices), dtype=[("strand_root_idx", "i4")]
+    )
+    root_index["strand_root_idx"] = root_endpoint_indices
+    root = np.empty(len(ref_roots), dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
+    root[:] = list(map(tuple, ref_roots))
     path.parent.mkdir(parents=True, exist_ok=True)
     PlyData(
         [
