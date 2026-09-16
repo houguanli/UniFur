@@ -218,6 +218,15 @@ def test_vertical_curriculum_optimizer_execution_and_checkpoint_honesty():
     assert records[-1]['shell_lr']>0 and trainer.checkpoint()['strict_resume_supported'] is False
 
 
+def test_persistent_shell_schedule():
+    cfg=Schedule(stage1024=2,stage2048=4,total_steps=6,persistent_shell=True)
+    assert cfg.at(0)['shell_lr']==cfg.at(3)['shell_lr']==cfg.at(5)['shell_lr']==1.
+    model=small_model();trainer=Trainer(model,views(),cfg,cpu_renderer)
+    trainer.step();trainer.step();model.birth([0],[[1,.1,.5]],1)
+    trainer.evidence=Evidence(model,[v.view_id for v in trainer.views]);trainer.step()
+    assert model.shell_dc.grad is not None and model.shell_dc.grad.count_nonzero()>0
+
+
 def test_evidence_birth_checks_entire_curve_in_distinct_masks():
     model=small_model();trainer=Trainer(model,views(),renderer=cpu_renderer)
     trainer.evidence.votes[:]=True;trainer.evidence.scatter[:,0,0]=6;trainer.evidence.scores[:]=1

@@ -30,6 +30,7 @@ class Schedule:
     max_segment_splits: int=32
     max_shell_splits: int=16
     topology_interval: int=48
+    persistent_shell: bool=False
 
     def at(self,step):
         require(0<=step<self.total_steps and 0<self.stage1024<self.stage2048<self.total_steps,'invalid curriculum')
@@ -38,7 +39,8 @@ class Schedule:
         progress=(step-self.stage1024)/(self.total_steps-self.stage1024)
         return dict(stage=stage,side=1024 if stage==1 else 2048,
                     gate=.05+.95*min(1.,(step-self.stage1024+1)/self.strand_ramp),
-                    shell_lr=float(math.exp(math.log(.05)*progress)))
+                    shell_lr=1. if self.persistent_shell else
+                    float(math.exp(math.log(.05)*progress)))
 
 
 def lowpass(image,kernel):
@@ -206,8 +208,9 @@ class Trainer:
         log=dict(lowpass=low,mask_shell_fn=fn,mask_shell_fp=fp)
         image,alpha,camera,target=shell_image,shell_alpha,camera_low,torch.cat((target_low,alpha_low))
         if setting['stage']>0 and len(model.strand_control):
-            # Forward is full RGB; ALL Shell paths (including attached roots) detach for detail.
-            batch=model.primitives(setting['stage'],setting['gate'],detach_shell=True)
+            # Persistent mode keeps Shell in the joint full-resolution objective after Strand birth.
+            batch=model.primitives(setting['stage'],setting['gate'],
+                                   detach_shell=not config.persistent_shell)
             target_rgb,target_alpha,_=view.at(full_side)
             target_rgb=target_rgb.to(device);target_alpha=target_alpha.to(device)
             camera=camera_for(view,full_side,model)

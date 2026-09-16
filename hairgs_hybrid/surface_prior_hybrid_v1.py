@@ -71,7 +71,9 @@ def load_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def sample_attachment(vertices: np.ndarray, faces: np.ndarray, views: list[TrainView],
-                      count: int, seed: int = 0) -> dict:
+                      count: int, seed: int = 0, mask_threshold: float = .05,
+                      min_support: int = 44, front_facing_only: bool = False,
+                      min_visible_views: int = 1, support_ratio: float | None = None) -> dict:
     """Uniform area samples retained by >=44/48 train hair masks."""
     tri = vertices[faces]
     cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -93,16 +95,25 @@ def sample_attachment(vertices: np.ndarray, faces: np.ndarray, views: list[Train
     normals = cross[chosen] / double_area[chosen, None]
 
     support = np.zeros(candidate_count, np.uint8)
+    visible_count = np.zeros(candidate_count, np.uint8)
     masks = []
     for view in views:
         _, alpha, k = view.at(512)
-        mask = alpha[0].numpy() > .05
+        mask = alpha[0].numpy() > mask_threshold
         pixel, depth = project_numpy(points, view, k)
         inside = np.isfinite(pixel).all(1) & (depth > 0) & (pixel >= 0).all(1) & (pixel < 512).all(1)
+        if front_facing_only:
+            camera_center = -view.rotation.T @ view.translation
+            to_camera = F.normalize(torch.from_numpy(camera_center - points), dim=1).numpy()
+            inside &= (normals * to_camera).sum(1) > .05
         xy = np.floor(np.clip(np.nan_to_num(pixel), 0, 511)).astype(np.int64)
         support += inside & mask[xy[:, 1], xy[:, 0]]
+        visible_count += inside
         masks.append((view, alpha[0].numpy(), k))
-    eligible = np.flatnonzero(support >= 44)
+    eligible = np.flatnonzero(
+        (visible_count >= min_visible_views) &
+        ((support >= min_support) if support_ratio is None else
+         (support >= np.ceil(visible_count * support_ratio))))
     require(len(eligible) >= count, f"surface/hair-mask intersection has only {len(eligible)} samples")
     selected = rng.choice(eligible, count, replace=False)
     points, normals, support = points[selected], normals[selected], support[selected]
@@ -134,7 +145,11 @@ def sample_attachment(vertices: np.ndarray, faces: np.ndarray, views: list[Train
             "surface_area": float(double_area.sum() * .5),
             "mesh_winding_global_flip": globally_flipped,
             "preflip_centroid_outward_fraction": outward_fraction,
-            "eligible_candidates": int(len(eligible)), "candidate_count": candidate_count}
+            "eligible_candidates": int(len(eligible)), "candidate_count": candidate_count,
+            "mask_threshold": float(mask_threshold), "min_support_views": int(min_support),
+            "front_facing_only": bool(front_facing_only),
+            "min_visible_views": int(min_visible_views),
+            "support_ratio": None if support_ratio is None else float(support_ratio)}
 
 
 class SurfacePriorHybrid(ShellStrand):
@@ -155,6 +170,33 @@ class SurfacePriorHybrid(ShellStrand):
             if group["name"] in ("shell_root", "shell_rotation"):
                 group["base_lr"] = group["lr"] = 0.
         return optimizer
+
+    def curve_geometry(self):
+        """Project every Strand segment into its root's outward normal half-space."""
+        if not len(self.strand_control):
+            return self.strand_control, self.strand_control
+        first = torch.cat((self.curve_counts.new_zeros(1), self.curve_counts.cumsum(0)[:-1]))
+        previous = torch.roll(self.strand_control, 1, 0)
+        previous = torch.index_fill(previous, 0, first, 0.)
+        delta = self.strand_control - previous
+        root_ids = torch.repeat_interleave(self.curve_roots, self.curve_counts)
+        rotation = quaternion_to_matrix(F.normalize(self.shell_rotation, dim=1))
+        normal = rotation[root_ids, :, 2]
+        normal_step = torch.sum(delta * normal, dim=1, keepdim=True)
+        minimum_step = self.spacing * 1e-4
+        delta = delta + (minimum_step - normal_step).clamp_min(0.) * normal
+
+        curve_id = torch.repeat_interleave(torch.arange(len(self.curve_counts), device=delta.device),
+                                           self.curve_counts)
+        local_id = torch.arange(len(delta), device=delta.device) - torch.repeat_interleave(first, self.curve_counts)
+        padded = delta.new_zeros((len(self.curve_counts), int(self.curve_counts.max()), 3))
+        padded[curve_id, local_id] = delta
+        control = padded.cumsum(1)[curve_id, local_id]
+        roots = self.shell_root[root_ids]
+        end = roots + control
+        start = roots + torch.roll(control, 1, 0)
+        start = torch.index_copy(start, 0, first, roots[first])
+        return start, end
 
 
 def initialize(surface: Path, scale: float, translation: np.ndarray,
@@ -183,6 +225,11 @@ def initialize(surface: Path, scale: float, translation: np.ndarray,
               "support_views_median": float(np.median(samples["support"])),
               "candidate_count": samples["candidate_count"],
               "eligible_candidates": samples["eligible_candidates"],
+              "mask_threshold": samples["mask_threshold"],
+              "min_support_views": samples["min_support_views"],
+              "front_facing_only": samples["front_facing_only"],
+              "min_visible_views": samples["min_visible_views"],
+              "support_ratio": samples["support_ratio"],
               "surface_area": samples["surface_area"], "source": source,
               "mesh_winding_global_flip": samples["mesh_winding_global_flip"],
               "preflip_centroid_outward_fraction": samples["preflip_centroid_outward_fraction"],
@@ -299,6 +346,10 @@ def audit(args: argparse.Namespace) -> None:
     centers = batch.get_xyz.numpy().astype(np.float64)
     shell_count = len(model.shell_root) * model.layers
     route = np.arange(len(centers)) >= shell_count
+    starts, ends = model.curve_geometry()
+    root_ids = torch.repeat_interleave(model.curve_roots, model.curve_counts)
+    rotation = quaternion_to_matrix(F.normalize(model.shell_rotation, dim=1))
+    normal_delta = torch.sum((ends - starts) * rotation[root_ids, :, 2], dim=1).numpy()
     mesh = trimesh.load(args.surface.resolve(), process=False)
     vertices, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
     archive = np.load(args.strands.resolve(), mmap_mode="r")
@@ -321,6 +372,11 @@ def audit(args: argparse.Namespace) -> None:
               "checkpoint": str(args.checkpoint.resolve()), "checkpoint_sha256": sha(args.checkpoint),
               "initial_attachment_roots": score(initial), "trained_attachment_roots": score(model.shell_root.numpy()),
               "shell_centers": score(centers[~route]), "strand_centers": score(centers[route]),
+              "strand_outward_constraint": {
+                  "criterion": "dot(segment_delta, fixed_root_outward_normal) >= 0",
+                  "minimum": float(normal_delta.min()) if len(normal_delta) else None,
+                  "negative_fraction_below_minus_1e_7": float((normal_delta < -1e-7).mean()) if len(normal_delta) else 0.,
+                  "zero_or_tangent_fraction_at_1e_7": float((normal_delta <= 1e-7).mean()) if len(normal_delta) else 0.},
               "counts": {"shell": int((~route).sum()), "strand": int(route.sum())}}
     write_json(args.output.resolve(), result)
     print(json.dumps(result, indent=2, allow_nan=False))
@@ -329,7 +385,7 @@ def audit(args: argparse.Namespace) -> None:
 def self_check() -> None:
     roots = np.array([[0., 0., 0.]], np.float32)
     model = SurfacePriorHybrid(roots, np.array([[0., 0., 1.]], np.float32),
-                               np.full((1, 3), .5, np.float32), 1., layers=3, cap=3)
+                               np.full((1, 3), .5, np.float32), 1., layers=3, cap=6)
     xyz, _, _ = model.shell_geometry()
     require(torch.allclose(xyz[0, 0], model.shell_root[0]) and
             bool((xyz[0, 1:, 2] > xyz[0, :-1, 2]).all()), "Shell does not grow outward")
@@ -337,7 +393,17 @@ def self_check() -> None:
     require(next(g for g in model.optimizer.param_groups if g["name"] == "shell_root")["lr"] == 0 and
             next(g for g in model.optimizer.param_groups if g["name"] == "shell_rotation")["lr"] == 0,
             "attachment frame is not frozen")
-    print(json.dumps({"status": "self_check_pass", "z": xyz[0, :, 2].tolist()}))
+    model.birth(torch.tensor([0]), torch.tensor([[1., 0., 1.]]), stage=1, segments=3)
+    with torch.no_grad():
+        model.strand_control.copy_(torch.tensor([[.1, 0., .2], [.2, 0., .1], [.3, 0., .3]]))
+    start, end = model.curve_geometry()
+    normal = torch.tensor([0., 0., 1.])
+    require(bool((((end - start) * normal).sum(1) >= -1e-7).all()),
+            "Strand has an inward segment")
+    require(torch.allclose(end[:, 0], torch.tensor([.1, .2, .3])),
+            "outward projection changed tangential bending")
+    print(json.dumps({"status": "self_check_pass", "shell_z": xyz[0, :, 2].tolist(),
+                      "strand_segment_normal_delta": ((end - start) * normal).sum(1).tolist()}))
 
 
 def main() -> None:
