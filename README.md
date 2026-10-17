@@ -1,5 +1,17 @@
 # UniFur
 
+## Latest static milestone: known-surface 3DGS → Shell / Strand
+
+Both [A025 oracle-surface routes](experiments/a025_oracle_surface_routes_20261017/docs/README.md)
+are archived: free 3DGS followed by routing, and routed primitives from birth.
+**These are static reconstruction experiments, NOT physically simulatable assets.**
+Surface initialization, route labels and connected endpoints do not provide moving
+surface anchors, collisions or a validated physical solver. The newly approved
+surface-binding work is separate and is not included in this milestone.
+The study uses an explicitly authorized known naked-body prior, not an
+image-estimated prior; it must not be compared with older A025 datasets as if the
+protocol were unchanged. The historical sections below describe earlier versions.
+
 ## Current experimental pipeline: teacher-free Shell / Strand
 
 The current animal-reconstruction prototype is

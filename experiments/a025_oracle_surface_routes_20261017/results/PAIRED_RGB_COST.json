@@ -1,0 +1,140 @@
+{
+  "scope": "all three frozen models on same GPU, train0001 native 2K; no parameter changes",
+  "model_sha256": {
+    "free_reference": "867de3cfad6b17a70417268c89aa84538b1ba9c473c0b4e358cf8a5aa16c8931",
+    "postroute": "bf04de7d72c24e179d2fe5dd45ee573c3dae4ad631fb66bfd3ecf591062af242",
+    "born_routed": "876f5da3770e0ba6f9f99c1fb144ba4578d89edcdd619a11ff3749336e25af5b"
+  },
+  "rounds": [
+    {
+      "free_reference": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.004815628449432552,
+        "FPS": 207.6572166022972,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 228525,
+        "visible_GS": 228525,
+        "radius_px_q50_q90_q99": [
+          11.0,
+          37.0,
+          84.0
+        ],
+        "radius_squared_sum": 129781072.0,
+        "actual_scale_sorted_q50": [
+          8.34669845062308e-06,
+          0.000770914601162076,
+          0.006456146016716957
+        ]
+      },
+      "postroute": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.004690799000672996,
+        "FPS": 213.18329774022047,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 215495,
+        "visible_GS": 215495,
+        "radius_px_q50_q90_q99": [
+          12.0,
+          38.0,
+          85.0
+        ],
+        "radius_squared_sum": 129884608.0,
+        "actual_scale_sorted_q50": [
+          8.834209438646212e-06,
+          0.0007147304131649435,
+          0.006924898363649845
+        ]
+      },
+      "born_routed": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.0025911664473824204,
+        "FPS": 385.92657797425306,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 122767,
+        "visible_GS": 122767,
+        "radius_px_q50_q90_q99": [
+          6.0,
+          16.0,
+          58.0
+        ],
+        "radius_squared_sum": 23980794.0,
+        "actual_scale_sorted_q50": [
+          0.0004303910245653242,
+          0.0016564105171710253,
+          0.00232949061319232
+        ]
+      }
+    },
+    {
+      "born_routed": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.0025174397975206374,
+        "FPS": 397.2289629268889,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 122767,
+        "visible_GS": 122767,
+        "radius_px_q50_q90_q99": [
+          6.0,
+          16.0,
+          58.0
+        ],
+        "radius_squared_sum": 23980794.0,
+        "actual_scale_sorted_q50": [
+          0.0004303910245653242,
+          0.0016564105171710253,
+          0.00232949061319232
+        ]
+      },
+      "postroute": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.004257229290669784,
+        "FPS": 234.89455975312794,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 215495,
+        "visible_GS": 215495,
+        "radius_px_q50_q90_q99": [
+          12.0,
+          38.0,
+          85.0
+        ],
+        "radius_squared_sum": 129884608.0,
+        "actual_scale_sorted_q50": [
+          8.834209438646212e-06,
+          0.0007147304131649435,
+          0.006924898363649845
+        ]
+      },
+      "free_reference": {
+        "warmups": 3,
+        "synchronized_passes": 20,
+        "RGB_only": true,
+        "seconds_mean": 0.004229579557431862,
+        "FPS": 236.43011945309885,
+        "CUDA_selection": "GPU-627324a1-9ff7-9e8a-5b4d-873699c3f808",
+        "GS": 228525,
+        "visible_GS": 228525,
+        "radius_px_q50_q90_q99": [
+          11.0,
+          37.0,
+          84.0
+        ],
+        "radius_squared_sum": 129781072.0,
+        "actual_scale_sorted_q50": [
+          8.34669845062308e-06,
+          0.000770914601162076,
+          0.006456146016716957
+        ]
+      }
+    }
+  ]
+}
