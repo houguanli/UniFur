@@ -1,18 +1,20 @@
 # UniFur
 
-## Latest static milestone: known-surface 3DGS → Shell / Strand
+## Latest reconstruction milestone: known-surface 3DGS → Shell / Strand
 
 Both [A025 oracle-surface routes](experiments/a025_oracle_surface_routes_20261017/docs/README.md)
 are archived: free 3DGS followed by routing, and routed primitives from birth.
-**These are static reconstruction experiments, NOT physically simulatable assets.**
-Surface initialization, route labels and connected endpoints do not provide moving
-surface anchors, collisions or a validated physical solver. The newly approved
-surface-binding work is separate and is not included in this milestone.
+**These are successful static reconstructions, NOT complete physically simulatable fur.**
+The validated [surface-binding and continuous-follow decoder](reports/A025_CURRENT_RECONSTRUCTION_20261019.md)
+is now included, together with CPU checks and standard full-parameter 3DGS PLY
+export. Root attachment and existing shared endpoints are verified; route 2 still
+contains independent rods. No collision-free groom or full flexible-fiber solver
+is claimed. Neither original reconstruction nor its static evaluation changed.
 The study uses an explicitly authorized known naked-body prior, not an
 image-estimated prior; it must not be compared with older A025 datasets as if the
 protocol were unchanged. The historical sections below describe earlier versions.
 
-## Current experimental pipeline: teacher-free Shell / Strand
+## Earlier experimental pipeline: teacher-free Shell / Strand
 
 The current animal-reconstruction prototype is
 [teacher_free_shell_strand_v1](hairgs_hybrid/teacher_free_shell_strand_v1/README.md).
