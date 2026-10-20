@@ -1,0 +1,22 @@
+{
+  "input": "outputs/a025_rooted_strands_20261020_review002/born_routed/complete_asset.npz",
+  "input_sha256": "a01e93e463361e49de1e6f97236a9988ee9d489a4826b5b017eb51f2ed6f5317",
+  "view_id": "0001",
+  "fps": 24,
+  "frames": 96,
+  "substeps": 4,
+  "angular_damping": 9.0,
+  "root_stiffness": 240.0,
+  "tip_stiffness": 60.0,
+  "neighbor_stiffness": 90.0,
+  "wind_torque": 16.0,
+  "wind_duration": 0.9,
+  "root_outward_constraint": true,
+  "wind_direction": "fixed camera-right world axis; one positive half-sine pulse",
+  "body": "bitwise fixed",
+  "Shell": "high-stiffness static coverage, including all body/context GS",
+  "Strand": "actual saved shared-node render graph, per-edge elastic rotation",
+  "material": "bbox-normalized, unit rotational inertia, uncalibrated small-angle model",
+  "SH": "unchanged learned world-basis coefficients",
+  "collision": "first-edge root halfspace only; no full body or hair-hair collisions"
+}

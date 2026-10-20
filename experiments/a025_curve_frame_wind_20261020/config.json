@@ -1,0 +1,28 @@
+{
+  "input": "outputs/a025_rooted_strands_20261020_review002/born_routed/complete_asset.npz",
+  "input_sha256": "a01e93e463361e49de1e6f97236a9988ee9d489a4826b5b017eb51f2ed6f5317",
+  "previous": "outputs/a025_all_fur_wind_20261020/shell_follow_v1",
+  "output": "outputs/a025_curve_frame_wind_20261020/geometry_v2",
+  "view_id": "0001",
+  "fps": 24,
+  "frames": 96,
+  "substeps": 4,
+  "angular_damping": 9.0,
+  "root_stiffness": 240.0,
+  "tip_stiffness": 60.0,
+  "neighbor_stiffness": 90.0,
+  "wind_torque": 16.0,
+  "wind_duration": 0.9,
+  "root_outward_constraint": true,
+  "Shell_curve_neighbors": 3,
+  "Shell_arc_scale_limit": 3.0,
+  "long_curve_min_bbox": 0.035,
+  "long_region": "Shell column root-relative2sigma extent AND nearby actual curve length >=0.035D; no hard anatomical label or pixel ROI gate",
+  "parts": "experiments/a025_body_prior_compare_20261017/inputs/parts/prior_regions.npz",
+  "crops": {
+    "dark_mane": [750, 970, 1190, 1350],
+    "fringe": [786, 1217, 1112, 1297]
+  },
+  "steady_envelope": "same original half-sine rising edge until0.45s, then hold1; unchanged force amplitude/direction/material",
+  "scope": "Same saved reconstruction. Long-mane Shell closest arc material coordinates plus curve-local rotation; short Shell unchanged tangent sliding. Fixed body and all material roots; no training, no new rendering GS."
+}

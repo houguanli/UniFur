@@ -1,0 +1,20 @@
+{
+  "input": "outputs/a025_rooted_strands_20261020_review002/born_routed/complete_asset.npz",
+  "input_sha256": "a01e93e463361e49de1e6f97236a9988ee9d489a4826b5b017eb51f2ed6f5317",
+  "output": "outputs/a025_all_fur_wind_20261020/shell_follow_v1",
+  "view_id": "0001",
+  "fps": 24,
+  "frames": 96,
+  "substeps": 4,
+  "angular_damping": 9.0,
+  "root_stiffness": 240.0,
+  "tip_stiffness": 60.0,
+  "neighbor_stiffness": 90.0,
+  "wind_torque": 16.0,
+  "wind_duration": 0.9,
+  "root_outward_constraint": true,
+  "Shell_curve_neighbors": 3,
+  "Shell_arc_scale_limit": 3.0,
+  "crops": {"dark_mane": [750, 970, 1190, 1350], "legs": [750, 1200, 1250, 1720]},
+  "scope": "Unchanged actual Strand wind; exterior Shell follows the same real curves, tangential layer sliding. Body/context and roots fixed. No retraining or GS changes."
+}

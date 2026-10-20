@@ -1,0 +1,23 @@
+{
+  "input": "outputs/a025_rooted_strands_20261020_review002/born_routed/complete_asset.npz",
+  "input_sha256": "a01e93e463361e49de1e6f97236a9988ee9d489a4826b5b017eb51f2ed6f5317",
+  "previous": "outputs/a025_all_fur_wind_20261020/shell_follow_v1",
+  "output": "outputs/a025_mane_material_carriers_20261021/run001",
+  "audit": "outputs/a025_mane_binding_audit_20261021/audit001",
+  "prepared": "outputs/a025_mane_material_carriers_20261021/prepared002",
+  "view_id": "0001",
+  "allow_shared_gpu": true,
+  "fps": 24, "frames": 96, "substeps": 4,
+  "angular_damping": 9.0,
+  "root_stiffness": 240.0, "tip_stiffness": 60.0, "neighbor_stiffness": 90.0,
+  "wind_torque": 16.0, "wind_duration": 0.9,
+  "root_outward_constraint": true,
+  "Shell_curve_neighbors": 3, "Shell_arc_scale_limit": 3.0,
+  "long_curve_min_bbox": 0.035,
+  "guide_bin_bbox": 0.005, "guide_edge_bbox": 0.0035,
+  "guide_initial_clearance_bbox": 0.0002,
+  "guide_fit_margin_bbox": 0.005,
+  "parts": "experiments/a025_body_prior_compare_20261017/inputs/parts/prior_regions.npz",
+  "crops": {"dark_mane": [750,970,1190,1350], "fringe": [786,1217,1112,1297]},
+  "scope": "Frozen Shell clusters determine rooted continuous PHYSICAL carrier geometry. No render GS or Strand-node edits. Same gust/steady solver/material/force. GT evaluation never enters preparation. Not a contact-safe release."
+}

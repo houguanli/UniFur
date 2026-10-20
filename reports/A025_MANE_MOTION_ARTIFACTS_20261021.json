@@ -1,0 +1,14 @@
+{
+  "input_asset_sha256": "a01e93e463361e49de1e6f97236a9988ee9d489a4826b5b017eb51f2ed6f5317",
+  "render_GS": 241548,
+  "local_root": "F:/UniFur/experiments/a025_mane_material_carriers_20261021",
+  "remote_root": "/root/Public/h84435299/UniFur/outputs/a025_mane_material_carriers_20261021",
+  "preserve_immutable": true,
+  "videos": {
+    "run001/steady/dark_mane_transparent.webm": "7efad9eba8f0d7b46a6134df0468f66a6c687c7146211ac3f78985b380e6a148",
+    "run001/steady/fringe_transparent.webm": "1b6efa36c962a8354e991a4f0ed5e73d3b381c56049873c388304ea2569973de",
+    "run001/steady/before_after_fringe_transparent.webm": "48ace96179eea1726aa5b32ef2d3953ce855794e45eaca66a602c91ddbd01181",
+    "run001/gust/before_after_fringe_transparent.webm": "e77b27036a0ec3322d883b71229b85b5fb28533fc17a2abfafc66fe8ba46b12f"
+  },
+  "not_claimed": ["collision-free physics", "calibrated material parameters", "all Shell supported by corrected carriers", "a new radial route-prior experiment"]
+}

@@ -1,6 +1,39 @@
 # UniFur
 
-## Latest reconstruction milestone: known-surface 3DGS → Shell / Strand
+## Latest milestone: rooted multi-segment Strand and geometry-matched Shell motion
+
+The validated current-result refinement and fixed-body wind prototype are now
+archived under `experiments/a025_rooted_strands_20261020_review002` and
+`experiments/a025_mane_material_carriers_20261021`. Long Shell clusters use
+geometry-supported material carriers; short fur keeps layered sliding. The
+existing rendered Strand graph, pinned roots, full anisotropic covariance, SH
+and native true-alpha renderer are retained. Physical proxy curves are **not**
+additional rendering GS or a claim of recovered individual hairs.
+
+The [measured audit](reports/A025_MANE_MOTION_20261021.txt) includes unchanged
+static rendering, paired carrier correspondence, original-gust/sustained-wind
+motion, collisions and timings. In the selected dark-mane crop, mean projected
+Shell motion increases from 5.02 to 8.23 native pixels at the same gust time and
+force. Rendering remains 241,548 GS. Whole-body sampled penetration and
+cross-cluster differential-motion tails slightly worsen: **this is a useful
+reconstruction/motion prototype, not collision-free, calibrated fur physics.**
+The prior sustained-wind videos and complete assets remain immutable external
+artifacts; their hashes and paths are in the report. Licensed data, checkpoints,
+videos and generated NPZ files are deliberately not committed. The new radial
+Shell/Strand prior experiment is not included in this frozen milestone.
+
+CPU checks, without training or a GPU:
+
+```sh
+python -B experiments/a025_rooted_strands_20261020_review002/topology.py
+python -B experiments/a025_fixed_mesh_wind_20261020/wind.py
+python -B experiments/a025_mane_material_carriers_20261021/run.py --selftest
+```
+
+Replaying native videos requires the external asset/prepared files referenced
+and hash-checked by the frozen configuration and the existing native 3DGS build.
+
+## Earlier reconstruction milestone: known-surface 3DGS → Shell / Strand
 
 Both [A025 oracle-surface routes](experiments/a025_oracle_surface_routes_20261017/docs/README.md)
 are archived: free 3DGS followed by routing, and routed primitives from birth.
