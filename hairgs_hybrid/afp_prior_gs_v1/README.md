@@ -4,7 +4,7 @@ A025 final_prior combines frozen AnimalFurPrior guidance with native 3DGS. It fi
 
 The A025 entry points retain their original signed dataset and run paths. Round18 uses the 33-case case_108 selection in round18_cases.json. The separate A025 strict-SMAL source run is outside that selection. Each Round18 case fits views 000–029 and renders the six held-out views 030–035 after training. Case body and camera arrays are validated against the signed receipt. AFP sees only training images and the known naked body. The adapter scales body vertices, cameras and predicted curves together to the A025 reference body diagonal of 2.323113865546574 model units so the reference grid spacing and loss tolerances apply across cases.
 
-Use the existing A800 installation. UNIFUR_ROOT and AFP_ROOT can point to its UniFur and AnimalFurPrior directories if the checkout is elsewhere. The AFP phase uses the HairGS Python environment for DINOv3, AFP and Open3D. The fit and render phases use the official 3DGS environment. The selected prior is AnimalFurPrior/output/original_adaptive_dense_20261103_v2/training/best.pt and its sibling calibration.json. Both are pinned by SHA-256.
+Use the existing A800 installation. UNIFUR_ROOT and AFP_ROOT can point to its UniFur and AnimalFurPrior directories if the checkout is elsewhere. The AFP phase uses the DINOv3 Python environment (Torch 2.7.1) for AFP and Open3D. The fit and render phases use the official 3DGS environment. The selected prior is AnimalFurPrior/output/original_adaptive_dense_20261103_v2/training/best.pt and its sibling calibration.json. Both are pinned by SHA-256.
 
 ```bash
 cd <source-checkout>

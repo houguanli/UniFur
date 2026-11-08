@@ -16,7 +16,7 @@ from .round18 import DATASET, TEST_IDS, load_case
 
 CODE = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / 'compare_methods/3DGS/a025_20261015'
-PRIOR_PYTHON = ROOT / 'compare_methods/HairGS/env/py310/bin/python'
+PRIOR_PYTHON = ROOT / 'DINOv3/env/py310/bin/python'
 NATIVE_PYTHON = NATIVE / 'env/py310/bin/python'
 REGISTRY = ROOT / 'experiments/structured_fur_v2_20261016/panda_baselines/registry'
 SELECTION = Path(__file__).with_name('round18_cases.json')
