@@ -1,0 +1,69 @@
+{
+  "version": "v2",
+  "frames": 390,
+  "fps": 30,
+  "static_warmup": 60,
+  "motion_warmup": 60,
+  "camera": {
+    "width": 1200,
+    "height": 800,
+    "eye": [
+      1.763010245968905,
+      -3.0583504099481753,
+      1.442738114785489
+    ],
+    "target": [
+      0.0,
+      -0.12,
+      0.62
+    ],
+    "fov_y_degrees": 35.0,
+    "near": 0.0035240610472230373,
+    "far": 100.0,
+    "world_up": [
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "controls": {
+    "wind_strength": 2.4,
+    "wind_azimuth": 70.0,
+    "wind_elevation": 10.0,
+    "gust_strength": 0.85,
+    "gust_hz": 0.65,
+    "max_angle_degrees": 24.0,
+    "frequency_hz": 2.0,
+    "damping_ratio": 0.72,
+    "speed": 1.0,
+    "render_width": 960,
+    "fov_y_degrees": 35.0,
+    "appearance": "appearance",
+    "paused": false,
+    "motion_profile": "full",
+    "simulation_enabled": true,
+    "background": "Light",
+    "sh_degree": "Auto",
+    "up_axis": "+Z",
+    "animation_enabled": true,
+    "animation_mode": "loop",
+    "collision_enabled": true,
+    "collision_resolution": 128,
+    "collision_margin": 0.003,
+    "animation_speed": 0.4,
+    "inertia_strength": 0.45
+  },
+  "rod": {
+    "count": 384,
+    "bend": 1E-06,
+    "drag": 1.2,
+    "bundle": 8E-05,
+    "damping": 1.8,
+    "substeps": 8,
+    "iterations": 10,
+    "material_contact": true,
+    "root_filter": 0.06,
+    "viscosity": 8.0,
+    "volume_gain": 0.9
+  }
+}

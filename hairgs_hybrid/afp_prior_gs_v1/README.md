@@ -16,3 +16,5 @@ OUT=/root/Public/h84435299/UniFur/outputs/afp_prior_gs_round18_20261108
 ```
 
 Each worker claims one GPU UUID through the shared registry. The smoke phase reuses its prior for the formal run. Re-running the same command verifies completed cases and resumes pending cases from the last completed phase. Incomplete artifacts are retained in interrupted directories. Each formal case emits its source receipt, the AFP field, free and routed Gaussian tensors, complete_asset.npz, final_3dgs.ply, and six 16-bit RGBA test images under cases/<id>/reconstruction/test. BATCH_COMPLETE.json records each render's SHA-256 after validating all selected cases.
+
+For the A025 Lion_Run animation, see the [v2/v3 physics replay](../../experiments/a025_running_fur_physics_20261109/README.md). It takes the paired A025 training export and run rig.
