@@ -66,3 +66,28 @@ PYTHONPATH="$repo" "$PY" -B -m mane_rods_v2.check_solver
 PYTHONPATH="$repo" "$PY" -B -m whole_body_fur_v3.check_solver
 PYTHONPATH="$repo" "$PY" -B -m whole_body_fur_v3.check_grading
 ```
+
+
+## 5. V3 跑动的头颈与下颌增强
+
+从原始 `Lion_Run` 骨骼轨迹提取头部俯仰和相对颈根的高度，沿原动作节奏增强。新增俯仰限制在 4.5°，垂直位移限制在 0.018 模型单位。头颈顶点按原蒙皮权重叠加位移。下颌使用 `Lion_LookAround` 第 360 帧相对第 0 帧的变换，融合强度为 0.85，峰值位于 `Lion_Run` 第 64 帧。V3 使用派生网格重新求解毛发和碰撞。眨眼试渲有眼周伪影，验收版省略了这项。
+
+使用第 2 节中的变量。`blender_export_run` 提供跑动骨骼，`blender_export` 提供 LookAround 骨骼和三个网格的蒙皮数据。先准备同一预设下的原版 V3 结果 `$OUT/v3` 供并排对照。
+
+```bash
+ANIM="$VIEWER/assets/animations"
+HEAD="$OUT/head_rig"
+
+"$PY" -B "$EXP/augment_run.py" --rig "$RIG" \
+  --run-bones "$ANIM/blender_export_run/Lion_Rig_grp_deform_bones.npz" \
+  --look-bones "$ANIM/blender_export/Lion_Rig_grp_deform_bones.npz" \
+  --skin-dir "$ANIM/blender_export" --output "$HEAD"
+
+HEAD_SHA=$(sha256sum "$HEAD/binding_run_head.npz" | cut -d ' ' -f 1)
+"$PY" -B "$EXP/render_run.py" --version v3 --asset "$ASSET" \
+  --rig "$HEAD/binding_run_head.npz" --head-rig-sha256 "$HEAD_SHA" \
+  --reference "$OUT/v3" --output "$OUT/v3_head"
+"$PY" -B "$EXP/validate_output.py" "$OUT/v3_head"
+```
+
+派生 rig 和三个动作缓存写入新目录 `$HEAD`。`head_motion.json` 记录输入哈希和动作幅度。验收片段为 195 帧、30 fps、6.5 秒，轻微张嘴约出现在 3.3 秒。

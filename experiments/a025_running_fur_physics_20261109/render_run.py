@@ -60,10 +60,16 @@ def render(args):
 
     asset_path, rig_path = args.asset.resolve(), args.rig.resolve()
     hashes = fingerprint([asset_path, rig_path])
-    if hashes[str(asset_path)] != ASSET_SHA256 or hashes[str(rig_path)] != RIG_SHA256:
+    expected_rig = args.head_rig_sha256 or RIG_SHA256
+    if hashes[str(asset_path)] != ASSET_SHA256 or hashes[str(rig_path)] != expected_rig:
         raise ValueError('This A025 replay requires the approved training export and paired Lion_Run rig')
     with np.load(rig_path, allow_pickle=False) as archive:
         rig_manifest = json.loads(str(archive['manifest_json'].item()))
+    head_motion = rig_manifest.get('head_motion_augmentation')
+    if args.head_rig_sha256 and (
+            args.version != 'v3' or not isinstance(head_motion, dict)
+            or head_motion.get('original_binding_sha256') != RIG_SHA256):
+        raise ValueError('Use --head-rig-sha256 only with the derived A025 V3 head rig')
     cycle = rig_manifest['motion']['cycle_frames']
     inputs = [asset_path, rig_path, preset]
     inputs += [(rig_path.parent / clip['file']).resolve() for clip in rig_manifest['clips']]
@@ -108,6 +114,8 @@ def render(args):
                         static=False, no_wind=False, static_warmup=config['static_warmup'],
                         motion_warmup=config['motion_warmup'], rod_parameters=rod_parameters,
                         reference=str(reference) if reference else 'Reduced-mode control')
+        if args.head_rig_sha256:
+            manifest['head_motion_augmentation'] = head_motion
         write_json(output / 'scene_manifest.json', manifest)
         write_json(output / 'input_hashes.json', hashes)
         write_json(output / 'source_hashes.json', source_hashes)
@@ -144,7 +152,11 @@ def render(args):
             file = f'{index:05d}.png'
             final.save(output / 'optimized/frames' / file)
             left = 'Matched rod reference' if reference else 'Reduced-mode wind control'
-            panel(control, final, left, f'Rods {args.version} | {index * dt:.2f}s').save(output / 'comparison/frames' / file)
+            right = f'Rods {args.version}'
+            if args.head_rig_sha256:
+                left = 'Original V3' if reference else left
+                right = 'V3 head and jaw motion'
+            panel(control, final, left, f'{right} | {index * dt:.2f}s').save(output / 'comparison/frames' / file)
             panel(rods.wireframe(camera, final), final, 'Grey: rest | blue: simulated guides',
                   f'A025 rod replay {args.version}').save(output / 'diagnostic/frames' / file)
             if index % 15 == 0 or index + 1 == frames:
@@ -199,6 +211,7 @@ def main():
     parser.add_argument('--asset', type=Path, required=True, help='A025 complete_asset.npz exported from final_prior')
     parser.add_argument('--rig', type=Path, required=True, help='binding_run.npz with its sibling motion_run_inplace directory')
     parser.add_argument('--output', type=Path, required=True, help='new directory for frames and MP4 files')
+    parser.add_argument('--head-rig-sha256', help='digest printed by augment_run.py for its derived V3 rig')
     parser.add_argument('--reference', type=Path, help='optional matched v1 or v2 output directory')
     parser.add_argument('--preset', type=Path, help='optional JSON override for the selected version')
     parser.add_argument('--frames', type=int, help='optional prefix of the full sequence, with the same warmup')
