@@ -94,3 +94,31 @@ HEAD_SHA=$(sha256sum "$HEAD/binding_run_head.npz" | cut -d ' ' -f 1)
 
 
 制作 teaser 摆头版时，用新输出目录运行上述流程，并给 `augment_run.py` 加 `--teaser-yaw`。左右前爪的前后位移差经周期平滑和两帧延迟后驱动摆头，新增转角上限为 5.5°。给渲染命令加 `--counter-orbit-deg 0.8` 可让相机绕固定目标小幅反向移动。逐帧的摆头和相机转角写入 `report.json`。
+
+
+## 6. 已验收的 20° teaser 版
+
+完整片段使用 `presets/v3.json` 的 195 帧和 30 fps。新增头部偏航的参数为 9.4°，相机反向绕转上限为 2.35°。按双眼中心连线相对视线测量，预览的 3–5 秒窗口跨度为 20.15°，完整片段跨度为 24.74°。`presets/v3_head_yaw20_track.json` 保存实际的逐帧头部角度、相机位置和源动作帧。
+
+沿用第 2 和第 5 节的输入变量，使用新的输出目录。
+
+```bash
+HEAD20="$OUT/head_yaw20_rig"
+RUN20="$OUT/v3_yaw20"
+TRACK20="$EXP/presets/v3_head_yaw20_track.json"
+
+"$PY" -B "$EXP/augment_run.py" --rig "$RIG" \
+  --run-bones "$ANIM/blender_export_run/Lion_Rig_grp_deform_bones.npz" \
+  --look-bones "$ANIM/blender_export/Lion_Rig_grp_deform_bones.npz" \
+  --skin-dir "$ANIM/blender_export" --output "$HEAD20" --teaser-yaw-deg 9.4
+
+HEAD20_SHA=$(sha256sum "$HEAD20/binding_run_head.npz" | cut -d ' ' -f 1)
+"$PY" -B "$EXP/render_run.py" --version v3 --asset "$ASSET" \
+  --rig "$HEAD20/binding_run_head.npz" --head-rig-sha256 "$HEAD20_SHA" \
+  --counter-orbit-deg 2.35 --preset "$EXP/presets/v3.json" --output "$RUN20"
+"$PY" -B "$EXP/validate_output.py" "$RUN20"
+"$PY" -B "$EXP/make_head_teaser.py" --render "$RUN20" --track "$TRACK20" \
+  --output "$OUT/A025_Teaser_Four_Frames_20deg.png"
+```
+
+四帧图条使用从零开始计数的 85、109、126、134 帧。首帧在 2.83 秒，取收腿姿态；3.63 和 4.20 秒是预览窗口的反向摆头峰值。图条工具先校验源帧及头部、相机角度，再使用统一裁切和 DejaVu Sans 字体生成图条。

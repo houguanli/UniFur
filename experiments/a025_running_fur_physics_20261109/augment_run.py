@@ -63,7 +63,10 @@ def jaw_deltas(poses, head, drift, rest_inverse, jaw_ids, jaw_changes, rest, ids
     return corrections
 
 
-def bake(rig, run_bones, look_bones, skin_dir, output, *, teaser_yaw=False):
+def bake(rig, run_bones, look_bones, skin_dir, output, *, teaser_yaw=False, teaser_yaw_deg=None):
+    yaw_amplitude = 5.5 if teaser_yaw_deg is None and teaser_yaw else teaser_yaw_deg
+    if yaw_amplitude is not None and not 0. < yaw_amplitude <= 15.:
+        raise ValueError('Teaser yaw amplitude must be in (0, 15] degrees')
     rig_digest = sha256(rig)
     if rig_digest != RIG_SHA256:
         raise ValueError('Use the approved A025 binding_run.npz')
@@ -103,11 +106,11 @@ def bake(rig, run_bones, look_bones, skin_dir, output, *, teaser_yaw=False):
     shift = np.column_stack((np.zeros(cycle), fore, .018 * unit_drive(height)))
     shift = np.concatenate((shift, shift[:1]))
     correction = Rotation.from_euler('x', np.r_[pitch, pitch[0]], degrees=True).as_matrix()
-    if teaser_yaw:
+    if yaw_amplitude is not None:
         # The opposite forepaw reaches give the cycle a left/right signal.
         paws = [index[f'DEF_index_F_a.{side}'] for side in ('L', 'R')]
         reach = poses[:cycle, paws, 1, 3].astype(np.float64)
-        yaw = 5.5 * np.roll(unit_drive(reach[:, 0] - reach[:, 1]), 2)
+        yaw = yaw_amplitude * np.roll(unit_drive(reach[:, 0] - reach[:, 1]), 2)
         yaw = np.r_[yaw, yaw[0]]
         correction = Rotation.from_euler('z', yaw, degrees=True).as_matrix() @ correction
 
@@ -187,9 +190,9 @@ def bake(rig, run_bones, look_bones, skin_dir, output, *, teaser_yaw=False):
                 added_pitch_deg=[float(pitch.min()), float(pitch.max())],
                 added_translation_max=np.abs(shift).max(axis=0).tolist(),
                 jaw=dict(lookaround_frame=LOOK_JAW_FRAME, run_peak_frame=JAW_PEAK_FRAME, blend=JAW_BLEND))
-    if teaser_yaw:
+    if yaw_amplitude is not None:
         info['teaser_yaw'] = dict(source_bones=['DEF_index_F_a.L', 'DEF_index_F_a.R'],
-                                  phase_delay_frames=2, amplitude_deg=5.5, added_deg=yaw.tolist())
+                                  phase_delay_frames=2, amplitude_deg=yaw_amplitude, added_deg=yaw.tolist())
     manifest['head_motion_augmentation'] = info
     binding['manifest_json'] = np.array(json.dumps(manifest))
     destination = output / 'binding_run_head.npz'
@@ -206,11 +209,13 @@ def main():
     parser.add_argument('--look-bones', type=Path, required=True)
     parser.add_argument('--skin-dir', type=Path, required=True, help='Directory with the three LookAround mesh exports')
     parser.add_argument('--output', type=Path, required=True, help='New directory for the derived rig and clips')
-    parser.add_argument('--teaser-yaw', action='store_true', help='add gait-driven left and right head turns')
+    parser.add_argument('--teaser-yaw', action='store_true', help='add gait-driven head turns with 5.5 degrees of yaw')
+    parser.add_argument('--teaser-yaw-deg', type=float, help='enable head turns at the given amplitude')
     args = parser.parse_args()
     if args.output.exists():
         parser.error('Choose a new output directory')
-    bake(args.rig, args.run_bones, args.look_bones, args.skin_dir, args.output, teaser_yaw=args.teaser_yaw)
+    bake(args.rig, args.run_bones, args.look_bones, args.skin_dir, args.output,
+         teaser_yaw=args.teaser_yaw, teaser_yaw_deg=args.teaser_yaw_deg)
 
 
 if __name__ == '__main__':
