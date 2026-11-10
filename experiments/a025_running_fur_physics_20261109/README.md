@@ -91,3 +91,6 @@ HEAD_SHA=$(sha256sum "$HEAD/binding_run_head.npz" | cut -d ' ' -f 1)
 ```
 
 派生 rig 和三个动作缓存写入新目录 `$HEAD`。`head_motion.json` 记录输入哈希和动作幅度。验收片段为 195 帧、30 fps、6.5 秒，轻微张嘴约出现在 3.3 秒。
+
+
+制作 teaser 摆头版时，用新输出目录运行上述流程，并给 `augment_run.py` 加 `--teaser-yaw`。左右前爪的前后位移差经周期平滑和两帧延迟后驱动摆头，新增转角上限为 5.5°。给渲染命令加 `--counter-orbit-deg 0.8` 可让相机绕固定目标小幅反向移动。逐帧的摆头和相机转角写入 `report.json`。

@@ -1,5 +1,6 @@
 """Reproduce the approved A025 v2/v3 run from a trained asset and its run rig."""
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -71,6 +72,18 @@ def render(args):
             or head_motion.get('original_binding_sha256') != RIG_SHA256):
         raise ValueError('Use --head-rig-sha256 only with the derived A025 V3 head rig')
     cycle = rig_manifest['motion']['cycle_frames']
+    if not 0. <= args.counter_orbit_deg <= 3.:
+        raise ValueError('--counter-orbit-deg must be between 0 and 3')
+    if args.counter_orbit_deg:
+        track = head_motion.get('teaser_yaw') if args.head_rig_sha256 else None
+        if not isinstance(track, dict):
+            raise ValueError('Counter-orbit requires a head rig baked with --teaser-yaw')
+        yaw = np.asarray(track['added_deg'], dtype=np.float64)
+        if yaw.shape != (cycle+1,) or not np.isfinite(yaw).all() or yaw[0] != yaw[-1] or not np.any(yaw):
+            raise ValueError('Invalid teaser yaw track')
+        orbit = -args.counter_orbit_deg * yaw / np.max(np.abs(yaw))
+        target = np.asarray(camera.target)
+        eye_offset = np.asarray(camera.eye) - target
     inputs = [asset_path, rig_path, preset]
     inputs += [(rig_path.parent / clip['file']).resolve() for clip in rig_manifest['clips']]
 
@@ -116,6 +129,8 @@ def render(args):
                         reference=str(reference) if reference else 'Reduced-mode control')
         if args.head_rig_sha256:
             manifest['head_motion_augmentation'] = head_motion
+        if args.counter_orbit_deg:
+            manifest['camera_counter_orbit_deg'] = args.counter_orbit_deg
         write_json(output / 'scene_manifest.json', manifest)
         write_json(output / 'input_hashes.json', hashes)
         write_json(output / 'source_hashes.json', source_hashes)
@@ -138,9 +153,20 @@ def render(args):
             rods.region_samples.clear()
         records = []
         for index in range(frames):
-            control, _, final, stats = rods.frame(camera, dt)
-            source = float(scene.animation_clock.frame)
             expected = ((config['motion_warmup'] + index + 1) * state['animation_speed']) % cycle
+            frame_camera = camera
+            if args.counter_orbit_deg:
+                degrees = float(np.interp(expected, np.arange(cycle+1), orbit))
+                angle = np.deg2rad(degrees)
+                c, s = np.cos(angle), np.sin(angle)
+                x, y, z = eye_offset
+                eye = target + [c*x-s*y, s*x+c*y, z]
+                frame_camera = replace(camera, eye=tuple(eye))
+            control, _, final, stats = rods.frame(frame_camera, dt)
+            if args.counter_orbit_deg:
+                stats['camera_orbit_deg'] = degrees
+                stats['added_head_yaw_deg'] = float(np.interp(expected, np.arange(cycle+1), yaw))
+            source = float(scene.animation_clock.frame)
             error = abs(source - expected)
             assert min(error, abs(error - cycle)) < 1e-3, (source, expected)
             if reference:
@@ -154,10 +180,11 @@ def render(args):
             left = 'Matched rod reference' if reference else 'Reduced-mode wind control'
             right = f'Rods {args.version}'
             if args.head_rig_sha256:
-                left = 'Original V3' if reference else left
-                right = 'V3 head and jaw motion'
+                if reference:
+                    left = 'V3 head and jaw reference' if args.counter_orbit_deg else 'Original V3'
+                right = 'V3 head yaw and counter-orbit' if args.counter_orbit_deg else 'V3 head and jaw motion'
             panel(control, final, left, f'{right} | {index * dt:.2f}s').save(output / 'comparison/frames' / file)
-            panel(rods.wireframe(camera, final), final, 'Grey: rest | blue: simulated guides',
+            panel(rods.wireframe(frame_camera, final), final, 'Grey: rest | blue: simulated guides',
                   f'A025 rod replay {args.version}').save(output / 'diagnostic/frames' / file)
             if index % 15 == 0 or index + 1 == frames:
                 print(json.dumps(stats), flush=True)
@@ -212,7 +239,9 @@ def main():
     parser.add_argument('--rig', type=Path, required=True, help='binding_run.npz with its sibling motion_run_inplace directory')
     parser.add_argument('--output', type=Path, required=True, help='new directory for frames and MP4 files')
     parser.add_argument('--head-rig-sha256', help='digest printed by augment_run.py for its derived V3 rig')
-    parser.add_argument('--reference', type=Path, help='optional matched v1 or v2 output directory')
+    parser.add_argument('--counter-orbit-deg', type=float, default=0.,
+                        help='maximum opposite camera orbit for a teaser yaw rig')
+    parser.add_argument('--reference', type=Path, help='optional matched rendered reference directory')
     parser.add_argument('--preset', type=Path, help='optional JSON override for the selected version')
     parser.add_argument('--frames', type=int, help='optional prefix of the full sequence, with the same warmup')
     render(parser.parse_args())
